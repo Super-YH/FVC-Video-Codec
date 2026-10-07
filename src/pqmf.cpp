@@ -122,6 +122,12 @@ void Pqmf1D::synthesize(const std::vector<std::vector<double>>& in, std::vector<
     for (int n = 0; n < L; ++n) y[n] = gain_ * t[(n + d) % L];
 }
 
+double Pqmf1D::synth_norm(int k) const {
+    double e = 0.0;
+    for (double v : f_[k]) e += v * v;
+    return std::sqrt(gain_ * gain_ * e / M_);
+}
+
 Pqmf2D::Pqmf2D(int Mx, int My, int m, double beta) : fx_(Mx, m, beta), fy_(My, m, beta) {}
 
 void Pqmf2D::analyze(const std::vector<double>& img, int W, int H,

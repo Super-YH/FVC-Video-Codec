@@ -9,10 +9,15 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-add_library(fvc src/color.cpp src/pqmf.cpp src/quant.cpp src/transform.cpp src/entropy.cpp)
+add_library(fvc src/color.cpp src/pqmf.cpp src/quant.cpp src/transform.cpp src/entropy.cpp
+  src/frame.cpp src/codec.cpp)
 target_include_directories(fvc PUBLIC include)
 
 enable_testing()
 add_executable(fvc_tests tests/test_main.cpp)
 target_link_libraries(fvc_tests PRIVATE fvc)
 add_test(NAME fvc_tests COMMAND fvc_tests)
+
+add_executable(fvc_cli tools/fvc.cpp)
+target_link_libraries(fvc_cli PRIVATE fvc)
+set_target_properties(fvc_cli PROPERTIES OUTPUT_NAME fvc)

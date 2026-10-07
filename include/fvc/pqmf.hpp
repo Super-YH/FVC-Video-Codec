@@ -17,6 +17,8 @@ public:
     void analyze(const std::vector<double>& x, std::vector<std::vector<double>>& out) const;
     // 合成。遅延 (N-1) を循環シフトで補償済み。
     void synthesize(const std::vector<std::vector<double>>& in, std::vector<double>& y) const;
+    // 帯域 k の単位分散ノイズが出力に与える 1 サンプルあたり RMS (量子化ステップ正規化用)
+    double synth_norm(int k) const;
 
 private:
     int M_, N_;
@@ -35,6 +37,7 @@ public:
                  std::vector<std::vector<double>>& bands) const;
     void synthesize(const std::vector<std::vector<double>>& bands, int W, int H,
                     std::vector<double>& img) const;
+    double band_norm(int kx, int ky) const { return fx_.synth_norm(kx) * fy_.synth_norm(ky); }
     int bands_x() const { return fx_.bands(); }
     int bands_y() const { return fy_.bands(); }
 

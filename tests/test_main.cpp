@@ -1,9 +1,11 @@
 // FVC リファレンス部品の単体テスト (外部依存なし)
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
 
+#include "fvc/codec.hpp"
 #include "fvc/color.hpp"
 #include "fvc/entropy.hpp"
 #include "fvc/pqmf.hpp"
@@ -166,12 +168,52 @@ static void test_entropy() {
                 bytes.size() * 8.0 / vals.size(), ok ? "ok" : "NG");
 }
 
+static void test_codec() {
+    VideoInfo info;
+    info.width = 83; info.height = 61; info.chroma = ChromaFormat::C420; info.ct = ColorTransform::Identity;
+    Frame f;
+    for (int p = 0; p < 3; ++p) {
+        const int w = p ? info.chroma_w() : info.width, h = p ? info.chroma_h() : info.height;
+        Plane pl(w, h);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < w; ++x)
+                pl.at(x, y) = std::clamp(static_cast<int>(128 + 70 * std::sin(x * 0.13 + p) * std::cos(y * 0.09) + ((x * 13 + y * 7) % 11)), 0, 255);
+        f.p.push_back(pl);
+    }
+    struct Case { bool lossy, l2; int pqmf, qp; Preset pr; };
+    const Case cases[] = {{false, false, 0, 0, Preset::Medium}, {true, true, 0, 30, Preset::Medium}, {true, false, 0, 30, Preset::Faster},
+                          {true, false, 0, 40, Preset::Placebo}, {true, true, 2, 30, Preset::Medium}, {true, false, 1, 25, Preset::Medium}};
+    for (const Case& c : cases) {
+        EncoderConfig cfg;
+        cfg.lossy_layer = c.lossy; cfg.l2_lossless = c.l2; cfg.pqmf_log2 = c.pqmf; cfg.qp = c.qp; cfg.preset = c.pr;
+        Encoder enc(info, cfg);
+        auto s = enc.sequence_header();
+        Frame rec, dec;
+        for (int k = 0; k < 2; ++k) { auto u = enc.encode(f, &rec); s.insert(s.end(), u.begin(), u.end()); }
+        auto e = enc.end_of_stream(); s.insert(s.end(), e.begin(), e.end());
+        Decoder d(s);
+        CHECK(d.ok());
+        int n = 0;
+        while (d.next(dec)) {
+            ++n;
+            for (int p = 0; p < 3; ++p) {
+                CHECK(dec.p[p].v == rec.p[p].v);                       // 符号器と復号器の再構成一致
+                if (!c.lossy || c.l2) CHECK(dec.p[p].v == f.p[p].v);    // 可逆
+            }
+        }
+        CHECK(n == 2);
+        std::printf("codec: lossy=%d l2=%d pqmf=%d qp=%d -> %zu bytes, PSNR-Y %.2f\n", c.lossy, c.l2, c.pqmf, c.qp, s.size(),
+                    plane_psnr(f.p[0], rec.p[0], 8));
+    }
+}
+
 int main() {
     test_color();
     test_pqmf();
     test_lattice();
     test_transform();
     test_entropy();
+    test_codec();
     if (g_fail) { std::printf("%d failure(s)\n", g_fail); return 1; }
     std::printf("all tests passed\n");
     return 0;
