@@ -192,7 +192,19 @@ void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) c
     const int s = 1 << l;
     if (lf.pt == 2) {
         if (is_luma()) {
-            inter_predict(lf.mi, inter_.l0, inter_.l1, x0, y0, s, s, 0, lo_, hi_, pred);
+            if (lf.part == 0) {
+                inter_predict(lf.mi, inter_.l0, inter_.l1, x0, y0, s, s, 0, lo_, hi_, pred);
+            } else {
+                // 長方形予測分割 (1: 上下 2NxN, 2: 左右 Nx2N)。変換は正方形のまま
+                const int pw = lf.part == 2 ? s / 2 : s, ph = lf.part == 1 ? s / 2 : s;
+                std::vector<int32_t> sub(static_cast<size_t>(pw) * ph);
+                for (int k = 0; k < 2; ++k) {
+                    const int ox = lf.part == 2 ? k * pw : 0, oy = lf.part == 1 ? k * ph : 0;
+                    inter_predict(k ? lf.mi2 : lf.mi, inter_.l0, inter_.l1, x0 + ox, y0 + oy, pw, ph, 0, lo_, hi_, sub.data());
+                    for (int y = 0; y < ph; ++y)
+                        for (int x = 0; x < pw; ++x) pred[(oy + y) * s + ox + x] = sub[y * pw + x];
+                }
+            }
         } else {
             // 色差: 輝度の動きベクトル場から 4x4 単位で導出 (動き情報は送らない)
             const int cs = inter_.chroma_shift, b = 4;
@@ -268,16 +280,47 @@ void BlockCoder::ibc_search(int x0, int y0, int s, int& bx, int& by) const {
 
 
 // ---------------- インター (§7.3) ----------------
-int BlockCoder::merge_list(int x0, int y0, MotionInfo* out) const {
+// 時間方向候補 (§7.3): 同位置ピクチャの動きを POC 距離で伸縮
+bool BlockCoder::temporal_cand(int x, int y, MotionInfo& out) const {
+    if (!tools_.tmvp || !inter_.col) return false;
+    const MotionField& c = *inter_.col;
+    const int cx = std::min(x, c.w4 * 4 - 1), cy = std::min(y, c.h4 * 4 - 1);
+    const MotionInfo& m = c.at(cx, cy);
+    if (m.dir == 0) return false;
+    const int l = (m.dir & 1) ? 0 : 1;
+    const int td = inter_.col_poc - inter_.col_ref_poc[l][m.ref[l]];
+    if (td == 0) return false;
+    auto scale = [&](int v, int tb) {
+        const int64_t num = static_cast<int64_t>(v) * tb;
+        const int64_t r = num >= 0 ? (num + std::abs(td) / 2) / td : -((-num + std::abs(td) / 2) / td);
+        return static_cast<int16_t>(std::clamp<int64_t>(r, -16000, 16000));
+    };
+    out = MotionInfo{};
+    const int tb0 = inter_.cur_poc - inter_.ref_poc[0][0];
+    out.mvx[0] = scale(m.mvx[l], tb0);
+    out.mvy[0] = scale(m.mvy[l], tb0);
+    out.dir = 1;
+    if (inter_.bframe && inter_.nref[1] > 0) {
+        const int tb1 = inter_.cur_poc - inter_.ref_poc[1][0];
+        out.mvx[1] = scale(m.mvx[l], tb1);
+        out.mvy[1] = scale(m.mvy[l], tb1);
+        out.dir = 3;
+    }
+    return true;
+}
+
+int BlockCoder::merge_list(int x0, int y0, int w, int h, MotionInfo* out) const {
     int n = 0;
     auto push = [&](const MotionInfo& m) {
-        if (m.dir == 0 || n >= 3) return;
+        if (m.dir == 0 || n >= kMaxMerge) return;
         if (((m.dir >> 1) & 1) && inter_.nref[1] == 0) return;
         for (int i = 0; i < n; ++i) if (out[i] == m) return;
         out[n++] = m;
     };
-    if (x0 > tx0_) push(inter_.mf->at(x0 - 1, y0));
-    if (y0 > ty0_) push(inter_.mf->at(x0, y0 - 1));
+    if (x0 > tx0_) push(inter_.mf->at(x0 - 1, y0 + h - 1));
+    if (y0 > ty0_) push(inter_.mf->at(x0 + w - 1, y0 - 1));
+    MotionInfo t;
+    if (temporal_cand(x0 + w / 2, y0 + h / 2, t)) push(t);
     if (x0 > tx0_ && y0 > ty0_) push(inter_.mf->at(x0 - 1, y0 - 1));
     MotionInfo g;
     g.dir = 1;
@@ -297,11 +340,13 @@ void BlockCoder::mv_pred(int x0, int y0, int list, int ref, int& px, int& py) co
     };
     if (x0 > tx0_ && try_mi(inter_.mf->at(x0 - 1, y0))) return;
     if (y0 > ty0_ && try_mi(inter_.mf->at(x0, y0 - 1))) return;
+    MotionInfo t;
+    if (ref == 0 && temporal_cand(x0, y0, t) && try_mi(t)) return;
     px = list == 0 ? inter_.gmv_x : 0;
     py = list == 0 ? inter_.gmv_y : 0;
 }
 
-int64_t BlockCoder::me_cost(int x0, int y0, int s, const MotionInfo& mi) const {
+int64_t BlockCoder::me_cost(int x0, int y0, int w, int h, const MotionInfo& mi) const {
     if (search_.approx_subpel && mi.psi == 0 && (mi.dir == 1 || mi.dir == 2)) {
         // 探索用近似: 1/4 画素位置を双線形補間で評価 (8 タップより大幅に軽い)
         const int l = mi.dir == 2 ? 1 : 0;
@@ -310,9 +355,9 @@ int64_t BlockCoder::me_cost(int x0, int y0, int s, const MotionInfo& mi) const {
         const int ix = mi.mvx[l] >> 2, iy = mi.mvy[l] >> 2, fx = mi.mvx[l] & 3, fy = mi.mvy[l] & 3;
         const int w00 = (4 - fx) * (4 - fy), w10 = fx * (4 - fy), w01 = (4 - fx) * fy, w11 = fx * fy;
         int64_t sad = 0;
-        for (int y = 0; y < s; ++y) {
+        for (int y = 0; y < h; ++y) {
             const int ry0 = std::clamp(y0 + y + iy, 0, p.h - 1), ry1 = std::clamp(y0 + y + iy + 1, 0, p.h - 1);
-            for (int x = 0; x < s; ++x) {
+            for (int x = 0; x < w; ++x) {
                 const int rx0 = std::clamp(x0 + x + ix, 0, p.w - 1), rx1 = std::clamp(x0 + x + ix + 1, 0, p.w - 1);
                 int32_t v = (w00 * p.at(rx0, ry0) + w10 * p.at(rx1, ry0) + w01 * p.at(rx0, ry1) + w11 * p.at(rx1, ry1) + 8) >> 4;
                 v = ((v * rp.gain_q + 32) >> 6) + rp.off;
@@ -321,20 +366,20 @@ int64_t BlockCoder::me_cost(int x0, int y0, int s, const MotionInfo& mi) const {
         }
         return sad;
     }
-    std::vector<int32_t> pred(static_cast<size_t>(s) * s);
-    inter_predict(mi, inter_.l0, inter_.l1, x0, y0, s, s, 0, lo_, hi_, pred.data());
+    std::vector<int32_t> pred(static_cast<size_t>(w) * h);
+    inter_predict(mi, inter_.l0, inter_.l1, x0, y0, w, h, 0, lo_, hi_, pred.data());
     int64_t sad = 0;
-    for (int y = 0; y < s; ++y)
-        for (int x = 0; x < s; ++x) sad += std::abs(org_->at(x0 + x, y0 + y) - pred[y * s + x]);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) sad += std::abs(org_->at(x0 + x, y0 + y) - pred[y * w + x]);
     return sad;
 }
 
-void BlockCoder::motion_search(int x0, int y0, int s, std::vector<Leaf>& cands) const {
+void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& cands) const {
     const double lsad = std::sqrt(lambda_);
     auto mvbits = [&](int dx, int dy) { return 2.0 + 2.0 * std::log2(1.0 + std::abs(dx)) + 2.0 * std::log2(1.0 + std::abs(dy)); };
     // マージ候補
-    MotionInfo ml[3];
-    const int nm = merge_list(x0, y0, ml);
+    MotionInfo ml[kMaxMerge];
+    const int nm = merge_list(x0, y0, w, h, ml);
     for (int i = 0; i < nm; ++i) { Leaf lf; lf.pt = 2; lf.mi = ml[i]; lf.merge = i; cands.push_back(lf); }
     MotionInfo best_uni[2];
     double best_uni_cost[2] = {1e300, 1e300};
@@ -346,9 +391,9 @@ void BlockCoder::motion_search(int x0, int y0, int s, std::vector<Leaf>& cands) 
             // 整数探索 (SAD、参照はクランプ)
             auto isad = [&](int ix, int iy, int64_t bound) {
                 int64_t sad = 0;
-                for (int y = 0; y < s && sad < bound; ++y) {
+                for (int y = 0; y < h && sad < bound; ++y) {
                     const int ry = std::clamp(y0 + y + iy, 0, rp.h - 1);
-                    for (int x = 0; x < s; ++x)
+                    for (int x = 0; x < w; ++x)
                         sad += std::abs(org_->at(x0 + x, y0 + y) - rp.at(std::clamp(x0 + x + ix, 0, rp.w - 1), ry));
                 }
                 return sad;
@@ -390,7 +435,7 @@ void BlockCoder::motion_search(int x0, int y0, int s, std::vector<Leaf>& cands) 
                 MotionInfo t = mi;
                 t.mvx[list] = static_cast<int16_t>(vx);
                 t.mvy[list] = static_cast<int16_t>(vy);
-                return static_cast<double>(me_cost(x0, y0, s, t)) + lsad * (mvbits(vx - px, vy - py) + (inter_.nref[list] > 1 ? ref : 0));
+                return static_cast<double>(me_cost(x0, y0, w, h, t)) + lsad * (mvbits(vx - px, vy - py) + (inter_.nref[list] > 1 ? ref : 0));
             };
             double sc = subcost(mx, my);
             for (int step = 2; step >= (search_.qpel ? 1 : 2); step >>= 1) {
@@ -412,12 +457,12 @@ void BlockCoder::motion_search(int x0, int y0, int s, std::vector<Leaf>& cands) 
         cands.push_back(lf);
         if (tools_.fir && search_.try_fir) {
             // FIR 平滑強度 (動きぼけ/フォーカス変化) の選択
-            int64_t bsad = me_cost(x0, y0, s, lf.mi);
+            int64_t bsad = me_cost(x0, y0, w, h, lf.mi);
             int bpsi = 0;
             for (int psi = 1; psi <= 3; ++psi) {
                 MotionInfo t = lf.mi;
                 t.psi = static_cast<uint8_t>(psi);
-                const int64_t c = me_cost(x0, y0, s, t);
+                const int64_t c = me_cost(x0, y0, w, h, t);
                 if (c < bsad) { bsad = c; bpsi = psi; }
             }
             if (bpsi) { Leaf l2 = lf; l2.mi.psi = static_cast<uint8_t>(bpsi); cands.push_back(l2); }
@@ -431,6 +476,35 @@ void BlockCoder::motion_search(int x0, int y0, int s, std::vector<Leaf>& cands) 
         lf.mi.mvx[1] = best_uni[1].mvx[1];
         lf.mi.mvy[1] = best_uni[1].mvy[1];
         cands.push_back(lf);
+    }
+}
+
+// 長方形予測分割の探索: 各区画で動き探索し、SAD+λ·ビット最小の動きを組み合わせる
+void BlockCoder::rect_search(int x0, int y0, int s, std::vector<Leaf>& cands) {
+    const double lsad = std::sqrt(lambda_);
+    for (int part = 1; part <= 2; ++part) {
+        const int pw = part == 2 ? s / 2 : s, ph = part == 1 ? s / 2 : s;
+        Leaf lf;
+        lf.pt = 2;
+        lf.part = part;
+        double total = 0;
+        for (int k = 0; k < 2; ++k) {
+            const int px = x0 + (part == 2 ? k * pw : 0), py = y0 + (part == 1 ? k * ph : 0);
+            std::vector<Leaf> c;
+            motion_search(px, py, pw, ph, c);
+            double best = 1e300;
+            MotionInfo bm;
+            for (const Leaf& t : c) {
+                const double j = static_cast<double>(me_cost(px, py, pw, ph, t.mi)) + lsad * (t.merge >= 0 ? 2.0 : 12.0);
+                if (j < best) { best = j; bm = t.mi; }
+            }
+            if (best >= 1e300) return;
+            total += best;
+            (k ? lf.mi2 : lf.mi) = bm;
+            if (k == 0) inter_.mf->fill(px, py, pw, ph, bm);  // 第 2 区画の候補用 (RD 後に上書きされる)
+        }
+        if (!(lf.mi == lf.mi2)) cands.push_back(lf);
+        (void)total;
     }
 }
 
@@ -694,7 +768,10 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         for (int m : pick) { Leaf lf; lf.mode = m; cands.push_back(lf); }
         if (tools_.cfl) { Leaf lf; lf.mode = kModeCfl; lf.alpha = fit_cfl_alpha(x0, y0, s); cands.push_back(lf); }
         if (inter_.enabled) {
-            if (is_luma()) motion_search(x0, y0, s, cands);
+            if (is_luma()) {
+                motion_search(x0, y0, s, s, cands);
+                if (tools_.rect && s >= 8) rect_search(x0, y0, s, cands);
+            }
             else { Leaf lf; lf.pt = 2; cands.push_back(lf); }
         }
         if (tools_.dict && (s == 8 || s == 16)) dict_search(x0, y0, s, cands);
@@ -771,7 +848,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     }
     leaf_at(x0, y0, l) = best_leaf;
     restore(x0, y0, s, best_rec);
-    if (inter_.enabled && is_luma()) inter_.mf->fill(x0, y0, s, s, best_leaf.pt == 2 ? best_leaf.mi : MotionInfo{});
+    fill_mf(best_leaf, x0, y0, s);
     set_modes4(x0, y0, s, best_leaf.pt ? kModePlanar : best_leaf.mode);
     if (l <= min_log2_) return best;
     if (best < lambda_ * 4.0 || (search_.skip_split_on_skip && best_leaf.pt == 2 && best_leaf.last < 0)) {
@@ -790,7 +867,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         split_at(x0, y0, l) = 0;
         restore(x0, y0, s, best_rec);
         set_modes4(x0, y0, s, best_leaf.pt ? kModePlanar : best_leaf.mode);
-        if (inter_.enabled && is_luma()) inter_.mf->fill(x0, y0, s, s, best_leaf.pt == 2 ? best_leaf.mi : MotionInfo{});
+        fill_mf(best_leaf, x0, y0, s);
         bv_px_ = sbx; bv_py_ = sby;
         if (best_leaf.pt == 1) { bv_px_ = best_leaf.bvx; bv_py_ = best_leaf.bvy; }
         return best;
@@ -808,45 +885,20 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
     if (is_inter) {
         lf.pt = 2;
         if (is_luma()) {
-            MotionInfo ml[3];
-            const int nm = merge_list(x0, y0, ml);
-            if (io.enc && lf.merge >= 0 && !(lf.merge < nm && ml[lf.merge] == lf.mi)) lf.merge = -1;  // 候補変化時は明示
-            if (io.enc && lf.merge < 0)
-                for (int i = 0; i < nm; ++i) if (ml[i] == lf.mi) lf.merge = i;
-            const int is_merge = nm > 0 ? io.bit(md.inter, 1, L, 0, lf.merge >= 0) : 0;
-            if (is_merge) {
-                int idx = nm > 1 ? io.bit(md.inter, 2, 0, 0, lf.merge > 0) : 0;
-                if (idx && nm > 2) idx += io.bit(md.inter, 3, 0, 0, lf.merge > 1);
-                lf.merge = idx;
-                lf.mi = ml[idx];
+            int part = 0;
+            if (tools_.rect && s >= 8) {
+                const int is_part = io.bit(md.inter, 12, L, 0, lf.part != 0);
+                part = is_part ? 1 + io.bit(md.inter, 13, L, 0, lf.part == 2) : 0;
+            }
+            lf.part = part;
+            if (part == 0) {
+                code_motion(io, md, L, x0, y0, s, s, lf.mi, lf.merge);
             } else {
-                lf.merge = -1;
-                MotionInfo& m = lf.mi;
-                if (inter_.bframe) {
-                    const int bi = io.bit(md.inter, 4, L, 0, m.dir == 3);
-                    m.dir = bi ? 3 : (io.bit(md.inter, 5, L, 0, m.dir == 2) ? 2 : 1);
-                } else {
-                    m.dir = 1;
-                }
-                for (int li = 0; li < 2; ++li) {
-                    if (!((m.dir >> li) & 1)) { m.ref[li] = 0; m.mvx[li] = m.mvy[li] = 0; continue; }
-                    if (inter_.nref[li] > 1) m.ref[li] = static_cast<int8_t>(io.uint(md.inter, 6 + li, 0, static_cast<uint32_t>(m.ref[li])));
-                    if (m.ref[li] < 0 || m.ref[li] >= inter_.nref[li]) throw std::runtime_error("corrupt stream: ref idx");
-                    int px, py;
-                    mv_pred(x0, y0, li, m.ref[li], px, py);
-                    const int vx = px + io.sint(md.mvd, 0, static_cast<uint32_t>(li), m.mvx[li] - px);
-                    const int vy = py + io.sint(md.mvd, 1, static_cast<uint32_t>(li), m.mvy[li] - py);
-                    if (std::abs(vx) > 32000 || std::abs(vy) > 32000) throw std::runtime_error("corrupt stream: mv");
-                    m.mvx[li] = static_cast<int16_t>(vx);
-                    m.mvy[li] = static_cast<int16_t>(vy);
-                }
-                if (tools_.fir) {
-                    int psi = io.bit(md.inter, 8, 0, 0, m.psi >> 1) << 1;
-                    psi |= io.bit(md.inter, 9 + (psi >> 1), 0, 0, m.psi & 1);
-                    m.psi = static_cast<uint8_t>(psi);
-                } else {
-                    m.psi = 0;
-                }
+                const int pw = part == 2 ? s / 2 : s, ph = part == 1 ? s / 2 : s;
+                code_motion(io, md, L, x0, y0, pw, ph, lf.mi, lf.merge);
+                // 第 2 区画のマージ/予測ベクトルは第 1 区画の動きを参照する
+                if (!io.cost) inter_.mf->fill(x0, y0, pw, ph, lf.mi);
+                code_motion(io, md, L, x0 + (part == 2 ? pw : 0), y0 + (part == 1 ? ph : 0), pw, ph, lf.mi2, lf.merge2);
             }
         }
     } else if (tools_.dict && (s == 8 || s == 16) && io.bit(md.dict, 0, L, 0, lf.pt == 3)) {
@@ -972,6 +1024,57 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
     }
 }
 
+void BlockCoder::code_motion(SymIO& io, Models& md, uint32_t L, int x0, int y0, int w, int h, MotionInfo& m, int& merge) {
+    MotionInfo ml[kMaxMerge];
+    const int nm = merge_list(x0, y0, w, h, ml);
+    if (io.enc && merge >= 0 && !(merge < nm && ml[merge] == m)) merge = -1;  // 候補変化時は明示
+    if (io.enc && merge < 0)
+        for (int i = 0; i < nm; ++i) if (ml[i] == m) { merge = i; break; }
+    const int is_merge = nm > 0 ? io.bit(md.inter, 1, L, 0, merge >= 0) : 0;
+    if (is_merge) {
+        int idx = 0;
+        while (idx < nm - 1 && io.bit(md.inter, 20 + idx, 0, 0, merge > idx)) ++idx;  // 切り詰め単進
+        merge = idx;
+        m = ml[idx];
+        return;
+    }
+    merge = -1;
+    if (inter_.bframe) {
+        const int bi = io.bit(md.inter, 4, L, 0, m.dir == 3);
+        m.dir = bi ? 3 : (io.bit(md.inter, 5, L, 0, m.dir == 2) ? 2 : 1);
+    } else {
+        m.dir = 1;
+    }
+    for (int li = 0; li < 2; ++li) {
+        if (!((m.dir >> li) & 1)) { m.ref[li] = 0; m.mvx[li] = m.mvy[li] = 0; continue; }
+        if (inter_.nref[li] > 1) m.ref[li] = static_cast<int8_t>(io.uint(md.inter, 6 + li, 0, static_cast<uint32_t>(m.ref[li])));
+        if (m.ref[li] < 0 || m.ref[li] >= inter_.nref[li]) throw std::runtime_error("corrupt stream: ref idx");
+        int px, py;
+        mv_pred(x0, y0, li, m.ref[li], px, py);
+        const int vx = px + io.sint(md.mvd, 0, static_cast<uint32_t>(li), m.mvx[li] - px);
+        const int vy = py + io.sint(md.mvd, 1, static_cast<uint32_t>(li), m.mvy[li] - py);
+        if (std::abs(vx) > 32000 || std::abs(vy) > 32000) throw std::runtime_error("corrupt stream: mv");
+        m.mvx[li] = static_cast<int16_t>(vx);
+        m.mvy[li] = static_cast<int16_t>(vy);
+    }
+    if (tools_.fir) {
+        int psi = io.bit(md.inter, 8, 0, 0, m.psi >> 1) << 1;
+        psi |= io.bit(md.inter, 9 + (psi >> 1), 0, 0, m.psi & 1);
+        m.psi = static_cast<uint8_t>(psi);
+    } else {
+        m.psi = 0;
+    }
+}
+
+void BlockCoder::fill_mf(const Leaf& lf, int x0, int y0, int s) {
+    if (!(inter_.enabled && is_luma())) return;
+    if (lf.pt != 2) { inter_.mf->fill(x0, y0, s, s, MotionInfo{}); return; }
+    if (lf.part == 0) { inter_.mf->fill(x0, y0, s, s, lf.mi); return; }
+    const int pw = lf.part == 2 ? s / 2 : s, ph = lf.part == 1 ? s / 2 : s;
+    inter_.mf->fill(x0, y0, pw, ph, lf.mi);
+    inter_.mf->fill(x0 + (lf.part == 2 ? pw : 0), y0 + (lf.part == 1 ? ph : 0), pw, ph, lf.mi2);
+}
+
 void BlockCoder::code_leaf(SymIO& io, Models& md, Leaf& lf, int x0, int y0, int l) {
     const int s = 1 << l, n = s * s;
     std::vector<int32_t> pred(n);
@@ -990,7 +1093,7 @@ void BlockCoder::code_leaf(SymIO& io, Models& md, Leaf& lf, int x0, int y0, int 
         ++leaf_counter_;
     }
     set_modes4(x0, y0, s, lf.pt ? kModePlanar : lf.mode);
-    if (inter_.enabled && is_luma()) inter_.mf->fill(x0, y0, s, s, lf.pt == 2 ? lf.mi : MotionInfo{});
+    fill_mf(lf, x0, y0, s);
 }
 
 double BlockCoder::leaf_rate(Leaf& lf, int x0, int y0, int l) {

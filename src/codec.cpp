@@ -235,7 +235,13 @@ Tools tools_from_byte(uint8_t b) {
     return t;
 }
 
-struct Picture { int poc = 0; Frame f; bool anchor = true; };
+struct Picture {
+    int poc = 0;
+    Frame f;
+    bool anchor = true;
+    std::shared_ptr<MotionField> mf;  // 輝度 4x4 動き (時間方向候補用)
+    std::vector<int> ref_poc[2];
+};
 
 // タイルごとの独立 rANS ストリーム (符号器は出力を蓄積、復号器は順に消費)
 struct TileStreams {
@@ -255,8 +261,20 @@ struct CodecState {
         for (const auto& p : dpb) if (p.poc == poc) return &p.f;
         return nullptr;
     }
+    const Picture* find_pic(int poc) const {
+        for (const auto& p : dpb) if (p.poc == poc) return &p;
+        return nullptr;
+    }
+    // 直前に符号化/復号したフレームの動き (code_frame が設定)
+    std::shared_ptr<MotionField> last_mf;
+    std::vector<int> last_ref_poc[2];
     void push(int poc, const Frame& f, bool anchor) {
-        dpb.push_back({poc, f, anchor});
+        Picture pic;
+        pic.poc = poc; pic.f = f; pic.anchor = anchor;
+        pic.mf = last_mf;
+        pic.ref_poc[0] = last_ref_poc[0];
+        pic.ref_poc[1] = last_ref_poc[1];
+        dpb.push_back(std::move(pic));
         while (dpb.size() > kMaxDpb) dpb.pop_front();
     }
 };
@@ -392,6 +410,17 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             ic.mf = &mf;
             ic.chroma_shift = pi ? cs : 0;
             ic.gmv_x = gmv_x; ic.gmv_y = gmv_y;
+            ic.cur_poc = fp.poc;
+            for (int l = 0; l < 2; ++l)
+                for (size_t r = 0; r < fp.ref_poc[l].size() && r < 4; ++r) ic.ref_poc[l][r] = fp.ref_poc[l][r];
+            const int colp = !fp.ref_poc[1].empty() ? fp.ref_poc[1][0] : fp.ref_poc[0][0];
+            const Picture* cp = st.find_pic(colp);
+            if (cp && cp->mf && cp->mf->w4 * 4 == W && cp->mf->h4 * 4 == H) {
+                ic.col = cp->mf.get();
+                ic.col_poc = colp;
+                for (int l = 0; l < 2; ++l)
+                    for (size_t r = 0; r < cp->ref_poc[l].size() && r < 4; ++r) ic.col_ref_poc[l][r] = cp->ref_poc[l][r];
+            }
         }
         Plane out(w, h);
         if (fp.type == FrameType::Copy) {
@@ -530,6 +559,23 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         if (fp.l2 || !fp.lossy) code_lossless(io, md, pi, w, h, org ? &org->p[pi] : nullptr, out, fp.lossy, mid);
         rec.p[pi] = std::move(out);
     }
+    // 時間方向候補のために輝度の動きを保存 (I: 全イントラ, COPY: グローバル動き)
+    {
+        const int W = (info.width + kCtu - 1) / kCtu * kCtu, H = (info.height + kCtu - 1) / kCtu * kCtu;
+        auto smf = std::make_shared<MotionField>();
+        if (inter && fp.type != FrameType::Copy && mf.w4 * 4 == W) {
+            *smf = mf;
+        } else {
+            smf->init(W, H);
+            if (fp.type == FrameType::Copy) {
+                MotionInfo g; g.dir = 1; g.mvx[0] = static_cast<int16_t>(gmv_x); g.mvy[0] = static_cast<int16_t>(gmv_y);
+                smf->fill(0, 0, W, H, g);
+            }
+        }
+        st.last_mf = smf;
+        st.last_ref_poc[0] = fp.ref_poc[0];
+        st.last_ref_poc[1] = fp.ref_poc[1];
+    }
     // 辞書更新 (ADD_FROM_RECON, §10.2): 符号器は輝度再構成の高テクスチャブロックを選ぶ
     if (fp.tools.dict && fp.type != FrameType::Copy) {
         std::vector<std::array<int, 3>> adds;  // x/8, y/8, size
@@ -607,6 +653,10 @@ FrameParams params_from(const EncoderConfig& c) {
     if (c.shapes >= 0) fp.shapes = c.shapes != 0;
     if (c.fir >= 0) { t.fir = s.try_fir = c.fir != 0; }
     if (c.loop_filter >= 0) fp.lf = fp.lf_freq = fp.lf_map = c.loop_filter != 0;
+    t.tmvp = c.preset != Preset::Faster;
+    t.rect = c.preset >= Preset::Medium;
+    if (c.rect >= 0) t.rect = c.rect != 0;
+    if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
     const int dt = c.preset == Preset::Placebo ? 1 : 2;
     fp.tile_cols = std::clamp(c.tile_cols > 0 ? c.tile_cols : dt, 1, 16);
@@ -623,7 +673,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>(fp.min_log2) | (static_cast<uint32_t>(fp.max_log2) << 4));
     put_u8(p, tools_byte(fp.tools));
     put_u8(p, (fp.shapes ? 1u : 0u) | (fp.band_tools ? 2u : 0u) | (fp.dict_reset ? 4u : 0u) | (fp.lf ? 8u : 0u) |
-                  (fp.lf_freq ? 16u : 0u) | (fp.lf_map ? 32u : 0u));
+                  (fp.lf_freq ? 16u : 0u) | (fp.lf_map ? 32u : 0u) | (fp.tools.rect ? 64u : 0u) | (fp.tools.tmvp ? 128u : 0u));
     put_u8(p, static_cast<uint32_t>((fp.tile_cols - 1) | ((fp.tile_rows - 1) << 4)));
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
     for (int l = 0; l < 2; ++l) {
@@ -646,6 +696,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     const uint32_t f2 = br.u8();
     fp.shapes = f2 & 1; fp.band_tools = (f2 >> 1) & 1; fp.dict_reset = (f2 >> 2) & 1;
     fp.lf = (f2 >> 3) & 1; fp.lf_freq = (f2 >> 4) & 1; fp.lf_map = (f2 >> 5) & 1;
+    fp.tools.rect = (f2 >> 6) & 1; fp.tools.tmvp = (f2 >> 7) & 1;
     const uint32_t tl = br.u8();
     fp.tile_cols = static_cast<int>(tl & 15) + 1;
     fp.tile_rows = static_cast<int>(tl >> 4) + 1;

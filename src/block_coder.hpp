@@ -79,6 +79,8 @@ struct Tools {
     bool all_angular = true;  // false: {DC, Planar, H, V} のみ
     bool dict = false;        // 辞書予測 (§10)
     bool fir = true;          // FIR 動き平滑 (§7.3)
+    bool rect = false;        // 長方形予測分割 (2NxN / Nx2N)
+    bool tmvp = false;        // 時間方向動きベクトル候補
 };
 
 // インター予測の文脈 (プレーン単位)
@@ -90,6 +92,11 @@ struct InterCtx {
     MotionField* mf = nullptr;  // 輝度が書き、色差は読み取り専用
     int chroma_shift = 0;       // 色差プレーンの縮小 (420: 1)
     int gmv_x = 0, gmv_y = 0;   // グローバル動き (1/4 輝度画素)
+    // 時間方向候補: 同位置ピクチャ (L1[0] があればそれ、なければ L0[0]) の動きベクトル場
+    const MotionField* col = nullptr;
+    int col_poc = 0, cur_poc = 0;
+    int col_ref_poc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
+    int ref_poc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
 };
 
 // 符号器探索パラメータ (ビットストリームに影響しない)
@@ -129,6 +136,9 @@ private:
         int pt = 0;  // 0: イントラ, 1: IBC, 2: インター, 3: 辞書
         MotionInfo mi;       // pt==2
         int merge = -1;      // pt==2: マージ候補番号 (-1: 明示)
+        int part = 0;        // pt==2 (輝度): 0 = 2Nx2N, 1 = 2NxN (上下), 2 = Nx2N (左右)
+        MotionInfo mi2;      // 第 2 区画の動き
+        int merge2 = -1;
         int dict_idx = 0, dict_gain = 0;  // pt==3: サイズ別リスト内の位置, ゲイン (1/16)
         int mode = kModePlanar, alpha = 0, bvx = 0, bvy = 0;
         int qmode = 0;  // 0: デッドゾーンスカラ, 1: E8 格子 VQ
@@ -173,10 +183,15 @@ private:
     bool ibc_valid(int rx, int ry, int s) const;
     void ibc_search(int x0, int y0, int s, int& bx, int& by) const;
     bool is_luma() const { return plane_ == 0; }
-    int merge_list(int x0, int y0, MotionInfo* out) const;
+    static constexpr int kMaxMerge = 5;
+    int merge_list(int x0, int y0, int w, int h, MotionInfo* out) const;
+    bool temporal_cand(int x, int y, MotionInfo& out) const;
+    void code_motion(SymIO& io, Models& md, uint32_t L, int x0, int y0, int w, int h, MotionInfo& m, int& merge);
+    void fill_mf(const Leaf& lf, int x0, int y0, int s);
+    void rect_search(int x0, int y0, int s, std::vector<Leaf>& cands);
     void mv_pred(int x0, int y0, int list, int ref, int& px, int& py) const;
-    int64_t me_cost(int x0, int y0, int s, const MotionInfo& mi) const;
-    void motion_search(int x0, int y0, int s, std::vector<Leaf>& cands) const;
+    int64_t me_cost(int x0, int y0, int w, int h, const MotionInfo& mi) const;
+    void motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& cands) const;
     void dict_search(int x0, int y0, int s, std::vector<Leaf>& cands) const;
     void rdoq(Leaf& lf, int l, const std::vector<double>& e) const;
     void quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) const;
