@@ -21,7 +21,7 @@ struct EncoderConfig {
     int ibc = -1;             // -1: プリセット依存, 0/1: 強制
     int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1;
     int keyint = 0;           // I フレーム間隔 (0: 先頭のみ)
-    int bframes = -1;         // -1: プリセット依存, 0: なし, 1: B フレーム 1 枚 (P B P B ...)
+    int bframes = -1;         // アンカー間の B 枚数 (階層 B, 0..15)。-1: プリセット依存
     int refs = -1;            // P の参照枚数 (1..4), -1: プリセット依存
     bool copy_frames = true;  // 静止区間を COPY フレームで符号化
     bool keep_recon = false;  // 再構成を表示順で保持 (テスト/PSNR 用)
@@ -59,12 +59,12 @@ private:
     EncoderConfig cfg_;
     std::unique_ptr<CodecState> st_;
     int next_poc_ = 0;
-    bool have_pending_ = false;
-    Frame pending_;
-    int pending_poc_ = 0;
+    std::vector<std::pair<int, Frame>> pend_;  // 未符号化フレーム (表示順)
+    std::vector<uint8_t> flush_pending();
+    void encode_b_range(const std::vector<std::pair<int, Frame>>& v, int a, int b, int depth, std::vector<uint8_t>& out);
     std::vector<FrameStats> stats_;
     std::map<int, Frame> recon_;
-    std::vector<uint8_t> encode_picture(const Frame& f, int poc, FrameType type);
+    std::vector<uint8_t> encode_picture(const Frame& f, int poc, FrameType type, int depth = 0);
 };
 
 class Decoder {

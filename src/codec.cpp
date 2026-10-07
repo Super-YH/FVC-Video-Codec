@@ -230,7 +230,7 @@ Tools tools_from_byte(uint8_t b) {
     return t;
 }
 
-struct Picture { int poc = 0; Frame f; };
+struct Picture { int poc = 0; Frame f; bool anchor = true; };
 
 // タイルごとの独立 rANS ストリーム (符号器は出力を蓄積、復号器は順に消費)
 struct TileStreams {
@@ -245,13 +245,13 @@ struct TileStreams {
 struct CodecState {
     std::deque<Picture> dpb;  // 復号順、最大 kMaxDpb
     Dictionary dict;
-    static constexpr size_t kMaxDpb = 6;
+    static constexpr size_t kMaxDpb = 12;
     const Frame* find(int poc) const {
         for (const auto& p : dpb) if (p.poc == poc) return &p.f;
         return nullptr;
     }
-    void push(int poc, const Frame& f) {
-        dpb.push_back({poc, f});
+    void push(int poc, const Frame& f, bool anchor) {
+        dpb.push_back({poc, f, anchor});
         while (dpb.size() > kMaxDpb) dpb.pop_front();
     }
 };
@@ -664,7 +664,7 @@ std::vector<uint8_t> Encoder::sequence_header() const {
     return out;
 }
 
-std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType type) {
+std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType type, int depth) {
     FrameParams fp = params_from(cfg_);
     fp.poc = poc;
     fp.type = type;
@@ -673,7 +673,9 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
     } else {
         // 参照選択: L0 = 過去 (近い順), L1 = 未来 (近い順)
         std::vector<int> past, fut;
-        for (const auto& p : st_->dpb) (p.poc < poc ? past : fut).push_back(p.poc);
+        // P はアンカー (I/P) のみ参照、B は全参照可
+        for (const auto& p : st_->dpb)
+            if (type == FrameType::B || p.anchor) (p.poc < poc ? past : fut).push_back(p.poc);
         std::sort(past.begin(), past.end(), std::greater<int>());
         std::sort(fut.begin(), fut.end());
         int nref = cfg_.refs > 0 ? cfg_.refs
@@ -683,9 +685,9 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         for (int i = 0; i < nref && i < static_cast<int>(past.size()); ++i) fp.ref_poc[0].push_back(past[i]);
         if (fp.ref_poc[0].empty()) { type = fp.type = FrameType::I; fp.dict_reset = true; }
         if (type == FrameType::B) fp.ref_poc[1].push_back(fut[0]);
-        constexpr int kPOff = 1, kBOff = 3;
-        if (type == FrameType::P) fp.qp = std::min(63, fp.qp + kPOff);
-        if (type == FrameType::B) fp.qp = std::min(63, fp.qp + kBOff);
+        // QP カスケード: P +1, B は階層深さ d に応じて +1+d
+        if (type == FrameType::P) fp.qp = std::min(63, fp.qp + 1);
+        if (type == FrameType::B) fp.qp = std::min(63, fp.qp + 1 + std::max(1, depth));
     }
     if (type == FrameType::I) fp.ref_poc[0].clear();
     auto run = [&](FrameParams& par, Frame& rec) {
@@ -728,7 +730,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
     if (!done) payload = run(fp, rec);
     std::vector<uint8_t> out;
     put_unit(out, UnitType::Frame, payload);
-    st_->push(poc, rec);
+    st_->push(poc, rec, type != FrameType::B);
     FrameStats fs;
     fs.poc = poc;
     fs.type = type;
@@ -742,30 +744,46 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
 std::vector<uint8_t> Encoder::encode(const Frame& f) {
     const int poc = next_poc_++;
     const bool key = poc == 0 || (cfg_.keyint > 0 && poc % cfg_.keyint == 0);
-    int bf = cfg_.bframes >= 0 ? cfg_.bframes : (cfg_.preset >= Preset::Medium ? 1 : 0);
+    int bf = cfg_.bframes >= 0 ? cfg_.bframes
+                               : (cfg_.preset == Preset::Faster ? 3 : 7);
+    bf = std::clamp(bf, 0, 15);
     if (!cfg_.lossy_layer) bf = 0;
     std::vector<uint8_t> out;
     auto append = [&](const std::vector<uint8_t>& u) { out.insert(out.end(), u.begin(), u.end()); };
     if (key) {
-        if (have_pending_) { append(encode_picture(pending_, pending_poc_, FrameType::P)); have_pending_ = false; }
+        append(flush_pending());
         append(encode_picture(f, poc, FrameType::I));
         return out;
     }
-    if (bf == 0) { append(encode_picture(f, poc, FrameType::P)); return out; }
-    if (!have_pending_) { pending_ = f; pending_poc_ = poc; have_pending_ = true; return out; }
-    // P B 並べ替え: 新フレームを P として先に符号化し、保留フレームを B に
-    append(encode_picture(f, poc, FrameType::P));
-    append(encode_picture(pending_, pending_poc_, FrameType::B));
-    have_pending_ = false;
+    pend_.push_back({poc, f});
+    if (static_cast<int>(pend_.size()) >= bf + 1) append(flush_pending());
     return out;
 }
 
-std::vector<uint8_t> Encoder::flush() {
+// 保留フレームを符号化: 最後をアンカー P、間を二分の階層 B (中央から)
+std::vector<uint8_t> Encoder::flush_pending() {
     std::vector<uint8_t> out;
-    if (have_pending_) {
-        out = encode_picture(pending_, pending_poc_, FrameType::P);
-        have_pending_ = false;
-    }
+    if (pend_.empty()) return out;
+    std::vector<std::pair<int, Frame>> v;
+    v.swap(pend_);
+    const int n = static_cast<int>(v.size());
+    const auto u = encode_picture(v[n - 1].second, v[n - 1].first, FrameType::P);
+    out.insert(out.end(), u.begin(), u.end());
+    encode_b_range(v, -1, n - 1, 1, out);
+    return out;
+}
+
+void Encoder::encode_b_range(const std::vector<std::pair<int, Frame>>& v, int a, int b, int depth, std::vector<uint8_t>& out) {
+    if (b - a < 2) return;
+    const int mid = (a + b) / 2;
+    const auto u = encode_picture(v[mid].second, v[mid].first, FrameType::B, depth);
+    out.insert(out.end(), u.begin(), u.end());
+    encode_b_range(v, a, mid, depth + 1, out);
+    encode_b_range(v, mid, b, depth + 1, out);
+}
+
+std::vector<uint8_t> Encoder::flush() {
+    std::vector<uint8_t> out = flush_pending();
     put_unit(out, UnitType::Eos, {});
     return out;
 }
@@ -823,7 +841,7 @@ bool Decoder::decode_unit() {
         io.r = &er;
         Frame f;
         code_frame(io, info_, fp, nullptr, f, *st_, ts);
-        st_->push(fp.poc, f);
+        st_->push(fp.poc, f, fp.type != FrameType::B);
         out_[fp.poc] = std::move(f);
         return true;
     }
