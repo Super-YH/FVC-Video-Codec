@@ -27,6 +27,7 @@ struct EncoderConfig {
     bool keep_recon = false;  // 再構成を表示順で保持 (テスト/PSNR 用)
     int tile_cols = 0, tile_rows = 0;  // 0: プリセット依存
     int threads = 0;          // 0: ハードウェアスレッド数
+    int chroma_qp_offset = 0; // 色差 QP オフセット (-12..12)
 };
 
 // ユニット種別 (仕様 §12.1)

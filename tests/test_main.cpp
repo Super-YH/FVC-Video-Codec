@@ -200,6 +200,8 @@ static void test_codec() {
         {"placebo-l2", true, true, 0, 28, Preset::Placebo, 3, 1, 0, false},
         {"pqmf-l2", true, true, 2, 30, Preset::Medium, 2, 0, 0, false},
         {"pqmf-psy", true, false, 1, 25, Preset::Medium, 3, 0, 0, true},
+        {"medium-B3", true, false, 0, 32, Preset::Medium, 9, 3, 0, false},
+        {"fast-B7-key", true, false, 0, 30, Preset::Fast, 13, 7, 6, false},
     };
     for (const Case& c : cases) {
         EncoderConfig cfg;

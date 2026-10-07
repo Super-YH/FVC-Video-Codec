@@ -210,6 +210,7 @@ struct FrameParams {
     bool dict_reset = false;
     bool lf = true, lf_freq = false, lf_map = false;  // ループフィルタ (§9)
     int tile_cols = 1, tile_rows = 1;                  // タイル分割 (CTU 単位で均等)
+    int cqp_off = 0;                                   // 色差 QP オフセット
     int threads = 1;                                   // 符号器/復号器のスレッド数 (ビットストリームに影響しない)
     // 符号器: グローバルパラメータのキャッシュ (COPY 判定と本符号化で共有)
     mutable bool gm_valid = false;
@@ -400,14 +401,15 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         if (org) opad = pad_plane(org->p[pi], W, H);
         Plane R(W, H, 0);
         if (fp.lossy) {
-            const double step = qp_step(fp.qp, info.bit_depth);
+            const int pqp = std::clamp(fp.qp + (pi ? fp.cqp_off : 0), 0, 63);
+            const double step = qp_step(pqp, info.bit_depth);
             if (fp.pqmf_log2 > 0 && !inter) {
                 code_bands(io, md, fp.pqmf_log2, org ? &opad : nullptr, R, step, 1.0 / 3.0, lo, hi, fp.band_tools, fp.psy,
                            static_cast<uint64_t>(fp.poc) * 3 + pi);
             } else {
                 Plane lds;
                 if (pi > 0 && fp.tools.cfl) lds = luma_at_chroma(luma_rec, info, W, H);
-                const double lambda = 0.57 * std::pow(2.0, (fp.qp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
+                const double lambda = 0.57 * std::pow(2.0, (pqp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
                 // 図形レイヤ (§4): 輝度のみ、I フレームのみ。符号器は RD で採否を決める
                 std::vector<Shape> shapes;
                 Plane S(W, H, 0);
@@ -504,7 +506,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 if (use_shapes)
                     for (size_t i = 0; i < R.v.size(); ++i) R.v[i] = std::clamp(R.v[i] + S.v[i], lo, hi);
                 if (fp.lf) {
-                    code_loop_filter(io, md.lf, R, org ? &opad : nullptr, einfo, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, fp.qp,
+                    code_loop_filter(io, md.lf, R, org ? &opad : nullptr, einfo, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, pqp,
                                      info.bit_depth, step, lambda, fp.lf_freq, fp.lf_map, lo, hi);
                 }
             }
@@ -548,6 +550,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
 FrameParams params_from(const EncoderConfig& c) {
     FrameParams fp;
     fp.qp = std::clamp(c.qp, 0, 63);
+    fp.cqp_off = std::clamp(c.chroma_qp_offset, -12, 12);
     fp.lossy = c.lossy_layer;
     fp.l2 = c.l2_lossless;
     fp.pqmf_log2 = std::clamp(c.pqmf_log2, 0, 4);
@@ -607,6 +610,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, (fp.shapes ? 1u : 0u) | (fp.band_tools ? 2u : 0u) | (fp.dict_reset ? 4u : 0u) | (fp.lf ? 8u : 0u) |
                   (fp.lf_freq ? 16u : 0u) | (fp.lf_map ? 32u : 0u));
     put_u8(p, static_cast<uint32_t>((fp.tile_cols - 1) | ((fp.tile_rows - 1) << 4)));
+    put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_u32(p, static_cast<uint32_t>(poc));
@@ -630,6 +634,8 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     const uint32_t tl = br.u8();
     fp.tile_cols = static_cast<int>(tl & 15) + 1;
     fp.tile_rows = static_cast<int>(tl >> 4) + 1;
+    fp.cqp_off = static_cast<int>(br.u8()) - 32;
+    if (fp.cqp_off < -12 || fp.cqp_off > 12) return false;
     for (int l = 0; l < 2; ++l) {
         const uint32_t n = br.u8();
         if (n > 4) return false;
@@ -686,10 +692,16 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         if (fp.ref_poc[0].empty()) { type = fp.type = FrameType::I; fp.dict_reset = true; }
         if (type == FrameType::B) fp.ref_poc[1].push_back(fut[0]);
         // QP カスケード: P +1, B は階層深さ d に応じて +1+d
-        if (type == FrameType::P) fp.qp = std::min(63, fp.qp + 1);
-        if (type == FrameType::B) fp.qp = std::min(63, fp.qp + 1 + std::max(1, depth));
+        // QP カスケード (実測で決定: I -5, P -2, B +1+深さ)
+        constexpr int kPOff = -2, kBOff = 1;
+        if (type == FrameType::P) fp.qp = std::clamp(fp.qp + kPOff, 0, 63);
+        if (type == FrameType::B) fp.qp = std::clamp(fp.qp + kBOff + std::max(1, depth), 0, 63);
     }
-    if (type == FrameType::I) fp.ref_poc[0].clear();
+    if (type == FrameType::I) {
+        fp.ref_poc[0].clear();
+        constexpr int kIOff = -5;
+        fp.qp = std::clamp(fp.qp + kIOff, 0, 63);
+    }
     auto run = [&](FrameParams& par, Frame& rec) {
         EntropyWriter ew;
         SymIO io;

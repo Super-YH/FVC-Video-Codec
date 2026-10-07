@@ -21,7 +21,7 @@ static bool ends_with(const std::string& s, const char* suf) {
 static int usage() {
     std::fprintf(stderr,
                  "usage:\n  fvc enc [-q QP] [--preset faster|fast|medium|slow|placebo] [--lossless] [--l2] [--pqmf N]"
-                 " [--frames N]\n      [--keyint N] [--bframes 0|1] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
+                 " [--frames N]\n      [--keyint N] [--bframes 0|1] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
     return 2;
 }
 
@@ -50,6 +50,7 @@ static int cmd_enc(int argc, char** argv) {
         else if (a == "-v") verbose = true;
         else if (a == "--tiles" && i + 2 < argc) { cfg.tile_cols = std::atoi(argv[++i]); cfg.tile_rows = std::atoi(argv[++i]); }
         else if (a == "--threads" && i + 1 < argc) cfg.threads = std::atoi(argv[++i]);
+        else if (a == "--cqp" && i + 1 < argc) cfg.chroma_qp_offset = std::atoi(argv[++i]);
         else if (a.rfind("--dict=", 0) == 0) cfg.dict = std::atoi(a.c_str() + 7);
         else if (a.rfind("--shapes=", 0) == 0) cfg.shapes = std::atoi(a.c_str() + 9);
         else if (a.rfind("--fir=", 0) == 0) cfg.fir = std::atoi(a.c_str() + 6);
