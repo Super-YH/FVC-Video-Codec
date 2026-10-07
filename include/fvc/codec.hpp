@@ -29,17 +29,36 @@ struct EncoderConfig {
     int tile_cols = 0, tile_rows = 0;  // 0: プリセット依存
     int threads = 0;          // 0: ハードウェアスレッド数
     int chroma_qp_offset = 0; // 色差 QP オフセット (-12..12)
+    double target_ssim = 0;   // >0: フレームごとに輝度 SSIM がこの値以上となる最大 QP を探索
 };
 
 // ユニット種別 (仕様 §12.1)
 enum class UnitType : uint8_t { Seq = 0, Frame = 1, Tile = 2, Dict = 3, Sei = 4, Eos = 5 };
 enum class FrameType : uint8_t { I = 0, P = 1, B = 2, Copy = 3 };
 
+// ブロック使用統計 (輝度の面積 [画素] で集計、CfL のみ色差)
+struct BlockUsage {
+    uint64_t intra = 0, inter = 0, ibc = 0, dict = 0;  // 予測種別
+    uint64_t merge = 0, skip = 0, rect = 0, bi = 0;    // インターの内訳 (skip = マージかつ残差なし)
+    uint64_t size[7] = {0, 0, 0, 0, 0, 0, 0};          // 4x4 .. 256x256 (log2 2..8)
+    uint64_t tns = 0, e8 = 0, cfl = 0, leaves = 0;
+    void add(const BlockUsage& o) {
+        intra += o.intra; inter += o.inter; ibc += o.ibc; dict += o.dict;
+        merge += o.merge; skip += o.skip; rect += o.rect; bi += o.bi;
+        for (int i = 0; i < 7; ++i) size[i] += o.size[i];
+        tns += o.tns; e8 += o.e8; cfl += o.cfl; leaves += o.leaves;
+    }
+};
+
 struct FrameStats {
     int poc = 0;
     FrameType type = FrameType::I;
     size_t bytes = 0;
+    int qp = 0;
+    int trials = 1;         // 目標 SSIM 探索での符号化回数
     double psnr[3] = {0, 0, 0};
+    double ssim = 0;        // 輝度 SSIM
+    BlockUsage usage;
 };
 
 struct CodecState;  // DPB と辞書 (符号器・復号器で同一に更新)
@@ -69,6 +88,7 @@ private:
     std::vector<uint8_t> encode_picture(const Frame& f, int poc, FrameType type, int depth = 0,
                                         const std::vector<const Frame*>& look = {});
     bool key_pending_ = false;
+    int last_q_[4] = {-1, -1, -1, -1};  // 目標 SSIM: フレーム種別ごとの直前 QP
 };
 
 class Decoder {

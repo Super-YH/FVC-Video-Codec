@@ -36,3 +36,15 @@ cmake -S . -B build && cmake --build build -j && ./build/fvc_tests
 ```
 
 追加オプション: `--refs N`, `--no-copy`, `--dict=0|1`, `--shapes=0|1`, `--fir=0|1`, `-v` (フレーム別統計)
+
+## エンコード情報の表示と目標 SSIM
+
+既定で LAME 風の表示を行います (`--quiet` で抑制、`-v` でフレームごとの QP/サイズ/PSNR/SSIM)。
+
+- 開始時: 入力形式、モード (固定 QP / 目標 SSIM / ロスレス)、プリセット
+- 進捗: フレーム数と割合、CPU/実時間と推定、再生速度比、残り時間、kbps、平均 PSNR-Y、平均 SSIM
+- 終了時: フレーム種別ごとの枚数・平均サイズ・QP 分布、ブロックモード (イントラ/インター/マージ/スキップ/双予測/長方形/IBC/辞書) とブロックサイズの面積比、平均 PSNR/SSIM、ビットレート、速度
+
+```sh
+./build/fvc enc --preset fast --ssim 0.95 in.y4m out.fvc   # 各フレームの輝度 SSIM ≥ 0.95 となる最大 QP を探索
+```

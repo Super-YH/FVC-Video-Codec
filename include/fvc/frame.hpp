@@ -62,5 +62,9 @@ bool write_ppm_ycocg(const std::string& path, const Frame& f, const VideoInfo& i
 void plane_range(const VideoInfo& info, int plane, int32_t& lo, int32_t& hi);
 
 double plane_psnr(const Plane& a, const Plane& b, int bit_depth);
+// SSIM (8x8 窓, 4 画素間隔, C1=(0.01L)^2, C2=(0.03L)^2)
+double plane_ssim(const Plane& a, const Plane& b, int bit_depth);
+// Y4M の総フレーム数 (ファイルサイズから推定、不明なら -1)
+int y4m_frame_count(const std::string& path, const VideoInfo& info);
 
 }  // namespace fvc

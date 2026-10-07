@@ -1094,6 +1094,25 @@ void BlockCoder::code_leaf(SymIO& io, Models& md, Leaf& lf, int x0, int y0, int 
     }
     set_modes4(x0, y0, s, lf.pt ? kModePlanar : lf.mode);
     fill_mf(lf, x0, y0, s);
+    if (io.w) {  // 符号器の統計 (輝度面積)
+        const uint64_t a = static_cast<uint64_t>(s) * s;
+        if (plane_ == 0) {
+            ++usage_.leaves;
+            usage_.size[std::clamp(l - 2, 0, 6)] += a;
+            if (lf.pt == 2) {
+                usage_.inter += a;
+                if (lf.part) usage_.rect += a;
+                else if (lf.merge >= 0) { usage_.merge += a; if (lf.last < 0) usage_.skip += a; }
+                if (lf.mi.dir == 3) usage_.bi += a;
+            } else if (lf.pt == 1) usage_.ibc += a;
+            else if (lf.pt == 3) usage_.dict += a;
+            else usage_.intra += a;
+            if (lf.tns_on) usage_.tns += a;
+            if (lf.qmode == 1 && lf.last >= 0) usage_.e8 += a;
+        } else if (lf.pt == 0 && lf.mode == kModeCfl) {
+            usage_.cfl += a;
+        }
+    }
 }
 
 double BlockCoder::leaf_rate(Leaf& lf, int x0, int y0, int l) {

@@ -8,6 +8,7 @@
 #include "fvc/frame.hpp"
 #include "fvc/transform.hpp"
 #include "inter.hpp"
+#include "fvc/codec.hpp"
 
 namespace fvc { class Dictionary; }
 
@@ -129,6 +130,7 @@ public:
     void enable_aqp(int base_qp, int bit_depth, int (*)(void*, int, int), void* ctx) ;
     // ループフィルタ用 4x4 ブロック情報
     const std::vector<int32_t>& leaf_ids() const { return leaf4_; }
+    const BlockUsage& usage() const { return usage_; }
     const std::vector<uint8_t>& leaf_flags() const { return flags4_; }
 
 private:
@@ -207,6 +209,7 @@ private:
     double leaf_rate(Leaf& lf, int x0, int y0, int l);
     double split_rate(int x0, int y0, int l, int split);
     Models* md_ = nullptr;
+    BlockUsage usage_;
     bool aqp_ = false;
     int base_qp_ = 0, bit_depth_ = 8, prev_dqp_ = 0;
     int (*dqp_fn_)(void*, int, int) = nullptr;

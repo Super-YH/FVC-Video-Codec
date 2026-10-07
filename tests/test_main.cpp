@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 
 #include "fvc/codec.hpp"
@@ -202,11 +203,13 @@ static void test_codec() {
         {"pqmf-psy", true, false, 1, 25, Preset::Medium, 3, 0, 0, true},
         {"medium-B3", true, false, 0, 32, Preset::Medium, 9, 3, 0, false},
         {"fast-B7-key", true, false, 0, 30, Preset::Fast, 13, 7, 6, false},
+        {"ssim-target", true, false, 0, 30, Preset::Fast, 6, 3, 0, false},
     };
     for (const Case& c : cases) {
         EncoderConfig cfg;
         cfg.lossy_layer = c.lossy; cfg.l2_lossless = c.l2; cfg.pqmf_log2 = c.pqmf; cfg.qp = c.qp; cfg.preset = c.pr;
         cfg.bframes = c.bframes; cfg.keyint = c.keyint; cfg.psy = c.psy; cfg.keep_recon = true;
+        if (std::string(c.name) == "ssim-target") cfg.target_ssim = 0.97;
         Encoder enc(info, cfg);
         auto s = enc.sequence_header();
         std::vector<Frame> src;
@@ -237,6 +240,8 @@ static void test_codec() {
             CHECK(false);
         }
         CHECK(n == c.frames);
+        if (cfg.target_ssim > 0)
+            for (const auto& st : enc.stats()) CHECK(st.ssim >= cfg.target_ssim || st.qp == 0);
         int types[4] = {0, 0, 0, 0};
         for (const auto& st : enc.stats()) ++types[static_cast<int>(st.type)];
         std::printf("codec %-12s: %d frames (I%d P%d B%d C%d) -> %zu bytes, PSNR-Y %.2f\n", c.name, n, types[0], types[1],

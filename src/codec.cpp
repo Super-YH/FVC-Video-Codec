@@ -334,7 +334,7 @@ void estimate_global_motion(const Plane& cur, const Plane& ref, int& gx, int& gy
 
 // フレームのペイロード (rANS) を符号化/復号。org==nullptr なら復号。
 void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const Frame* org, Frame& rec, CodecState& st,
-                TileStreams& ts) {
+                TileStreams& ts, BlockUsage* usage = nullptr) {
     Models md;
     rec.p.resize(3);
     if (fp.dict_reset) st.dict.reset_dynamic();
@@ -534,6 +534,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 }
                 for (const auto& e : errs) if (!e.empty()) throw std::runtime_error(e);
                 if (io.enc) for (int t = 0; t < nt; ++t) ts.out.push_back(tw[t]->finish());
+                if (usage) for (int t = 0; t < nt; ++t) usage->add(coders[t]->usage());
                 // ループフィルタ用のブロック情報をタイルから合成
                 EdgeInfo einfo;
                 einfo.w4 = W / 4; einfo.h4 = H / 4;
@@ -773,6 +774,9 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
     }
     // 適応 QP: 後続フレーム (このフレームを直接/間接に参照する) との同位置差分が小さい CTU ほど QP を下げる
     const bool aqp_on = cfg_.aqp >= 0 ? cfg_.aqp != 0 : true;
+    auto apply_aqp = [&](FrameParams& fp) {
+    fp.aqp = false;
+    fp.aqp_map.clear();
     if (aqp_on && cfg_.lossy_layer && !look.empty() && fp.pqmf_log2 == 0) {
         const Plane& A = f.p[0];
         const int aw = (A.w + kCtu - 1) / kCtu, ah = (A.h + kCtu - 1) / kCtu;
@@ -801,13 +805,17 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         fp.aqp = any;
         if (!any) fp.aqp_map.clear();
     }
+    };
+    apply_aqp(fp);
+    BlockUsage usage;
     auto run = [&](FrameParams& par, Frame& rec) {
         EntropyWriter ew;
         SymIO io;
         io.w = &ew;
         io.enc = true;
         TileStreams ts;
-        code_frame(io, info_, par, &f, rec, *st_, ts);
+        usage = BlockUsage{};
+        code_frame(io, info_, par, &f, rec, *st_, ts, &usage);
         std::vector<uint8_t> p;
         write_frame_header(p, par);
         auto bytes = ew.finish();
@@ -823,13 +831,16 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
     Frame rec;
     std::vector<uint8_t> payload;
     bool done = false;
+    int trials = 0;
+    const bool ssim_mode = cfg_.target_ssim > 0 && cfg_.lossy_layer && !cfg_.l2_lossless;
     if (type != FrameType::I && cfg_.copy_frames && cfg_.lossy_layer && !cfg_.l2_lossless) {
-        // COPY 判定: グローバル予測の MSE が量子化雑音相当以下なら COPY (辞書状態は変化しない)
+        // COPY 判定: グローバル予測の MSE が量子化雑音相当以下 (目標 SSIM 時は SSIM を満たす) なら COPY
         FrameParams cp = fp;
         cp.type = FrameType::Copy;
         cp.ref_poc[1].clear();
         Frame crec;
         auto pl = run(cp, crec);
+        ++trials;
         fp.gm_valid = cp.gm_valid;
         fp.gm_x = cp.gm_x; fp.gm_y = cp.gm_y;
         for (int pi = 0; pi < 3; ++pi) { fp.gm_gain[pi] = cp.gm_gain[pi]; fp.gm_off[pi] = cp.gm_off[pi]; }
@@ -838,9 +849,68 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         for (size_t i = 0; i < f.p[0].v.size(); ++i) { const double d = f.p[0].v[i] - crec.p[0].v[i]; se += d * d; }
         // 実測の量子化歪み (RDO 後) は Δ²/12 の 1 割未満なので、それと同等以下の時のみ COPY
         constexpr double kCopyK = 0.06;
-        if (se / f.p[0].v.size() <= kCopyK * step * step / 12.0) { payload = std::move(pl); rec = std::move(crec); done = true; type = FrameType::Copy; }
+        const bool ok = ssim_mode ? plane_ssim(f.p[0], crec.p[0], info_.bit_depth) >= cfg_.target_ssim
+                                  : se / f.p[0].v.size() <= kCopyK * step * step / 12.0;
+        if (ok) { payload = std::move(pl); rec = std::move(crec); done = true; type = FrameType::Copy; }
     }
-    if (!done) payload = run(fp, rec);
+    if (!done && ssim_mode) {
+        // 目標 SSIM: 種別ごとに前回 QP から探索し、条件を満たす最大 QP を選ぶ。
+        // 試行ごとに辞書・動き情報の状態を戻し、採用した試行の状態を復元する。
+        const Dictionary dict0 = st_->dict;
+        struct Trial { int qp; double ssim; std::vector<uint8_t> payload; Frame rec; Dictionary dict; std::shared_ptr<MotionField> mf;
+                       std::vector<int> rp[2]; BlockUsage usage; };
+        std::vector<Trial> tr;
+        auto attempt = [&](int q) -> const Trial& {
+            for (const Trial& t : tr) if (t.qp == q) return t;
+            st_->dict = dict0;
+            FrameParams par = fp;
+            par.qp = q;
+            apply_aqp(par);
+            Trial t;
+            t.qp = q;
+            t.payload = run(par, t.rec);
+            ++trials;
+            t.ssim = plane_ssim(f.p[0], t.rec.p[0], info_.bit_depth);
+            t.dict = st_->dict;
+            t.mf = st_->last_mf;
+            t.rp[0] = st_->last_ref_poc[0]; t.rp[1] = st_->last_ref_poc[1];
+            t.usage = usage;
+            tr.push_back(std::move(t));
+            return tr.back();
+        };
+        const int ti = static_cast<int>(type);
+        int q = last_q_[ti] >= 0 ? last_q_[ti] : fp.qp;
+        const double T = cfg_.target_ssim;
+        if (attempt(q).ssim >= T) {
+            // 満たす → QP を 2 ずつ上げ、失敗したら間の +1 を試す
+            while (q + 2 <= 63 && tr.size() < 8 && attempt(q + 2).ssim >= T) q += 2;
+            if (q + 1 <= 63 && attempt(q + 1).ssim >= T) q += 1;
+        } else {
+            // 満たさない → 満たすまで 2 ずつ下げ (QP 0 まで)、成功したら間の +1 を試す
+            while (q > 0) {
+                q = std::max(0, q - 2);
+                if (attempt(q).ssim >= T) break;
+            }
+            if (attempt(q).ssim >= T && attempt(q + 1).ssim >= T) q += 1;
+        }
+        // 条件を満たす最大 QP (なければ最小 QP の試行)
+        const Trial* best = nullptr;
+        for (const Trial& t : tr)
+            if (t.ssim >= T && (!best || t.qp > best->qp)) best = &t;
+        if (!best)
+            for (const Trial& t : tr)
+                if (!best || t.qp < best->qp) best = &t;
+        last_q_[ti] = best->qp;
+        fp.qp = best->qp;
+        payload = best->payload;
+        rec = best->rec;
+        st_->dict = best->dict;
+        st_->last_mf = best->mf;
+        st_->last_ref_poc[0] = best->rp[0]; st_->last_ref_poc[1] = best->rp[1];
+        usage = best->usage;
+        done = true;
+    }
+    if (!done) { payload = run(fp, rec); ++trials; }
     std::vector<uint8_t> out;
     put_unit(out, UnitType::Frame, payload);
     st_->push(poc, rec, type != FrameType::B);
@@ -849,6 +919,10 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
     fs.type = type;
     fs.bytes = out.size();
     for (int p = 0; p < 3; ++p) fs.psnr[p] = plane_psnr(f.p[p], rec.p[p], info_.bit_depth);
+    fs.ssim = plane_ssim(f.p[0], rec.p[0], info_.bit_depth);
+    fs.qp = fp.qp;
+    fs.trials = trials;
+    fs.usage = usage;
     stats_.push_back(fs);
     if (cfg_.keep_recon) recon_[poc] = rec;
     return out;

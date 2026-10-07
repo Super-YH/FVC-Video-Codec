@@ -149,4 +149,38 @@ double plane_psnr(const Plane& a, const Plane& b, int bit_depth) {
     return 10.0 * std::log10(peak * peak * a.v.size() / se);
 }
 
+double plane_ssim(const Plane& a, const Plane& b, int bit_depth) {
+    const double L = (1 << bit_depth) - 1, c1 = (0.01 * L) * (0.01 * L), c2 = (0.03 * L) * (0.03 * L);
+    double sum = 0;
+    int n = 0;
+    for (int y = 0; y + 8 <= a.h; y += 4)
+        for (int x = 0; x + 8 <= a.w; x += 4) {
+            double sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+            for (int j = 0; j < 8; ++j)
+                for (int i = 0; i < 8; ++i) {
+                    const double va = a.at(x + i, y + j), vb = b.at(x + i, y + j);
+                    sa += va; sb += vb; saa += va * va; sbb += vb * vb; sab += va * vb;
+                }
+            const double ma = sa / 64, mb = sb / 64;
+            const double va = saa / 64 - ma * ma, vb = sbb / 64 - mb * mb, cov = sab / 64 - ma * mb;
+            sum += ((2 * ma * mb + c1) * (2 * cov + c2)) / ((ma * ma + mb * mb + c1) * (va + vb + c2));
+            ++n;
+        }
+    return n ? sum / n : 1.0;
+}
+
+int y4m_frame_count(const std::string& path, const VideoInfo& info) {
+    FILE* fp = std::fopen(path.c_str(), "rb");
+    if (!fp) return -1;
+    std::string hdr;
+    int c;
+    while ((c = std::fgetc(fp)) != EOF && c != '\n') hdr.push_back(static_cast<char>(c));
+    const long start = std::ftell(fp);
+    std::fseek(fp, 0, SEEK_END);
+    const long end = std::ftell(fp);
+    std::fclose(fp);
+    const long fsz = 6L + info.width * static_cast<long>(info.height) + 2L * info.chroma_w() * info.chroma_h();
+    return fsz > 0 ? static_cast<int>((end - start) / fsz) : -1;
+}
+
 }  // namespace fvc
