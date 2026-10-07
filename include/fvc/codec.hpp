@@ -25,6 +25,8 @@ struct EncoderConfig {
     int refs = -1;            // P の参照枚数 (1..4), -1: プリセット依存
     bool copy_frames = true;  // 静止区間を COPY フレームで符号化
     bool keep_recon = false;  // 再構成を表示順で保持 (テスト/PSNR 用)
+    int tile_cols = 0, tile_rows = 0;  // 0: プリセット依存
+    int threads = 0;          // 0: ハードウェアスレッド数
 };
 
 // ユニット種別 (仕様 §12.1)
@@ -67,7 +69,7 @@ private:
 
 class Decoder {
 public:
-    explicit Decoder(const std::vector<uint8_t>& stream);
+    explicit Decoder(const std::vector<uint8_t>& stream, int threads = 0);
     ~Decoder();
     bool ok() const { return ok_; }
     const VideoInfo& info() const { return info_; }
@@ -81,6 +83,7 @@ private:
     std::map<int, Frame> out_;
     int next_out_ = 0;
     bool eos_ = false;
+    int threads_ = 1;
     bool decode_unit();
 };
 

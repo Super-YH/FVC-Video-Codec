@@ -100,13 +100,16 @@ struct Search {
     int me_range = 16;      // 整数動き探索範囲
     bool me_bi = true;      // 双予測探索
     bool try_fir = true;
+    bool qpel = true;              // 1/4 画素精密化 (false: 1/2 まで)
+    bool inter_skip_intra = false; // インター候補が十分よければイントラを評価しない
 };
 
 class BlockCoder {
 public:
     BlockCoder(Plane* rec, const Plane* org, const Plane* luma, int plane, int32_t lo, int32_t hi, double step,
                double lambda, int min_log2, int max_log2, const Tools& tools, const Search& search,
-               const InterCtx* inter = nullptr, Dictionary* dict = nullptr);
+               const InterCtx* inter = nullptr, Dictionary* dict = nullptr, int tx0 = 0, int ty0 = 0, int tw = 0,
+               int th = 0, int32_t leaf_base = 0);
     // CTU (cx,cy,size) を符号化/復号 (io.w があれば RD 探索も行う)
     void code_ctu(SymIO& io, Models& md, int cx, int cy, int ctu);
     // 符号器: RD 探索のみ行い CTU の RD コストを返す (再構成は rec に残る)
@@ -147,9 +150,12 @@ private:
     std::vector<std::vector<int8_t>> split_map_;
     std::vector<std::vector<Leaf>> leaf_map_;  // [log2] -> grid (符号器の決定)
 
-    int grid_w(int l) const { return rec_->w >> l; }
-    int8_t& split_at(int x, int y, int l) { return split_map_[l][(y >> l) * grid_w(l) + (x >> l)]; }
-    Leaf& leaf_at(int x, int y, int l) { return leaf_map_[l][(y >> l) * grid_w(l) + (x >> l)]; }
+    // タイル (§12.4): 予測参照はタイル内に限定 → タイル単位で並列符号化/復号できる
+    int tx0_ = 0, ty0_ = 0, tx1_ = 0, ty1_ = 0;
+    int grid_w(int l) const { return (tx1_ - tx0_) >> l; }
+    size_t gidx(int x, int y, int l) const { return static_cast<size_t>((y - ty0_) >> l) * grid_w(l) + ((x - tx0_) >> l); }
+    int8_t& split_at(int x, int y, int l) { return split_map_[l][gidx(x, y, l)]; }
+    Leaf& leaf_at(int x, int y, int l) { return leaf_map_[l][gidx(x, y, l)]; }
     TxType tx_for(int s) const { return s == 4 ? TxType::DST7 : TxType::DCT2; }
 
     void mpm(int x0, int y0, int& m0, int& m1) const;

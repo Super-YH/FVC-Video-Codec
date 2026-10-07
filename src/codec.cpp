@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <atomic>
+#include <string>
+#include <thread>
 #include <stdexcept>
 
 #include "fvc/entropy.hpp"
@@ -206,6 +209,8 @@ struct FrameParams {
     bool band_tools = false;   // 帯域間差分/ノイズ置換
     bool dict_reset = false;
     bool lf = true, lf_freq = false, lf_map = false;  // ループフィルタ (§9)
+    int tile_cols = 1, tile_rows = 1;                  // タイル分割 (CTU 単位で均等)
+    int threads = 1;                                   // 符号器/復号器のスレッド数 (ビットストリームに影響しない)
     std::vector<int> ref_poc[2];
     Search search;             // 符号器のみ
     bool psy = false;          // 符号器のみ
@@ -223,6 +228,13 @@ Tools tools_from_byte(uint8_t b) {
 }
 
 struct Picture { int poc = 0; Frame f; };
+
+// タイルごとの独立 rANS ストリーム (符号器は出力を蓄積、復号器は順に消費)
+struct TileStreams {
+    std::vector<std::vector<uint8_t>> out;
+    std::vector<std::pair<const uint8_t*, size_t>> in;
+    size_t next = 0;
+};
 
 }  // namespace
 
@@ -286,7 +298,8 @@ void estimate_global_motion(const Plane& cur, const Plane& ref, int& gx, int& gy
 }
 
 // フレームのペイロード (rANS) を符号化/復号。org==nullptr なら復号。
-void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const Frame* org, Frame& rec, CodecState& st) {
+void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const Frame* org, Frame& rec, CodecState& st,
+                TileStreams& ts) {
     Models md;
     rec.p.resize(3);
     if (fp.dict_reset) st.dict.reset_dynamic();
@@ -405,19 +418,75 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 Plane target;
                 if (use_shapes && org) { target = opad; for (size_t i = 0; i < target.v.size(); ++i) target.v[i] -= S.v[i]; }
                 const int32_t blo = use_shapes ? lo - hi : lo, bhi = use_shapes ? hi * 2 : hi;
-                BlockCoder bc(&R, org ? (use_shapes ? &target : &opad) : nullptr, (pi > 0 && fp.tools.cfl) ? &lds : nullptr, pi,
-                              blo, bhi, step, lambda, fp.min_log2, fp.max_log2, fp.tools, fp.search, inter ? &ic : nullptr,
-                              &st.dict);
-                for (int cy = 0; cy < H; cy += kCtu)
-                    for (int cx = 0; cx < W; cx += kCtu) bc.code_ctu(io, md, cx, cy, kCtu);
+                // タイル分割と並列符号化/復号
+                const int ncx = W / kCtu, ncy = H / kCtu;
+                const int tcn = std::clamp(fp.tile_cols, 1, ncx), trn = std::clamp(fp.tile_rows, 1, ncy);
+                const int nt = tcn * trn;
+                std::vector<std::unique_ptr<BlockCoder>> coders(nt);
+                std::vector<std::unique_ptr<Models>> tmd(nt);
+                std::vector<std::unique_ptr<EntropyWriter>> tw(nt);
+                std::vector<std::unique_ptr<EntropyReader>> tr(nt);
+                std::vector<SymIO> tio(nt);
+                std::vector<std::array<int, 4>> rect(nt);
+                for (int ty = 0; ty < trn; ++ty)
+                    for (int tx = 0; tx < tcn; ++tx) {
+                        const int t = ty * tcn + tx;
+                        const int x0 = tx * ncx / tcn * kCtu, x1 = (tx + 1) * ncx / tcn * kCtu;
+                        const int y0 = ty * ncy / trn * kCtu, y1 = (ty + 1) * ncy / trn * kCtu;
+                        rect[t] = {x0, y0, x1, y1};
+                        coders[t] = std::make_unique<BlockCoder>(
+                            &R, org ? (use_shapes ? &target : &opad) : nullptr, (pi > 0 && fp.tools.cfl) ? &lds : nullptr, pi, blo,
+                            bhi, step, lambda, fp.min_log2, fp.max_log2, fp.tools, fp.search, inter ? &ic : nullptr, &st.dict, x0,
+                            y0, x1 - x0, y1 - y0, t << 24);
+                        tmd[t] = std::make_unique<Models>();
+                        if (io.enc) {
+                            tw[t] = std::make_unique<EntropyWriter>();
+                            tio[t].w = tw[t].get();
+                            tio[t].enc = true;
+                        } else {
+                            if (ts.next >= ts.in.size()) throw std::runtime_error("corrupt stream: missing tile");
+                            const auto& b = ts.in[ts.next++];
+                            tr[t] = std::make_unique<EntropyReader>(b.first, b.second);
+                            tio[t].r = tr[t].get();
+                        }
+                    }
+                std::vector<std::string> errs(nt);
+                auto run_tile = [&](int t) {
+                    try {
+                        for (int cy = rect[t][1]; cy < rect[t][3]; cy += kCtu)
+                            for (int cx = rect[t][0]; cx < rect[t][2]; cx += kCtu) coders[t]->code_ctu(tio[t], *tmd[t], cx, cy, kCtu);
+                    } catch (const std::exception& ex) {
+                        errs[t] = ex.what();
+                    }
+                };
+                const int nth = std::clamp(fp.threads, 1, nt);
+                if (nth <= 1) {
+                    for (int t = 0; t < nt; ++t) run_tile(t);
+                } else {
+                    std::vector<std::thread> pool;
+                    std::atomic<int> nextt{0};
+                    for (int k = 0; k < nth; ++k)
+                        pool.emplace_back([&] { for (int t; (t = nextt.fetch_add(1)) < nt;) run_tile(t); });
+                    for (auto& th : pool) th.join();
+                }
+                for (const auto& e : errs) if (!e.empty()) throw std::runtime_error(e);
+                if (io.enc) for (int t = 0; t < nt; ++t) ts.out.push_back(tw[t]->finish());
+                // ループフィルタ用のブロック情報をタイルから合成
+                EdgeInfo einfo;
+                einfo.w4 = W / 4; einfo.h4 = H / 4;
+                einfo.leaf.assign(static_cast<size_t>(einfo.w4) * einfo.h4, -1);
+                einfo.flags.assign(einfo.leaf.size(), 0);
+                for (int t = 0; t < nt; ++t)
+                    for (int y = rect[t][1] / 4; y < rect[t][3] / 4; ++y)
+                        for (int x = rect[t][0] / 4; x < rect[t][2] / 4; ++x) {
+                            const size_t i = static_cast<size_t>(y) * einfo.w4 + x;
+                            einfo.leaf[i] = coders[t]->leaf_ids()[i];
+                            einfo.flags[i] = coders[t]->leaf_flags()[i];
+                        }
                 if (use_shapes)
                     for (size_t i = 0; i < R.v.size(); ++i) R.v[i] = std::clamp(R.v[i] + S.v[i], lo, hi);
                 if (fp.lf) {
-                    EdgeInfo e;
-                    e.w4 = W / 4; e.h4 = H / 4;
-                    e.leaf = bc.leaf_ids();
-                    e.flags = bc.leaf_flags();
-                    code_loop_filter(io, md.lf, R, org ? &opad : nullptr, e, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, fp.qp,
+                    code_loop_filter(io, md.lf, R, org ? &opad : nullptr, einfo, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, fp.qp,
                                      info.bit_depth, step, lambda, fp.lf_freq, fp.lf_map, lo, hi);
                 }
             }
@@ -473,11 +542,11 @@ FrameParams params_from(const EncoderConfig& c) {
     switch (c.preset) {
     case Preset::Faster:
         fp.min_log2 = 3; fp.max_log2 = 5; t.all_angular = false; s.rd_modes = 1;
-        t.fir = false; s.me_range = 2; s.me_bi = false;
+        t.fir = false; s.me_range = 2; s.me_bi = false; s.qpel = false; s.inter_skip_intra = true;
         break;
     case Preset::Fast:
         fp.min_log2 = 3; fp.max_log2 = 6; s.rd_modes = 2; s.me_range = 4;
-        fp.lf_map = true;
+        fp.lf_map = true; s.inter_skip_intra = true;
         break;
     case Preset::Medium:
         fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 3; s.me_range = 8;
@@ -502,6 +571,11 @@ FrameParams params_from(const EncoderConfig& c) {
     if (c.shapes >= 0) fp.shapes = c.shapes != 0;
     if (c.fir >= 0) { t.fir = s.try_fir = c.fir != 0; }
     if (c.loop_filter >= 0) fp.lf = fp.lf_freq = fp.lf_map = c.loop_filter != 0;
+    // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
+    const int dt = c.preset == Preset::Placebo ? 1 : 2;
+    fp.tile_cols = std::clamp(c.tile_cols > 0 ? c.tile_cols : dt, 1, 16);
+    fp.tile_rows = std::clamp(c.tile_rows > 0 ? c.tile_rows : dt, 1, 16);
+    fp.threads = c.threads > 0 ? c.threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
     return fp;
 }
 
@@ -514,6 +588,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, tools_byte(fp.tools));
     put_u8(p, (fp.shapes ? 1u : 0u) | (fp.band_tools ? 2u : 0u) | (fp.dict_reset ? 4u : 0u) | (fp.lf ? 8u : 0u) |
                   (fp.lf_freq ? 16u : 0u) | (fp.lf_map ? 32u : 0u));
+    put_u8(p, static_cast<uint32_t>((fp.tile_cols - 1) | ((fp.tile_rows - 1) << 4)));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_u32(p, static_cast<uint32_t>(poc));
@@ -534,6 +609,9 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     const uint32_t f2 = br.u8();
     fp.shapes = f2 & 1; fp.band_tools = (f2 >> 1) & 1; fp.dict_reset = (f2 >> 2) & 1;
     fp.lf = (f2 >> 3) & 1; fp.lf_freq = (f2 >> 4) & 1; fp.lf_map = (f2 >> 5) & 1;
+    const uint32_t tl = br.u8();
+    fp.tile_cols = static_cast<int>(tl & 15) + 1;
+    fp.tile_rows = static_cast<int>(tl >> 4) + 1;
     for (int l = 0; l < 2; ++l) {
         const uint32_t n = br.u8();
         if (n > 4) return false;
@@ -597,11 +675,18 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         SymIO io;
         io.w = &ew;
         io.enc = true;
-        code_frame(io, info_, par, &f, rec, *st_);
+        TileStreams ts;
+        code_frame(io, info_, par, &f, rec, *st_, ts);
         std::vector<uint8_t> p;
         write_frame_header(p, par);
         auto bytes = ew.finish();
+        put_u32(p, static_cast<uint32_t>(bytes.size()));
         p.insert(p.end(), bytes.begin(), bytes.end());
+        put_u16(p, static_cast<uint32_t>(ts.out.size()));
+        for (const auto& t : ts.out) {
+            put_u32(p, static_cast<uint32_t>(t.size()));
+            p.insert(p.end(), t.begin(), t.end());
+        }
         return p;
     };
     Frame rec;
@@ -665,7 +750,8 @@ std::vector<uint8_t> Encoder::flush() {
 }
 
 // ---------------- Decoder ----------------
-Decoder::Decoder(const std::vector<uint8_t>& stream) : s_(stream), st_(new CodecState) {
+Decoder::Decoder(const std::vector<uint8_t>& stream, int threads) : s_(stream), st_(new CodecState) {
+    threads_ = threads > 0 ? threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
     ByteReader br{s_.data(), s_.size()};
     if (br.u8() != static_cast<uint8_t>(UnitType::Seq)) return;
     const uint32_t len = br.u32();
@@ -698,11 +784,24 @@ bool Decoder::decode_unit() {
         ByteReader hr{pl, len};
         FrameParams fp;
         if (!read_frame_header(hr, fp)) { ok_ = false; return false; }
-        EntropyReader er(pl + hr.pos, len - hr.pos);
+        const uint32_t mlen = hr.u32();
+        if (hr.fail || hr.pos + mlen > len) { ok_ = false; return false; }
+        EntropyReader er(pl + hr.pos, mlen);
+        hr.pos += mlen;
+        TileStreams ts;
+        const uint32_t ntl = hr.u16();
+        for (uint32_t i = 0; i < ntl && !hr.fail; ++i) {
+            const uint32_t tl = hr.u32();
+            if (hr.fail || hr.pos + tl > len) { ok_ = false; return false; }
+            ts.in.push_back({pl + hr.pos, tl});
+            hr.pos += tl;
+        }
+        if (hr.fail) { ok_ = false; return false; }
+        fp.threads = threads_;
         SymIO io;
         io.r = &er;
         Frame f;
-        code_frame(io, info_, fp, nullptr, f, *st_);
+        code_frame(io, info_, fp, nullptr, f, *st_, ts);
         st_->push(fp.poc, f);
         out_[fp.poc] = std::move(f);
         return true;

@@ -12,14 +12,9 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 }
 
-const std::vector<double>& tx_matrix(TxType t, int N) {
-    static std::map<std::pair<int, int>, std::vector<double>> cache;
-    static std::mutex mu;
-    std::lock_guard<std::mutex> lk(mu);
-    auto key = std::make_pair(static_cast<int>(t), N);
-    auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
-    std::vector<double> m(N * N);
+namespace {
+std::vector<double> build_matrix(TxType t, int N) {
+    std::vector<double> m(static_cast<size_t>(N) * N);
     for (int k = 0; k < N; ++k)
         for (int n = 0; n < N; ++n) {
             double v = 0;
@@ -34,45 +29,103 @@ const std::vector<double>& tx_matrix(TxType t, int N) {
                 v = (k == n) ? 1.0 : 0.0;
                 break;
             }
-            m[k * N + n] = v;
+            m[static_cast<size_t>(k) * N + n] = v;
         }
-    return cache.emplace(key, std::move(m)).first->second;
+    return m;
 }
 
-static void apply_rows(const std::vector<double>& T, bool inv, const double* in, int w, int h, double* out) {
-    std::vector<double> r(w);
-    for (int y = 0; y < h; ++y) {
-        for (int k = 0; k < w; ++k) {
-            double s = 0;
-            for (int n = 0; n < w; ++n) s += (inv ? T[n * w + k] : T[k * w + n]) * in[y * w + n];
-            r[k] = s;
+int log2i(int n) { int l = 0; while ((1 << l) < n) ++l; return l; }
+
+struct MatrixCache {
+    // 2 冪サイズはロックなしの固定表、それ以外はロック付き map
+    std::vector<double> pow2[3][11];
+    std::mutex mu;
+    std::map<std::pair<int, int>, std::vector<double>> other;
+    MatrixCache() {
+        for (int t = 0; t < 3; ++t)
+            for (int l = 0; l <= 10; ++l) pow2[t][l] = build_matrix(static_cast<TxType>(t), 1 << l);
+    }
+};
+MatrixCache& cache() { static MatrixCache c; return c; }
+
+// 1D 順変換 (in/out はストライド付き)。DCT-II は偶奇対称で積和を半減。
+void fwd1d(TxType t, const double* T, int N, const double* in, int is, double* out, int os) {
+    if (t == TxType::IDTX) { for (int k = 0; k < N; ++k) out[k * os] = in[k * is]; return; }
+    if (t == TxType::DCT2 && N >= 4) {
+        const int h = N / 2;
+        double e[512], o[512];
+        for (int n = 0; n < h; ++n) { e[n] = in[n * is] + in[(N - 1 - n) * is]; o[n] = in[n * is] - in[(N - 1 - n) * is]; }
+        for (int k = 0; k < N; ++k) {
+            const double* row = T + static_cast<size_t>(k) * N;
+            const double* v = (k & 1) ? o : e;
+            double sum = 0;
+            for (int n = 0; n < h; ++n) sum += row[n] * v[n];
+            out[k * os] = sum;
         }
-        for (int k = 0; k < w; ++k) out[y * w + k] = r[k];
+        return;
+    }
+    for (int k = 0; k < N; ++k) {
+        const double* row = T + static_cast<size_t>(k) * N;
+        double sum = 0;
+        for (int n = 0; n < N; ++n) sum += row[n] * in[n * is];
+        out[k * os] = sum;
     }
 }
 
-static void apply_cols(const std::vector<double>& T, bool inv, const double* in, int w, int h, double* out) {
-    std::vector<double> c(h);
-    for (int x = 0; x < w; ++x) {
-        for (int k = 0; k < h; ++k) {
-            double s = 0;
-            for (int n = 0; n < h; ++n) s += (inv ? T[n * h + k] : T[k * h + n]) * in[n * w + x];
-            c[k] = s;
+// 1D 逆変換。kmax 以降の係数は 0 として枝刈り。
+void inv1d(TxType t, const double* T, int N, const double* in, int is, double* out, int os, int kmax) {
+    if (t == TxType::IDTX) { for (int n = 0; n < N; ++n) out[n * os] = in[n * is]; return; }
+    if (t == TxType::DCT2 && N >= 4) {
+        const int h = N / 2;
+        for (int n = 0; n < h; ++n) {
+            double e = 0, o = 0;
+            for (int k = 0; k < kmax; k += 2) e += T[static_cast<size_t>(k) * N + n] * in[k * is];
+            for (int k = 1; k < kmax; k += 2) o += T[static_cast<size_t>(k) * N + n] * in[k * is];
+            out[n * os] = e + o;
+            out[(N - 1 - n) * os] = e - o;
         }
-        for (int k = 0; k < h; ++k) out[k * w + x] = c[k];
+        return;
     }
+    for (int n = 0; n < N; ++n) {
+        double sum = 0;
+        for (int k = 0; k < kmax; ++k) sum += T[static_cast<size_t>(k) * N + n] * in[k * is];
+        out[n * os] = sum;
+    }
+}
+}  // namespace
+
+const std::vector<double>& tx_matrix(TxType t, int N) {
+    MatrixCache& c = cache();
+    const int l = log2i(N);
+    if ((1 << l) == N && l <= 10) return c.pow2[static_cast<int>(t)][l];
+    std::lock_guard<std::mutex> lk(c.mu);
+    auto key = std::make_pair(static_cast<int>(t), N);
+    auto it = c.other.find(key);
+    if (it != c.other.end()) return it->second;
+    return c.other.emplace(key, build_matrix(t, N)).first->second;
 }
 
 void forward_2d(TxType th, TxType tv, const double* in, int w, int h, double* out) {
-    std::vector<double> t(w * h);
-    apply_rows(tx_matrix(th, w), false, in, w, h, t.data());
-    apply_cols(tx_matrix(tv, h), false, t.data(), w, h, out);
+    const double* Th = tx_matrix(th, w).data();
+    const double* Tv = tx_matrix(tv, h).data();
+    std::vector<double> t(static_cast<size_t>(w) * h);
+    for (int y = 0; y < h; ++y) fwd1d(th, Th, w, in + static_cast<size_t>(y) * w, 1, t.data() + static_cast<size_t>(y) * w, 1);
+    for (int x = 0; x < w; ++x) fwd1d(tv, Tv, h, t.data() + x, w, out + x, w);
 }
 
 void inverse_2d(TxType th, TxType tv, const double* in, int w, int h, double* out) {
-    std::vector<double> t(w * h);
-    apply_cols(tx_matrix(tv, h), true, in, w, h, t.data());
-    apply_rows(tx_matrix(th, w), true, t.data(), w, h, out);
+    const double* Th = tx_matrix(th, w).data();
+    const double* Tv = tx_matrix(tv, h).data();
+    // 非ゼロ係数の範囲 (行 rmax, 列 cmax) で枝刈り
+    int rmax = 0, cmax = 0;
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            if (in[static_cast<size_t>(y) * w + x] != 0.0) { rmax = std::max(rmax, y + 1); cmax = std::max(cmax, x + 1); }
+    if (rmax == 0) { std::fill(out, out + static_cast<size_t>(w) * h, 0.0); return; }
+    std::vector<double> t(static_cast<size_t>(w) * h, 0.0);
+    for (int x = 0; x < cmax; ++x) inv1d(tv, Tv, h, in + x, w, t.data() + x, w, tv == TxType::IDTX ? h : rmax);
+    for (int y = 0; y < h; ++y)
+        inv1d(th, Th, w, t.data() + static_cast<size_t>(y) * w, 1, out + static_cast<size_t>(y) * w, 1, th == TxType::IDTX ? w : cmax);
 }
 
 TnsFilter tns_design(const double* c, int n, int max_order, int qbits) {

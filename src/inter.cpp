@@ -28,19 +28,53 @@ void motion_compensate(const RefPlane& ref, int x0, int y0, int w, int h, int mv
     const int taps = luma ? 8 : 4, half = taps / 2 - 1;
     const int* cx = luma ? kLuma[fx] : kChroma[fx];
     const int* cy = luma ? kLuma[fy] : kChroma[fy];
+    // 高速経路: 整数ベクトル・平滑なし (参照内部ならクランプも不要)
+    if (fx == 0 && fy == 0 && psi == 0) {
+        out64.resize(static_cast<size_t>(w) * h);
+        const int sx = x0 + ix, sy = y0 + iy;
+        const bool inside = sx >= 0 && sy >= 0 && sx + w <= p.w && sy + h <= p.h;
+        for (int y = 0; y < h; ++y) {
+            int32_t* o = &out64[static_cast<size_t>(y) * w];
+            if (inside) {
+                const int32_t* r = &p.v[static_cast<size_t>(sy + y) * p.w + sx];
+                for (int x = 0; x < w; ++x) o[x] = r[x] << 6;
+            } else {
+                const int ry = std::clamp(sy + y, 0, p.h - 1);
+                for (int x = 0; x < w; ++x) o[x] = p.at(std::clamp(sx + x, 0, p.w - 1), ry) << 6;
+            }
+        }
+        return;
+    }
     // 平滑用に 1 画素マージン
     const int m = psi ? 1 : 0;
     const int W = w + 2 * m, H = h + 2 * m;
     auto px = [&](int x, int y) { return p.at(std::clamp(x, 0, p.w - 1), std::clamp(y, 0, p.h - 1)); };
     std::vector<int32_t> tmp(static_cast<size_t>(W) * (H + taps - 1));
     const int bx = x0 + ix - m, by = y0 + iy - m;
-    for (int y = 0; y < H + taps - 1; ++y)
-        for (int x = 0; x < W; ++x) {
-            int32_t s = 0;
-            for (int k = 0; k < taps; ++k) s += cx[k] * px(bx + x + k - half, by + y - half);
-            tmp[static_cast<size_t>(y) * W + x] = s;  // ×64
+    const bool inside = bx - half >= 0 && by - half >= 0 && bx + W + taps - half <= p.w && by + H + taps - half <= p.h;
+    for (int y = 0; y < H + taps - 1; ++y) {
+        int32_t* t = &tmp[static_cast<size_t>(y) * W];
+        if (inside) {
+            const int32_t* r = &p.v[static_cast<size_t>(by + y - half) * p.w + bx - half];
+            if (fx == 0) { for (int x = 0; x < W; ++x) t[x] = r[x + half] << 6; continue; }
+            for (int x = 0; x < W; ++x) {
+                int32_t s = 0;
+                for (int k = 0; k < taps; ++k) s += cx[k] * r[x + k];
+                t[x] = s;
+            }
+        } else {
+            for (int x = 0; x < W; ++x) {
+                int32_t s = 0;
+                for (int k = 0; k < taps; ++k) s += cx[k] * px(bx + x + k - half, by + y - half);
+                t[x] = s;  // ×64
+            }
         }
+    }
     std::vector<int32_t> t2(static_cast<size_t>(W) * H);
+    if (fy == 0) {
+        for (int y = 0; y < H; ++y)
+            std::copy(&tmp[static_cast<size_t>(y + half) * W], &tmp[static_cast<size_t>(y + half) * W] + W, &t2[static_cast<size_t>(y) * W]);
+    } else
     for (int y = 0; y < H; ++y)
         for (int x = 0; x < W; ++x) {
             int64_t s = 0;

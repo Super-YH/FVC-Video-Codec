@@ -46,11 +46,15 @@ int ilog2(int s) { int l = 0; while ((1 << l) < s) ++l; return l; }
 
 BlockCoder::BlockCoder(Plane* rec, const Plane* org, const Plane* luma, int plane, int32_t lo, int32_t hi, double step,
                        double lambda, int min_log2, int max_log2, const Tools& tools, const Search& search,
-                       const InterCtx* inter, Dictionary* dict)
+                       const InterCtx* inter, Dictionary* dict, int tx0, int ty0, int tw, int th, int32_t leaf_base)
     : rec_(rec), org_(org), luma_(luma), plane_(plane), lo_(lo), hi_(hi), mid_((lo + hi + 1) / 2), step_(step),
       lambda_(lambda), min_log2_(min_log2), max_log2_(max_log2), tools_(tools), search_(search), dict_(dict) {
     if (!luma_) tools_.cfl = false;
     if (inter) inter_ = *inter;
+    tx0_ = tx0; ty0_ = ty0;
+    tx1_ = tw > 0 ? tx0 + tw : rec_->w;
+    ty1_ = th > 0 ? ty0 + th : rec_->h;
+    leaf_counter_ = leaf_base;
     if (!dict_ || plane_ != 0) tools_.dict = false;
     modes4_.assign(static_cast<size_t>(rec_->w / 4) * (rec_->h / 4), static_cast<int8_t>(kModePlanar));
     leaf4_.assign(modes4_.size(), -1);
@@ -59,16 +63,16 @@ BlockCoder::BlockCoder(Plane* rec, const Plane* org, const Plane* luma, int plan
     leaf_map_.resize(max_log2_ + 1);
     if (org_)
         for (int l = min_log2_; l <= max_log2_; ++l) {
-            split_map_[l].assign(static_cast<size_t>(rec_->w >> l) * (rec_->h >> l), 0);
-            leaf_map_[l].resize(static_cast<size_t>(rec_->w >> l) * (rec_->h >> l));
+            split_map_[l].assign(static_cast<size_t>((tx1_ - tx0_) >> l) * ((ty1_ - ty0_) >> l), 0);
+            leaf_map_[l].resize(static_cast<size_t>((tx1_ - tx0_) >> l) * ((ty1_ - ty0_) >> l));
         }
 }
 
 // ---------------- 予測 ----------------
 void BlockCoder::mpm(int x0, int y0, int& m0, int& m1) const {
     const int gw = rec_->w / 4;
-    const int left = x0 > 0 ? modes4_[(y0 / 4) * gw + (x0 / 4 - 1)] : kModePlanar;
-    const int above = y0 > 0 ? modes4_[(y0 / 4 - 1) * gw + (x0 / 4)] : kModePlanar;
+    const int left = x0 > tx0_ ? modes4_[(y0 / 4) * gw + (x0 / 4 - 1)] : kModePlanar;
+    const int above = y0 > ty0_ ? modes4_[(y0 / 4 - 1) * gw + (x0 / 4)] : kModePlanar;
     m0 = left;
     m1 = above != left ? above : (left != kModePlanar ? kModePlanar : kModeDC);
 }
@@ -82,7 +86,7 @@ void BlockCoder::set_modes4(int x0, int y0, int s, int mode) {
 
 void BlockCoder::intra_angular(int x0, int y0, int s, int mode, int32_t* pred) const {
     const Plane& r = *rec_;
-    const bool ht = y0 > 0, hl = x0 > 0;
+    const bool ht = y0 > ty0_, hl = x0 > tx0_;
     // 参照: corner, top[0..2s), left[0..2s)。右上/左下は端値で延長
     std::vector<int32_t> top(2 * s), left(2 * s);
     for (int i = 0; i < 2 * s; ++i) {
@@ -172,6 +176,22 @@ void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) c
         } else {
             // 色差: 輝度の動きベクトル場から 4x4 単位で導出 (動き情報は送らない)
             const int cs = inter_.chroma_shift, b = 4;
+            auto mi_at = [&](int bx, int by) {
+                const int lx = std::min((x0 + bx) << cs, inter_.mf->w4 * 4 - 1);
+                const int ly = std::min((y0 + by) << cs, inter_.mf->h4 * 4 - 1);
+                MotionInfo mi = inter_.mf->at(lx, ly);
+                if (mi.dir == 0) { mi = MotionInfo{}; mi.dir = 1; }
+                return mi;
+            };
+            // 高速経路: ブロック内の動きが一様なら 1 回で補償
+            const MotionInfo m0 = mi_at(0, 0);
+            bool uniform = true;
+            for (int by = 0; by < s && uniform; by += b)
+                for (int bx = 0; bx < s && uniform; bx += b) uniform = mi_at(bx, by) == m0;
+            if (uniform) {
+                inter_predict(m0, inter_.l0, inter_.l1, x0, y0, s, s, cs, lo_, hi_, pred);
+                return;
+            }
             std::vector<int32_t> sub(b * b);
             for (int by = 0; by < s; by += b)
                 for (int bx = 0; bx < s; bx += b) {
@@ -201,8 +221,8 @@ void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) c
 
 // ---------------- IBC (§6.1) ----------------
 bool BlockCoder::ibc_valid(int rx, int ry, int s) const {
-    if (rx < 0 || ry < 0 || rx + s > rec_->w || ry + s > rec_->h) return false;
-    if (ry + s <= cy_) return true;                                     // 上の CTU 行
+    if (rx < tx0_ || ry < ty0_ || rx + s > tx1_ || ry + s > ty1_) return false;
+    if (ry + s <= cy_) return true;                                     // 上の CTU 行 (タイル内)
     return rx + s <= cx_ && ry >= cy_ && ry + s <= cy_ + ctu_;          // 同 CTU 行の左 CTU
 }
 
@@ -236,9 +256,9 @@ int BlockCoder::merge_list(int x0, int y0, MotionInfo* out) const {
         for (int i = 0; i < n; ++i) if (out[i] == m) return;
         out[n++] = m;
     };
-    if (x0 > 0) push(inter_.mf->at(x0 - 1, y0));
-    if (y0 > 0) push(inter_.mf->at(x0, y0 - 1));
-    if (x0 > 0 && y0 > 0) push(inter_.mf->at(x0 - 1, y0 - 1));
+    if (x0 > tx0_) push(inter_.mf->at(x0 - 1, y0));
+    if (y0 > ty0_) push(inter_.mf->at(x0, y0 - 1));
+    if (x0 > tx0_ && y0 > ty0_) push(inter_.mf->at(x0 - 1, y0 - 1));
     MotionInfo g;
     g.dir = 1;
     g.mvx[0] = static_cast<int16_t>(inter_.gmv_x);
@@ -255,8 +275,8 @@ void BlockCoder::mv_pred(int x0, int y0, int list, int ref, int& px, int& py) co
         if (((m.dir >> list) & 1) && m.ref[list] == ref) { px = m.mvx[list]; py = m.mvy[list]; return true; }
         return false;
     };
-    if (x0 > 0 && try_mi(inter_.mf->at(x0 - 1, y0))) return;
-    if (y0 > 0 && try_mi(inter_.mf->at(x0, y0 - 1))) return;
+    if (x0 > tx0_ && try_mi(inter_.mf->at(x0 - 1, y0))) return;
+    if (y0 > ty0_ && try_mi(inter_.mf->at(x0, y0 - 1))) return;
     px = list == 0 ? inter_.gmv_x : 0;
     py = list == 0 ? inter_.gmv_y : 0;
 }
@@ -334,7 +354,7 @@ void BlockCoder::motion_search(int x0, int y0, int s, std::vector<Leaf>& cands) 
                 return static_cast<double>(me_cost(x0, y0, s, t)) + lsad * (mvbits(vx - px, vy - py) + (inter_.nref[list] > 1 ? ref : 0));
             };
             double sc = subcost(mx, my);
-            for (int step = 2; step >= 1; step >>= 1) {
+            for (int step = 2; step >= (search_.qpel ? 1 : 2); step >>= 1) {
                 const int ox = mx, oy = my;
                 for (int dy = -step; dy <= step; dy += step)
                     for (int dx = -step; dx <= step; dx += step) {
@@ -581,6 +601,20 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             ibc_search(x0, y0, s, lf.bvx, lf.bvy);
             if (lf.bvx || lf.bvy) cands.push_back(lf);
         }
+    }
+    // 高速化: インターで十分よい候補 (残差なし相当) があればイントラ候補を省く
+    if (inter_.enabled && search_.inter_skip_intra && is_luma()) {
+        int64_t best_sad = INT64_MAX;
+        for (const Leaf& c : cands)
+            if (c.pt == 2) {
+                predict(c, x0, y0, l, pred.data());
+                int64_t sad = 0;
+                for (int y = 0; y < s; ++y)
+                    for (int x = 0; x < s; ++x) sad += std::abs(org_->at(x0 + x, y0 + y) - pred[y * s + x]);
+                best_sad = std::min(best_sad, sad);
+            }
+        if (best_sad < static_cast<int64_t>(step_ * 0.5 * n))
+            cands.erase(std::remove_if(cands.begin(), cands.end(), [](const Leaf& c) { return c.pt != 2; }), cands.end());
     }
     // 量子化モード/TNS の組み合わせ
     double best = 1e300;
