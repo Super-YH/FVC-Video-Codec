@@ -102,6 +102,7 @@ struct Search {
     bool try_fir = true;
     bool qpel = true;              // 1/4 画素精密化 (false: 1/2 まで)
     bool inter_skip_intra = false; // インター候補が十分よければイントラを評価しない
+    int max_rd_cands = 0;          // >0: SAD 上位 K 候補のみ RD 評価
 };
 
 class BlockCoder {

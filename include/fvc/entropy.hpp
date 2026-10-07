@@ -51,7 +51,7 @@ struct BitCounter {
 class CMModel {
 public:
     static constexpr int kInputs = 4;   // order0 / ctxA / ctxB / ctxA^ctxB
-    static constexpr int kTableBits = 16;
+    static constexpr int kTableBits = 14;
 
     CMModel();
     // ctx_a, ctx_b: 呼び出し側が与える文脈 (近傍シンボル、帯域番号、位置など)
@@ -59,6 +59,7 @@ public:
     void update(int bit);
 
 private:
+    void init();
     std::vector<BitCounter> tab_;
     std::vector<int32_t> weights_;      // [mixer_ctx][kInputs+1]
     std::vector<uint16_t> apm_;         // [33 * 1024]

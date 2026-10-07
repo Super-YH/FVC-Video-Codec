@@ -72,16 +72,23 @@ inline uint32_t hash3(uint32_t a, uint32_t b, uint32_t c) {
 }
 }  // namespace
 
-CMModel::CMModel()
-    : tab_(static_cast<size_t>(kInputs) << kTableBits),
-      weights_(static_cast<size_t>(1024) * (kInputs + 1), (1 << 16) / kInputs),
-      apm_(33 * 1024) {
-    for (size_t c = 0; c < 1024; ++c)
-        for (int j = 0; j < 33; ++j)
-            apm_[c * 33 + j] = static_cast<uint16_t>(squash((j - 16) * 128) * 16);
+CMModel::CMModel() = default;
+
+// テーブルは初回使用時に確保 (使われない構文要素のモデルは 0 コスト)
+void CMModel::init() {
+    static const std::vector<uint16_t> apm_init = [] {
+        std::vector<uint16_t> a(33 * 1024);
+        for (size_t c = 0; c < 1024; ++c)
+            for (int j = 0; j < 33; ++j) a[c * 33 + j] = static_cast<uint16_t>(squash((j - 16) * 128) * 16);
+        return a;
+    }();
+    tab_.assign(static_cast<size_t>(kInputs) << kTableBits, BitCounter{});
+    weights_.assign(static_cast<size_t>(1024) * (kInputs + 1), (1 << 16) / kInputs);
+    apm_ = apm_init;
 }
 
 uint32_t CMModel::predict(uint32_t node, uint32_t a, uint32_t b) {
+    if (tab_.empty()) init();
     const uint32_t mask = (1u << kTableBits) - 1;
     idx_[0] = (hash3(node, 0, 0) & mask);
     idx_[1] = (hash3(node, a, 1) & mask) | (1u << kTableBits);

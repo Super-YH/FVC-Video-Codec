@@ -211,6 +211,9 @@ struct FrameParams {
     bool lf = true, lf_freq = false, lf_map = false;  // ループフィルタ (§9)
     int tile_cols = 1, tile_rows = 1;                  // タイル分割 (CTU 単位で均等)
     int threads = 1;                                   // 符号器/復号器のスレッド数 (ビットストリームに影響しない)
+    // 符号器: グローバルパラメータのキャッシュ (COPY 判定と本符号化で共有)
+    mutable bool gm_valid = false;
+    mutable int gm_x = 0, gm_y = 0, gm_gain[3] = {64, 64, 64}, gm_off[3] = {0, 0, 0};
     std::vector<int> ref_poc[2];
     Search search;             // 符号器のみ
     bool psy = false;          // 符号器のみ
@@ -280,12 +283,21 @@ void estimate_global_motion(const Plane& cur, const Plane& ref, int& gx, int& gy
         return n ? static_cast<double>(s) / n : 1e30;
     };
     int bx = 0, by = 0;
-    double best = sad(c, r, 0, 0, 1);
-    for (int dy = -16; dy <= 16; ++dy)
-        for (int dx = -16; dx <= 16; ++dx) {
-            const double v = sad(c, r, dx, dy, 1) + 0.05 * (std::abs(dx) + std::abs(dy));
+    double best = sad(c, r, 0, 0, 2);
+    for (int dy = -16; dy <= 16; dy += 2)
+        for (int dx = -16; dx <= 16; dx += 2) {
+            const double v = sad(c, r, dx, dy, 2) + 0.05 * (std::abs(dx) + std::abs(dy));
             if (v < best) { best = v; bx = dx; by = dy; }
         }
+    {
+        const int cx0 = bx, cy0 = by;
+        best = sad(c, r, cx0, cy0, 1) + 0.05 * (std::abs(cx0) + std::abs(cy0));
+        for (int dy = -2; dy <= 2; ++dy)
+            for (int dx = -2; dx <= 2; ++dx) {
+                const double v = sad(c, r, cx0 + dx, cy0 + dy, 1) + 0.05 * (std::abs(cx0 + dx) + std::abs(cy0 + dy));
+                if (v < best) { best = v; bx = cx0 + dx; by = cy0 + dy; }
+            }
+    }
     int fx = bx * 4, fy = by * 4;
     best = sad(cur, ref, fx, fy, 2);
     const int cx = fx, cy = fy;
@@ -315,7 +327,10 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         }
     int gmv_x = 0, gmv_y = 0, gain_q[3] = {64, 64, 64}, offs[3] = {0, 0, 0};
     if (inter) {
-        if (io.w) {
+        if (io.w && fp.gm_valid) {
+            gmv_x = fp.gm_x; gmv_y = fp.gm_y;
+            for (int pi = 0; pi < 3; ++pi) { gain_q[pi] = fp.gm_gain[pi]; offs[pi] = fp.gm_off[pi]; }
+        } else if (io.w) {
             estimate_global_motion(org->p[0], refs[0][0]->p[0], gmv_x, gmv_y);
             for (int pi = 0; pi < 3; ++pi) {
                 // MC(ref0, gmv) と原画の線形回帰でゲイン/オフセット
@@ -336,6 +351,9 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 gain_q[pi] = gq;
                 offs[pi] = std::abs(of) >= 1 ? of : 0;
             }
+            fp.gm_valid = true;
+            fp.gm_x = gmv_x; fp.gm_y = gmv_y;
+            for (int pi = 0; pi < 3; ++pi) { fp.gm_gain[pi] = gain_q[pi]; fp.gm_off[pi] = offs[pi]; }
         }
         gmv_x = io.sint(md.global, 0, 0, gmv_x);
         gmv_y = io.sint(md.global, 1, 0, gmv_y);
@@ -542,11 +560,11 @@ FrameParams params_from(const EncoderConfig& c) {
     switch (c.preset) {
     case Preset::Faster:
         fp.min_log2 = 3; fp.max_log2 = 5; t.all_angular = false; s.rd_modes = 1;
-        t.fir = false; s.me_range = 2; s.me_bi = false; s.qpel = false; s.inter_skip_intra = true;
+        t.fir = false; s.me_range = 2; s.me_bi = false; s.qpel = false; s.inter_skip_intra = true; s.max_rd_cands = 1;
         break;
     case Preset::Fast:
         fp.min_log2 = 3; fp.max_log2 = 6; s.rd_modes = 2; s.me_range = 4;
-        fp.lf_map = true; s.inter_skip_intra = true;
+        fp.lf_map = true; s.inter_skip_intra = true; s.max_rd_cands = 2;
         break;
     case Preset::Medium:
         fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 3; s.me_range = 8;
@@ -699,6 +717,9 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         cp.ref_poc[1].clear();
         Frame crec;
         auto pl = run(cp, crec);
+        fp.gm_valid = cp.gm_valid;
+        fp.gm_x = cp.gm_x; fp.gm_y = cp.gm_y;
+        for (int pi = 0; pi < 3; ++pi) { fp.gm_gain[pi] = cp.gm_gain[pi]; fp.gm_off[pi] = cp.gm_off[pi]; }
         const double step = qp_step(fp.qp, info_.bit_depth);
         double se = 0;
         for (size_t i = 0; i < f.p[0].v.size(); ++i) { const double d = f.p[0].v[i] - crec.p[0].v[i]; se += d * d; }

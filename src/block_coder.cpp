@@ -35,6 +35,26 @@ int32_t quant_dz(double c, double step, double rnd) {
     return c < 0 ? -q : q;
 }
 
+// 4x4 アダマール変換の絶対値和 (SATD)
+int64_t satd4(const int32_t* r, int s) {
+    int64_t total = 0;
+    for (int by = 0; by < s; by += 4)
+        for (int bx = 0; bx < s; bx += 4) {
+            int32_t m[16], t[16];
+            for (int i = 0; i < 4; ++i) {
+                const int32_t* p = r + (by + i) * s + bx;
+                const int32_t a = p[0] + p[3], b = p[1] + p[2], c = p[1] - p[2], d = p[0] - p[3];
+                m[i * 4 + 0] = a + b; m[i * 4 + 1] = d + c; m[i * 4 + 2] = a - b; m[i * 4 + 3] = d - c;
+            }
+            for (int j = 0; j < 4; ++j) {
+                const int32_t a = m[j] + m[12 + j], b = m[4 + j] + m[8 + j], c = m[4 + j] - m[8 + j], d = m[j] - m[12 + j];
+                t[j] = a + b; t[4 + j] = d + c; t[8 + j] = a - b; t[12 + j] = d - c;
+            }
+            for (int k = 0; k < 16; ++k) total += std::abs(t[k]);
+        }
+    return total / 2;
+}
+
 namespace {
 // HEVC 互換の角度表 (モード 2..34)
 constexpr int kAngle[35] = {0, 0, 32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26,
@@ -615,6 +635,24 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             }
         if (best_sad < static_cast<int64_t>(step_ * 0.5 * n))
             cands.erase(std::remove_if(cands.begin(), cands.end(), [](const Leaf& c) { return c.pt != 2; }), cands.end());
+    }
+    // 高速化: 予測 SAD 上位 K 候補のみ RD 評価
+    if (search_.max_rd_cands > 0 && static_cast<int>(cands.size()) > search_.max_rd_cands) {
+        std::vector<std::pair<double, size_t>> rank;
+        std::vector<int32_t> res(static_cast<size_t>(n));
+        const double lsad = std::sqrt(lambda_);
+        for (size_t i = 0; i < cands.size(); ++i) {
+            predict(cands[i], x0, y0, l, pred.data());
+            for (int y = 0; y < s; ++y)
+                for (int x = 0; x < s; ++x) res[y * s + x] = org_->at(x0 + x, y0 + y) - pred[y * s + x];
+            Leaf t = cands[i];
+            t.last = -1;
+            rank.push_back({static_cast<double>(satd4(res.data(), s)) + lsad * leaf_bits(t, x0, y0, l), i});
+        }
+        std::stable_sort(rank.begin(), rank.end());
+        std::vector<Leaf> keep;
+        for (int k = 0; k < search_.max_rd_cands; ++k) keep.push_back(cands[rank[k].second]);
+        cands.swap(keep);
     }
     // 量子化モード/TNS の組み合わせ
     double best = 1e300;
