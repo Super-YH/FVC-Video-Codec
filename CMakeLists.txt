@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.16)
+project(fvc CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release)
+endif()
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+add_library(fvc src/color.cpp src/pqmf.cpp src/quant.cpp src/transform.cpp src/entropy.cpp)
+target_include_directories(fvc PUBLIC include)
+
+enable_testing()
+add_executable(fvc_tests tests/test_main.cpp)
+target_link_libraries(fvc_tests PRIVATE fvc)
+add_test(NAME fvc_tests COMMAND fvc_tests)
