@@ -211,6 +211,10 @@ struct FrameParams {
     bool lf = true, lf_freq = false, lf_map = false;  // ループフィルタ (§9)
     int tile_cols = 1, tile_rows = 1;                  // タイル分割 (CTU 単位で均等)
     int cqp_off = 0;                                   // 色差 QP オフセット
+    bool aqp = false;                                  // CTU 単位の適応 QP
+    // 符号器: 輝度 64x64 CTU ごとの dQP (先読みによる静止度から決定)
+    std::vector<int8_t> aqp_map;
+    int aqp_w = 0;
     int threads = 1;                                   // 符号器/復号器のスレッド数 (ビットストリームに影響しない)
     // 符号器: グローバルパラメータのキャッシュ (COPY 判定と本符号化で共有)
     mutable bool gm_valid = false;
@@ -438,6 +442,15 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 Plane target;
                 if (use_shapes && org) { target = opad; for (size_t i = 0; i < target.v.size(); ++i) target.v[i] -= S.v[i]; }
                 const int32_t blo = use_shapes ? lo - hi : lo, bhi = use_shapes ? hi * 2 : hi;
+                // 適応 QP: 色差 CTU は対応する輝度 CTU の値を使う
+                struct AqpCtx { const FrameParams* fp; int shift; } actx{&fp, pi ? cs : 0};
+                auto aqp_lookup = [](void* c, int cx, int cy) -> int {
+                    const AqpCtx& a = *static_cast<AqpCtx*>(c);
+                    if (a.fp->aqp_map.empty()) return 0;
+                    const int lx = std::min(((cx << a.shift) / kCtu), a.fp->aqp_w - 1);
+                    const int ly = std::min(((cy << a.shift) / kCtu), static_cast<int>(a.fp->aqp_map.size()) / a.fp->aqp_w - 1);
+                    return a.fp->aqp_map[static_cast<size_t>(ly) * a.fp->aqp_w + lx];
+                };
                 // タイル分割と並列符号化/復号
                 const int ncx = W / kCtu, ncy = H / kCtu;
                 const int tcn = std::clamp(fp.tile_cols, 1, ncx), trn = std::clamp(fp.tile_rows, 1, ncy);
@@ -459,6 +472,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                             bhi, step, lambda, fp.min_log2, fp.max_log2, fp.tools, fp.search, inter ? &ic : nullptr, &st.dict, x0,
                             y0, x1 - x0, y1 - y0, t << 24);
                         tmd[t] = std::make_unique<Models>();
+                        if (fp.aqp) coders[t]->enable_aqp(pqp, info.bit_depth, aqp_lookup, &actx);
                         if (io.enc) {
                             tw[t] = std::make_unique<EntropyWriter>();
                             tio[t].w = tw[t].get();
@@ -567,20 +581,21 @@ FrameParams params_from(const EncoderConfig& c) {
         break;
     case Preset::Fast:
         fp.min_log2 = 3; fp.max_log2 = 6; s.rd_modes = 2; s.me_range = 4;
-        fp.lf_map = true; s.inter_skip_intra = true; s.max_rd_cands = 2; s.skip_split_on_skip = true; s.approx_subpel = true;
+        fp.lf_map = true; s.rdoq = true; s.inter_skip_intra = true; s.max_rd_cands = 2; s.skip_split_on_skip = true; s.approx_subpel = true;
         break;
     case Preset::Medium:
         fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 3; s.me_range = 8;
         fp.band_tools = true; fp.lf_freq = fp.lf_map = true;
+        s.rdoq = true;
         break;
     case Preset::Slow:
         fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 6; s.me_range = 16;
-        t.tns = t.ibc = t.dict = true; s.try_tns = true; s.ibc_range = 32;
+        t.tns = t.ibc = t.dict = true; s.try_tns = true; s.ibc_range = 32; s.rdoq = true;
         fp.band_tools = true; fp.lf_freq = fp.lf_map = true;
         break;
     case Preset::Placebo:
         fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 35; s.me_range = 32;
-        t.tns = t.e8 = t.ibc = t.dict = true; s.try_tns = s.try_e8 = true; s.ibc_range = 96;
+        t.tns = t.e8 = t.ibc = t.dict = true; s.try_tns = s.try_e8 = true; s.ibc_range = 96; s.rdoq = true;
         fp.shapes = true; fp.band_tools = true; fp.lf_freq = fp.lf_map = true;
         break;
     }
@@ -610,7 +625,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, (fp.shapes ? 1u : 0u) | (fp.band_tools ? 2u : 0u) | (fp.dict_reset ? 4u : 0u) | (fp.lf ? 8u : 0u) |
                   (fp.lf_freq ? 16u : 0u) | (fp.lf_map ? 32u : 0u));
     put_u8(p, static_cast<uint32_t>((fp.tile_cols - 1) | ((fp.tile_rows - 1) << 4)));
-    put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32));
+    put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_u32(p, static_cast<uint32_t>(poc));
@@ -634,7 +649,9 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     const uint32_t tl = br.u8();
     fp.tile_cols = static_cast<int>(tl & 15) + 1;
     fp.tile_rows = static_cast<int>(tl >> 4) + 1;
-    fp.cqp_off = static_cast<int>(br.u8()) - 32;
+    const uint32_t cq = br.u8();
+    fp.aqp = (cq >> 7) & 1;
+    fp.cqp_off = static_cast<int>(cq & 127) - 32;
     if (fp.cqp_off < -12 || fp.cqp_off > 12) return false;
     for (int l = 0; l < 2; ++l) {
         const uint32_t n = br.u8();
@@ -670,7 +687,8 @@ std::vector<uint8_t> Encoder::sequence_header() const {
     return out;
 }
 
-std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType type, int depth) {
+std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType type, int depth,
+                                             const std::vector<const Frame*>& look) {
     FrameParams fp = params_from(cfg_);
     fp.poc = poc;
     fp.type = type;
@@ -701,6 +719,36 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         fp.ref_poc[0].clear();
         constexpr int kIOff = -5;
         fp.qp = std::clamp(fp.qp + kIOff, 0, 63);
+    }
+    // 適応 QP: 後続フレーム (このフレームを直接/間接に参照する) との同位置差分が小さい CTU ほど QP を下げる
+    const bool aqp_on = cfg_.aqp >= 0 ? cfg_.aqp != 0 : true;
+    if (aqp_on && cfg_.lossy_layer && !look.empty() && fp.pqmf_log2 == 0) {
+        const Plane& A = f.p[0];
+        const int aw = (A.w + kCtu - 1) / kCtu, ah = (A.h + kCtu - 1) / kCtu;
+        fp.aqp_w = aw;
+        fp.aqp_map.assign(static_cast<size_t>(aw) * ah, 0);
+        const double step = qp_step(fp.qp, info_.bit_depth);
+        constexpr double kAqs = 1.0;  // 実測で決定 (0.5/1.0/1.5 を比較)
+        const double strength = std::min(6.0, kAqs * std::log2(1.0 + look.size()));
+        bool any = false;
+        for (int cy = 0; cy < ah; ++cy)
+            for (int cx = 0; cx < aw; ++cx) {
+                double d = 0;
+                int64_t cnt = 0;
+                for (const Frame* L : look)
+                    for (int y = cy * kCtu; y < std::min(A.h, (cy + 1) * kCtu); y += 2)
+                        for (int x = cx * kCtu; x < std::min(A.w, (cx + 1) * kCtu); x += 2) {
+                            d += std::abs(A.at(x, y) - L->p[0].at(x, y));
+                            ++cnt;
+                        }
+                d /= std::max<int64_t>(1, cnt);
+                const double stat = std::clamp(1.0 - d / step, 0.0, 1.0);
+                const int dq = -static_cast<int>(std::lround(strength * stat));
+                fp.aqp_map[static_cast<size_t>(cy) * aw + cx] = static_cast<int8_t>(dq);
+                any |= dq != 0;
+            }
+        fp.aqp = any;
+        if (!any) fp.aqp_map.clear();
     }
     auto run = [&](FrameParams& par, Frame& rec) {
         EntropyWriter ew;
@@ -737,7 +785,9 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         const double step = qp_step(fp.qp, info_.bit_depth);
         double se = 0;
         for (size_t i = 0; i < f.p[0].v.size(); ++i) { const double d = f.p[0].v[i] - crec.p[0].v[i]; se += d * d; }
-        if (se / f.p[0].v.size() <= 0.25 * step * step / 12.0) { payload = std::move(pl); rec = std::move(crec); done = true; type = FrameType::Copy; }
+        // 実測の量子化歪み (RDO 後) は Δ²/12 の 1 割未満なので、それと同等以下の時のみ COPY
+        constexpr double kCopyK = 0.06;
+        if (se / f.p[0].v.size() <= kCopyK * step * step / 12.0) { payload = std::move(pl); rec = std::move(crec); done = true; type = FrameType::Copy; }
     }
     if (!done) payload = run(fp, rec);
     std::vector<uint8_t> out;
@@ -756,32 +806,45 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
 std::vector<uint8_t> Encoder::encode(const Frame& f) {
     const int poc = next_poc_++;
     const bool key = poc == 0 || (cfg_.keyint > 0 && poc % cfg_.keyint == 0);
-    int bf = cfg_.bframes >= 0 ? cfg_.bframes
-                               : (cfg_.preset == Preset::Faster ? 3 : 7);
+    int bf = cfg_.bframes >= 0 ? cfg_.bframes : (cfg_.preset == Preset::Faster ? 3 : 7);
     bf = std::clamp(bf, 0, 15);
     if (!cfg_.lossy_layer) bf = 0;
     std::vector<uint8_t> out;
-    auto append = [&](const std::vector<uint8_t>& u) { out.insert(out.end(), u.begin(), u.end()); };
     if (key) {
-        append(flush_pending());
-        append(encode_picture(f, poc, FrameType::I));
-        return out;
+        // I フレームは後続ミニ GOP を先読みしてから符号化する (適応 QP 用)
+        out = flush_pending();
+        key_pending_ = true;
     }
     pend_.push_back({poc, f});
-    if (static_cast<int>(pend_.size()) >= bf + 1) append(flush_pending());
+    if (static_cast<int>(pend_.size()) >= bf + 1 + (key_pending_ ? 1 : 0)) {
+        const auto u = flush_pending();
+        out.insert(out.end(), u.begin(), u.end());
+    }
     return out;
 }
 
-// 保留フレームを符号化: 最後をアンカー P、間を二分の階層 B (中央から)
+// 保留フレームを符号化: [I] → 最後をアンカー P → 間を二分の階層 B
 std::vector<uint8_t> Encoder::flush_pending() {
     std::vector<uint8_t> out;
     if (pend_.empty()) return out;
     std::vector<std::pair<int, Frame>> v;
     v.swap(pend_);
+    const bool key = key_pending_;
+    key_pending_ = false;
     const int n = static_cast<int>(v.size());
-    const auto u = encode_picture(v[n - 1].second, v[n - 1].first, FrameType::P);
-    out.insert(out.end(), u.begin(), u.end());
-    encode_b_range(v, -1, n - 1, 1, out);
+    auto append = [&](const std::vector<uint8_t>& u) { out.insert(out.end(), u.begin(), u.end()); };
+    int start = 0;
+    if (key) {
+        std::vector<const Frame*> look;
+        for (int i = 1; i < n; ++i) look.push_back(&v[i].second);
+        append(encode_picture(v[0].second, v[0].first, FrameType::I, 0, look));
+        start = 1;
+        if (n == 1) return out;
+    }
+    std::vector<const Frame*> look;
+    for (int i = start; i < n - 1; ++i) look.push_back(&v[i].second);
+    append(encode_picture(v[n - 1].second, v[n - 1].first, FrameType::P, 0, look));
+    encode_b_range(v, start - 1, n - 1, 1, out);
     return out;
 }
 

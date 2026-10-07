@@ -24,6 +24,7 @@ struct EncoderConfig {
     int bframes = -1;         // アンカー間の B 枚数 (階層 B, 0..15)。-1: プリセット依存
     int refs = -1;            // P の参照枚数 (1..4), -1: プリセット依存
     bool copy_frames = true;  // 静止区間を COPY フレームで符号化
+    int aqp = -1;             // CTU 適応 QP (静止領域の QP を下げる)。-1: プリセット依存
     bool keep_recon = false;  // 再構成を表示順で保持 (テスト/PSNR 用)
     int tile_cols = 0, tile_rows = 0;  // 0: プリセット依存
     int threads = 0;          // 0: ハードウェアスレッド数
@@ -65,7 +66,9 @@ private:
     void encode_b_range(const std::vector<std::pair<int, Frame>>& v, int a, int b, int depth, std::vector<uint8_t>& out);
     std::vector<FrameStats> stats_;
     std::map<int, Frame> recon_;
-    std::vector<uint8_t> encode_picture(const Frame& f, int poc, FrameType type, int depth = 0);
+    std::vector<uint8_t> encode_picture(const Frame& f, int poc, FrameType type, int depth = 0,
+                                        const std::vector<const Frame*>& look = {});
+    bool key_pending_ = false;
 };
 
 class Decoder {

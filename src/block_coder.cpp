@@ -459,6 +459,68 @@ void BlockCoder::dict_search(int x0, int y0, int s, std::vector<Leaf>& cands) co
     if (bi >= 0 && bg != 0) { Leaf lf; lf.pt = 3; lf.dict_idx = bi; lf.dict_gain = bg; cands.push_back(lf); }
 }
 
+// ---------------- RDOQ (§13.1) ----------------
+// 走査順に、各係数のレベルを {round, round-1, 0} から D + λR 最小で貪欲に選ぶ。
+// R は CM モデルの現在確率から (構文と同じ文脈で) 見積もる。最後に末尾の打ち切り位置を最適化。
+void BlockCoder::rdoq(Leaf& lf, int l, const std::vector<double>& e) const {
+    const int s = 1 << l, n = s * s;
+    const auto& scan = diag_scan(l);
+    CMModel& cm = plane_ ? md_->coef_c : md_->coef_y;
+    const uint32_t L = static_cast<uint32_t>(l);
+    double cost_acc = 0;
+    SymIO io;
+    io.cost = &cost_acc;
+    io.enc = true;
+    auto bits_of = [&](int32_t v, uint32_t a, uint32_t b) {
+        cost_acc = 0;
+        io.sint(cm, a, b, v);
+        return cost_acc;
+    };
+    const int last0 = lf.last;
+    std::vector<int32_t> lv(n, 0);
+    std::vector<double> jcum(n + 1, 0.0);  // 位置 i までの (選択後) コスト累積
+    double tail_d = 0;                     // 打ち切った場合の歪み (e^2) の累積
+    std::vector<double> d0(n);
+    for (int i = 0; i < n; ++i) d0[i] = e[i] * e[i];
+    for (int i = 0; i <= last0; ++i) {
+        const int pos = scan[i];
+        const int u = pos & (s - 1), v = pos >> l;
+        const int32_t n1 = i > 0 ? std::abs(lv[i - 1]) : 0, n2 = i > 1 ? std::abs(lv[i - 2]) : 0;
+        const uint32_t a = static_cast<uint32_t>(std::min(n1 + n2, 15)) | (static_cast<uint32_t>(std::min(u + v, 15)) << 4);
+        const uint32_t b = L * 4 + (i == 0 ? 2u : 0u);
+        const double x = e[i] / step_;
+        const int32_t r = static_cast<int32_t>(std::lround(std::abs(x)));
+        double best = 1e300;
+        int32_t bv = 0;
+        for (int32_t m : {r, r - 1, 0}) {
+            if (m < 0) continue;
+            const int32_t vv = e[i] < 0 ? -m : m;
+            const double d = (e[i] - vv * step_) * (e[i] - vv * step_);
+            const double j = d + lambda_ * bits_of(vv, a, b);
+            if (j < best) { best = j; bv = vv; }
+            if (m == 0) break;
+        }
+        lv[i] = bv;
+        jcum[i + 1] = jcum[i] + best;
+    }
+    (void)tail_d;
+    // 末尾打ち切り: last = k を選ぶと k より後は 0 (歪み e^2)。last の符号化コストも加える
+    std::vector<double> suffix(last0 + 2, 0.0);
+    for (int i = last0; i >= 0; --i) suffix[i] = suffix[i + 1] + d0[i];
+    double bestj = suffix[0] + lambda_ * 0.5;  // 全ゼロ (cbf=0)
+    int bestk = -1;
+    for (int k = 0; k <= last0; ++k) {
+        if (lv[k] == 0) continue;
+        cost_acc = 0;
+        io.uint(md_->last, L, plane_ ? 1u : 0u, static_cast<uint32_t>(k));
+        const double j = jcum[k + 1] + suffix[k + 1] + lambda_ * cost_acc;
+        if (j < bestj) { bestj = j; bestk = k; }
+    }
+    std::fill(lf.q.begin(), lf.q.end(), 0);
+    for (int i = 0; i <= bestk; ++i) lf.q[scan[i]] = lv[i];
+    lf.last = bestk;
+}
+
 // ---------------- 量子化 / 再構成 ----------------
 void BlockCoder::quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) const {
     const int s = 1 << l, n = s * s;
@@ -482,6 +544,7 @@ void BlockCoder::quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) 
             lf.q[scan[i]] = v;
             if (v) lf.last = i;
         }
+        if (search_.rdoq && md_ && !lf.tns_on && lf.last >= 0) rdoq(lf, l, e);
         if (tools_.nf && lf.last + 1 < n) {
             double en = 0;
             for (int i = lf.last + 1; i < n; ++i) en += e[i] * e[i];
@@ -969,9 +1032,26 @@ void BlockCoder::code_node(SymIO& io, Models& md, int x0, int y0, int l) {
     code_leaf(io, md, lf, x0, y0, l);
 }
 
+void BlockCoder::enable_aqp(int base_qp, int bit_depth, int (*fn)(void*, int, int), void* ctx) {
+    aqp_ = true;
+    base_qp_ = base_qp;
+    bit_depth_ = bit_depth;
+    dqp_fn_ = fn;
+    dqp_ctx_ = ctx;
+}
+
 void BlockCoder::code_ctu(SymIO& io, Models& md, int cx, int cy, int ctu) {
     cx_ = cx; cy_ = cy; ctu_ = ctu;
     md_ = &md;
+    if (aqp_) {
+        int dqp = (io.enc && dqp_fn_) ? dqp_fn_(dqp_ctx_, cx, cy) : 0;
+        dqp = io.sint(md.aqp, static_cast<uint32_t>(std::min(std::abs(prev_dqp_), 7)), static_cast<uint32_t>(plane_ ? 1 : 0), dqp);
+        if (dqp < -12 || dqp > 12) throw std::runtime_error("corrupt stream: dqp");
+        prev_dqp_ = dqp;
+        const int q = std::clamp(base_qp_ + dqp, 0, 63);
+        step_ = qp_step(q, bit_depth_);
+        lambda_ = 0.57 * std::pow(2.0, (q - 12) / 3.0) * std::pow(4.0, bit_depth_ - 8);
+    }
     const int bs = 1 << max_log2_;
     for (int by = cy; by < cy + ctu; by += bs)
         for (int bx = cx; bx < cx + ctu; bx += bs) {

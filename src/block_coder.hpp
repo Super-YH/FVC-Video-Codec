@@ -63,7 +63,7 @@ struct SymIO {
 
 struct Models {
     CMModel split, mode, cbf, last, coef_y, coef_c, band_ll, band_hi, lossless, l2, ibc, cfl, tns, e8, nf;
-    CMModel inter, mvd, dict, shape, global, band_mode, lf;
+    CMModel inter, mvd, dict, shape, global, band_mode, lf, aqp;
 };
 
 const std::vector<int>& diag_scan(int log2s);
@@ -105,6 +105,7 @@ struct Search {
     int max_rd_cands = 0;          // >0: SAD 上位 K 候補のみ RD 評価
     bool skip_split_on_skip = false; // 残差なしインター葉なら分割を試さない
     bool approx_subpel = false;    // サブ画素探索コストを双線形で近似
+    bool rdoq = false;             // レート歪み最適化量子化
 };
 
 class BlockCoder {
@@ -117,6 +118,8 @@ public:
     void code_ctu(SymIO& io, Models& md, int cx, int cy, int ctu);
     // 符号器: RD 探索のみ行い CTU の RD コストを返す (再構成は rec に残る)
     double rd_ctu(int cx, int cy, int ctu);
+    // CTU 単位の適応 QP (§13.1)。base_qp と、符号器では CTU ごとの dQP 決定関数を与える
+    void enable_aqp(int base_qp, int bit_depth, int (*)(void*, int, int), void* ctx) ;
     // ループフィルタ用 4x4 ブロック情報
     const std::vector<int32_t>& leaf_ids() const { return leaf4_; }
     const std::vector<uint8_t>& leaf_flags() const { return flags4_; }
@@ -175,6 +178,7 @@ private:
     int64_t me_cost(int x0, int y0, int s, const MotionInfo& mi) const;
     void motion_search(int x0, int y0, int s, std::vector<Leaf>& cands) const;
     void dict_search(int x0, int y0, int s, std::vector<Leaf>& cands) const;
+    void rdoq(Leaf& lf, int l, const std::vector<double>& e) const;
     void quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) const;
     void reconstruct(const Leaf& lf, int x0, int y0, int l, const int32_t* pred);
     double leaf_bits(const Leaf& lf, int x0, int y0, int l) const;
@@ -188,6 +192,10 @@ private:
     double leaf_rate(Leaf& lf, int x0, int y0, int l);
     double split_rate(int x0, int y0, int l, int split);
     Models* md_ = nullptr;
+    bool aqp_ = false;
+    int base_qp_ = 0, bit_depth_ = 8, prev_dqp_ = 0;
+    int (*dqp_fn_)(void*, int, int) = nullptr;
+    void* dqp_ctx_ = nullptr;
     std::vector<int32_t> leaf4_;
     std::vector<uint8_t> flags4_;
     int32_t leaf_counter_ = 0;
