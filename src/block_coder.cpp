@@ -53,6 +53,8 @@ BlockCoder::BlockCoder(Plane* rec, const Plane* org, const Plane* luma, int plan
     if (inter) inter_ = *inter;
     if (!dict_ || plane_ != 0) tools_.dict = false;
     modes4_.assign(static_cast<size_t>(rec_->w / 4) * (rec_->h / 4), static_cast<int8_t>(kModePlanar));
+    leaf4_.assign(modes4_.size(), -1);
+    flags4_.assign(modes4_.size(), 0);
     split_map_.resize(max_log2_ + 1);
     leaf_map_.resize(max_log2_ + 1);
     if (org_)
@@ -808,6 +810,13 @@ void BlockCoder::code_leaf(SymIO& io, Models& md, Leaf& lf, int x0, int y0, int 
     leaf_syntax(io, md, lf, x0, y0, l);
     if (!io.enc) predict(lf, x0, y0, l, pred.data());
     reconstruct(lf, x0, y0, l, pred.data());
+    {
+        const int gw = rec_->w / 4;
+        const uint8_t fl = static_cast<uint8_t>((lf.pt != 2 ? 1 : 0) | (lf.last >= 0 || lf.nf ? 2 : 0));
+        for (int y = y0 / 4; y < (y0 + s) / 4; ++y)
+            for (int x = x0 / 4; x < (x0 + s) / 4; ++x) { leaf4_[y * gw + x] = leaf_counter_; flags4_[y * gw + x] = fl; }
+        ++leaf_counter_;
+    }
     set_modes4(x0, y0, s, lf.pt ? kModePlanar : lf.mode);
     if (inter_.enabled && is_luma()) inter_.mf->fill(x0, y0, s, s, lf.pt == 2 ? lf.mi : MotionInfo{});
 }

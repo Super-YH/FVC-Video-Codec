@@ -21,7 +21,7 @@ static bool ends_with(const std::string& s, const char* suf) {
 static int usage() {
     std::fprintf(stderr,
                  "usage:\n  fvc enc [-q QP] [--preset faster|fast|medium|slow|placebo] [--lossless] [--l2] [--pqmf N]"
-                 " [--frames N]\n      [--keyint N] [--bframes 0|1] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
+                 " [--frames N]\n      [--keyint N] [--bframes 0|1] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
     return 2;
 }
 
@@ -51,6 +51,7 @@ static int cmd_enc(int argc, char** argv) {
         else if (a.rfind("--dict=", 0) == 0) cfg.dict = std::atoi(a.c_str() + 7);
         else if (a.rfind("--shapes=", 0) == 0) cfg.shapes = std::atoi(a.c_str() + 9);
         else if (a.rfind("--fir=", 0) == 0) cfg.fir = std::atoi(a.c_str() + 6);
+        else if (a.rfind("--lf=", 0) == 0) cfg.loop_filter = std::atoi(a.c_str() + 5);
         else if (a == "--preset" && i + 1 < argc) {
             const std::string p = argv[++i];
             if (p == "faster") cfg.preset = Preset::Faster;

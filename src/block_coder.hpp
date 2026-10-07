@@ -63,7 +63,7 @@ struct SymIO {
 
 struct Models {
     CMModel split, mode, cbf, last, coef_y, coef_c, band_ll, band_hi, lossless, l2, ibc, cfl, tns, e8, nf;
-    CMModel inter, mvd, dict, shape, global, band_mode;
+    CMModel inter, mvd, dict, shape, global, band_mode, lf;
 };
 
 const std::vector<int>& diag_scan(int log2s);
@@ -111,6 +111,9 @@ public:
     void code_ctu(SymIO& io, Models& md, int cx, int cy, int ctu);
     // 符号器: RD 探索のみ行い CTU の RD コストを返す (再構成は rec に残る)
     double rd_ctu(int cx, int cy, int ctu);
+    // ループフィルタ用 4x4 ブロック情報
+    const std::vector<int32_t>& leaf_ids() const { return leaf4_; }
+    const std::vector<uint8_t>& leaf_flags() const { return flags4_; }
 
 private:
     struct Leaf {
@@ -176,6 +179,9 @@ private:
     double leaf_rate(Leaf& lf, int x0, int y0, int l);
     double split_rate(int x0, int y0, int l, int split);
     Models* md_ = nullptr;
+    std::vector<int32_t> leaf4_;
+    std::vector<uint8_t> flags4_;
+    int32_t leaf_counter_ = 0;
     Models own_md_;
 };
 

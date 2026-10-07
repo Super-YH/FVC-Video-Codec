@@ -19,7 +19,7 @@ struct EncoderConfig {
     Preset preset = Preset::Medium;
     bool psy = false;         // ノイズ補完/帯域ノイズ置換 (PSNR は下がるが質感保持)
     int ibc = -1;             // -1: プリセット依存, 0/1: 強制
-    int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1;
+    int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1;
     int keyint = 0;           // I フレーム間隔 (0: 先頭のみ)
     int bframes = -1;         // -1: プリセット依存, 0: なし, 1: B フレーム 1 枚 (P B P B ...)
     int refs = -1;            // P の参照枚数 (1..4), -1: プリセット依存

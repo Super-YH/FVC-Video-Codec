@@ -14,6 +14,7 @@
 #include "block_coder.hpp"
 #include "dictionary.hpp"
 #include "inter.hpp"
+#include "loop_filter.hpp"
 #include "shapes.hpp"
 #include "fvc/quant.hpp"
 
@@ -204,6 +205,7 @@ struct FrameParams {
     bool shapes = false;       // 図形レイヤ (I のみ)
     bool band_tools = false;   // 帯域間差分/ノイズ置換
     bool dict_reset = false;
+    bool lf = true, lf_freq = false, lf_map = false;  // ループフィルタ (§9)
     std::vector<int> ref_poc[2];
     Search search;             // 符号器のみ
     bool psy = false;          // 符号器のみ
@@ -410,6 +412,14 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     for (int cx = 0; cx < W; cx += kCtu) bc.code_ctu(io, md, cx, cy, kCtu);
                 if (use_shapes)
                     for (size_t i = 0; i < R.v.size(); ++i) R.v[i] = std::clamp(R.v[i] + S.v[i], lo, hi);
+                if (fp.lf) {
+                    EdgeInfo e;
+                    e.w4 = W / 4; e.h4 = H / 4;
+                    e.leaf = bc.leaf_ids();
+                    e.flags = bc.leaf_flags();
+                    code_loop_filter(io, md.lf, R, org ? &opad : nullptr, e, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, fp.qp,
+                                     info.bit_depth, step, lambda, fp.lf_freq, fp.lf_map, lo, hi);
+                }
             }
         }
         if (pi == 0) luma_rec = R;
@@ -467,20 +477,21 @@ FrameParams params_from(const EncoderConfig& c) {
         break;
     case Preset::Fast:
         fp.min_log2 = 3; fp.max_log2 = 6; s.rd_modes = 2; s.me_range = 4;
+        fp.lf_map = true;
         break;
     case Preset::Medium:
         fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 3; s.me_range = 8;
-        fp.band_tools = true;
+        fp.band_tools = true; fp.lf_freq = fp.lf_map = true;
         break;
     case Preset::Slow:
         fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 6; s.me_range = 16;
         t.tns = t.ibc = t.dict = true; s.try_tns = true; s.ibc_range = 32;
-        fp.band_tools = true;
+        fp.band_tools = true; fp.lf_freq = fp.lf_map = true;
         break;
     case Preset::Placebo:
         fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 35; s.me_range = 32;
         t.tns = t.e8 = t.ibc = t.dict = true; s.try_tns = s.try_e8 = true; s.ibc_range = 96;
-        fp.shapes = true; fp.band_tools = true;
+        fp.shapes = true; fp.band_tools = true; fp.lf_freq = fp.lf_map = true;
         break;
     }
     if (c.ibc >= 0) t.ibc = c.ibc != 0;
@@ -490,6 +501,7 @@ FrameParams params_from(const EncoderConfig& c) {
     if (c.dict >= 0) t.dict = c.dict != 0;
     if (c.shapes >= 0) fp.shapes = c.shapes != 0;
     if (c.fir >= 0) { t.fir = s.try_fir = c.fir != 0; }
+    if (c.loop_filter >= 0) fp.lf = fp.lf_freq = fp.lf_map = c.loop_filter != 0;
     return fp;
 }
 
@@ -500,7 +512,8 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, (fp.l2 ? 1u : 0u) | (fp.lossy ? 2u : 0u) | (static_cast<uint32_t>(fp.pqmf_log2) << 2));
     put_u8(p, static_cast<uint32_t>(fp.min_log2) | (static_cast<uint32_t>(fp.max_log2) << 4));
     put_u8(p, tools_byte(fp.tools));
-    put_u8(p, (fp.shapes ? 1u : 0u) | (fp.band_tools ? 2u : 0u) | (fp.dict_reset ? 4u : 0u));
+    put_u8(p, (fp.shapes ? 1u : 0u) | (fp.band_tools ? 2u : 0u) | (fp.dict_reset ? 4u : 0u) | (fp.lf ? 8u : 0u) |
+                  (fp.lf_freq ? 16u : 0u) | (fp.lf_map ? 32u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_u32(p, static_cast<uint32_t>(poc));
@@ -520,6 +533,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.tools = tools_from_byte(static_cast<uint8_t>(br.u8()));
     const uint32_t f2 = br.u8();
     fp.shapes = f2 & 1; fp.band_tools = (f2 >> 1) & 1; fp.dict_reset = (f2 >> 2) & 1;
+    fp.lf = (f2 >> 3) & 1; fp.lf_freq = (f2 >> 4) & 1; fp.lf_map = (f2 >> 5) & 1;
     for (int l = 0; l < 2; ++l) {
         const uint32_t n = br.u8();
         if (n > 4) return false;
