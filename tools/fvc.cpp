@@ -34,6 +34,12 @@ static int cmd_enc(int argc, char** argv) {
         if (a == "-q" && i + 1 < argc) cfg.qp = std::atoi(argv[++i]);
         else if (a == "--lossless") { cfg.lossy_layer = false; }
         else if (a == "--l2") cfg.l2_lossless = true;
+        else if (a == "--psy") cfg.psy = true;
+        else if (a == "--ibc") cfg.ibc = 1;
+        else if (a == "--no-ibc") cfg.ibc = 0;
+        else if (a.rfind("--e8=", 0) == 0) cfg.e8 = std::atoi(a.c_str() + 5);
+        else if (a.rfind("--tns=", 0) == 0) cfg.tns = std::atoi(a.c_str() + 6);
+        else if (a.rfind("--cfl=", 0) == 0) cfg.cfl = std::atoi(a.c_str() + 6);
         else if (a == "--pqmf" && i + 1 < argc) cfg.pqmf_log2 = std::atoi(argv[++i]);
         else if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
         else if (a == "--preset" && i + 1 < argc) {

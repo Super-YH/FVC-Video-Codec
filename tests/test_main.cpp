@@ -182,9 +182,11 @@ static void test_codec() {
     }
     struct Case { bool lossy, l2; int pqmf, qp; Preset pr; };
     const Case cases[] = {{false, false, 0, 0, Preset::Medium}, {true, true, 0, 30, Preset::Medium}, {true, false, 0, 30, Preset::Faster},
-                          {true, false, 0, 40, Preset::Placebo}, {true, true, 2, 30, Preset::Medium}, {true, false, 1, 25, Preset::Medium}};
+                          {true, false, 0, 40, Preset::Placebo}, {true, true, 2, 30, Preset::Medium}, {true, false, 1, 25, Preset::Medium},
+                          {true, false, 0, 34, Preset::Slow},     {true, true, 0, 28, Preset::Placebo}};
     for (const Case& c : cases) {
         EncoderConfig cfg;
+        cfg.psy = c.pr == Preset::Slow;  // ノイズ補完の往復も検証
         cfg.lossy_layer = c.lossy; cfg.l2_lossless = c.l2; cfg.pqmf_log2 = c.pqmf; cfg.qp = c.qp; cfg.preset = c.pr;
         Encoder enc(info, cfg);
         auto s = enc.sequence_header();

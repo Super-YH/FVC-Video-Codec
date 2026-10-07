@@ -9,6 +9,7 @@
 #include "fvc/entropy.hpp"
 #include "fvc/pqmf.hpp"
 #include "fvc/transform.hpp"
+#include "block_coder.hpp"
 
 namespace fvc {
 
@@ -36,252 +37,6 @@ void put_unit(std::vector<uint8_t>& out, UnitType t, const std::vector<uint8_t>&
     put_u32(out, static_cast<uint32_t>(payload.size()));
     out.insert(out.end(), payload.begin(), payload.end());
 }
-
-// ---------------- 符号器/復号器共有の構文 I/O ----------------
-// w != nullptr なら符号化 (値をそのまま返す)、そうでなければ復号した値を返す。
-struct SymIO {
-    EntropyWriter* w = nullptr;
-    EntropyReader* r = nullptr;
-    int bit(CMModel& m, uint32_t node, uint32_t a, uint32_t b, int v) {
-        if (w) { w->bit(m, node, a, b, v); return v; }
-        return r->bit(m, node, a, b);
-    }
-    int32_t sint(CMModel& m, uint32_t a, uint32_t b, int32_t v) {
-        if (w) { w->sint(m, a, b, v); return v; }
-        return r->sint(m, a, b);
-    }
-    uint32_t uint(CMModel& m, uint32_t a, uint32_t b, uint32_t v) {
-        if (w) { w->uint(m, a, b, v); return v; }
-        return r->uint(m, a, b);
-    }
-};
-
-struct Models {
-    CMModel split, mode, cbf, last, coef_y, coef_c, band_ll, band_hi, lossless, l2;
-};
-
-// ---------------- 走査順 (対角) ----------------
-const std::vector<int>& diag_scan(int log2s) {
-    static std::array<std::vector<int>, 11> cache;
-    auto& sc = cache[log2s];
-    if (sc.empty()) {
-        const int s = 1 << log2s;
-        for (int d = 0; d <= 2 * (s - 1); ++d)
-            for (int v = std::min(d, s - 1); v >= 0; --v) {
-                const int u = d - v;
-                if (u < s) sc.push_back(v * s + u);  // v: 行 (垂直周波数), u: 列
-            }
-    }
-    return sc;
-}
-
-// ---------------- イントラ予測 ----------------
-enum IntraMode { kDC = 0, kPlanar = 1, kVer = 2, kHor = 3, kNumModes = 4 };
-
-void intra_pred(const Plane& rec, int x0, int y0, int s, int mode, int32_t mid, int32_t* pred) {
-    std::vector<int32_t> top(2 * s), left(2 * s);
-    const bool ht = y0 > 0, hl = x0 > 0;
-    for (int i = 0; i < 2 * s; ++i) {
-        const int xx = std::min(x0 + i, rec.w - 1), yy = std::min(y0 + i, rec.h - 1);
-        top[i] = ht ? rec.at(i < s ? x0 + i : xx, y0 - 1) : (hl ? rec.at(x0 - 1, y0) : mid);
-        left[i] = hl ? rec.at(x0 - 1, i < s ? y0 + i : yy) : (ht ? rec.at(x0, y0 - 1) : mid);
-    }
-    // 右上/左下は未復号の可能性があるため s 番目以降は端値で代用
-    for (int i = s; i < 2 * s; ++i) { top[i] = top[s - 1]; left[i] = left[s - 1]; }
-    switch (mode) {
-    case kDC: {
-        int64_t sum = 0;
-        for (int i = 0; i < s; ++i) sum += top[i] + left[i];
-        const int32_t dc = static_cast<int32_t>((sum + s) / (2 * s));
-        for (int i = 0; i < s * s; ++i) pred[i] = dc;
-        break;
-    }
-    case kPlanar: {
-        const int sh = [s] { int l = 0; while ((1 << l) < s) ++l; return l; }();
-        for (int y = 0; y < s; ++y)
-            for (int x = 0; x < s; ++x) {
-                const int64_t h = static_cast<int64_t>(s - 1 - x) * left[y] + static_cast<int64_t>(x + 1) * top[s];
-                const int64_t v = static_cast<int64_t>(s - 1 - y) * top[x] + static_cast<int64_t>(y + 1) * left[s];
-                pred[y * s + x] = static_cast<int32_t>((h + v + s) >> (sh + 1));
-            }
-        break;
-    }
-    case kVer:
-        for (int y = 0; y < s; ++y) for (int x = 0; x < s; ++x) pred[y * s + x] = top[x];
-        break;
-    default:
-        for (int y = 0; y < s; ++y) for (int x = 0; x < s; ++x) pred[y * s + x] = left[y];
-        break;
-    }
-}
-
-// ---------------- 量子化 ----------------
-double qp_step(int qp, int bit_depth) { return std::pow(2.0, (qp - 4) / 6.0) * (1 << (bit_depth - 8)); }
-
-int32_t quant_dz(double c, double step, double rnd) {
-    const double a = std::abs(c) / step;
-    const int32_t q = static_cast<int32_t>(a + rnd);
-    return c < 0 ? -q : q;
-}
-
-// 係数レートの近似 (RD 探索用)
-double approx_bits(const std::vector<int32_t>& q, const std::vector<int>& scan) {
-    int last = -1;
-    for (int i = static_cast<int>(scan.size()) - 1; i >= 0; --i) if (q[scan[i]]) { last = i; break; }
-    if (last < 0) return 1.0;
-    double b = 2.0 + 2.0 * std::log2(2.0 + last);
-    for (int i = 0; i <= last; ++i) {
-        const int32_t a = std::abs(q[scan[i]]);
-        b += a ? 2.0 + 2.0 * std::log2(1.0 + a) : 0.6;
-    }
-    return b;
-}
-
-// ---------------- ブロック符号化 ----------------
-struct PlaneCoder {
-    Plane* rec;              // パディング済み再構成
-    const Plane* org;        // 符号器のみ (パディング済み原画)
-    int plane;
-    int32_t lo, hi, mid;
-    double step, lambda, rnd;
-    int min_log2, max_log2;
-    int nmodes;
-    std::vector<std::vector<int8_t>> split_map, mode_map;  // [log2] -> grid
-
-    int grid_w(int l) const { return rec->w >> l; }
-    int8_t& split_at(int x, int y, int l) { return split_map[l][(y >> l) * grid_w(l) + (x >> l)]; }
-    int8_t& mode_at(int x, int y, int l) { return mode_map[l][(y >> l) * grid_w(l) + (x >> l)]; }
-
-    TxType tx_for(int s) const { return s == 4 ? TxType::DST7 : TxType::DCT2; }
-
-    // 予測+変換+量子化 → q (符号器)
-    void analyze_block(int x0, int y0, int log2s, int mode, std::vector<int32_t>& pred, std::vector<int32_t>& q) {
-        const int s = 1 << log2s;
-        pred.resize(s * s);
-        q.assign(s * s, 0);
-        intra_pred(*rec, x0, y0, s, mode, mid, pred.data());
-        std::vector<double> r(s * s), c(s * s);
-        for (int y = 0; y < s; ++y)
-            for (int x = 0; x < s; ++x) r[y * s + x] = org->at(x0 + x, y0 + y) - pred[y * s + x];
-        forward_2d(tx_for(s), tx_for(s), r.data(), s, s, c.data());
-        for (int i = 0; i < s * s; ++i) q[i] = quant_dz(c[i], step, rnd);
-    }
-
-    // q を逆量子化・逆変換して再構成に書き込む (符号器/復号器共通)
-    void reconstruct(int x0, int y0, int log2s, const std::vector<int32_t>& pred, const std::vector<int32_t>& q) {
-        const int s = 1 << log2s;
-        bool any = false;
-        for (int32_t v : q) if (v) { any = true; break; }
-        std::vector<double> c(s * s), r(s * s, 0.0);
-        if (any) {
-            for (int i = 0; i < s * s; ++i) c[i] = q[i] * step;
-            inverse_2d(tx_for(s), tx_for(s), c.data(), s, s, r.data());
-        }
-        for (int y = 0; y < s; ++y)
-            for (int x = 0; x < s; ++x) {
-                const int32_t v = pred[y * s + x] + static_cast<int32_t>(std::lround(r[y * s + x]));
-                rec->at(x0 + x, y0 + y) = std::clamp(v, lo, hi);
-            }
-    }
-
-    double block_sse(int x0, int y0, int s) const {
-        double e = 0;
-        for (int y = 0; y < s; ++y)
-            for (int x = 0; x < s; ++x) { const double d = org->at(x0 + x, y0 + y) - rec->at(x0 + x, y0 + y); e += d * d; }
-        return e;
-    }
-
-    void save(int x0, int y0, int s, std::vector<int32_t>& buf) const {
-        buf.resize(s * s);
-        for (int y = 0; y < s; ++y) std::memcpy(&buf[y * s], &rec->v[(y0 + y) * rec->w + x0], s * sizeof(int32_t));
-    }
-    void restore(int x0, int y0, int s, const std::vector<int32_t>& buf) {
-        for (int y = 0; y < s; ++y) std::memcpy(&rec->v[(y0 + y) * rec->w + x0], &buf[y * s], s * sizeof(int32_t));
-    }
-
-    // RD 探索 (符号器): 分割とモードを決め、選んだ再構成を rec に残す
-    double rd_node(int x0, int y0, int l) {
-        const int s = 1 << l;
-        const auto& scan = diag_scan(l);
-        std::vector<int32_t> before, pred, q, best_rec;
-        save(x0, y0, s, before);
-        double best = 1e300;
-        int best_mode = 0;
-        for (int m = 0; m < nmodes; ++m) {
-            analyze_block(x0, y0, l, m, pred, q);
-            reconstruct(x0, y0, l, pred, q);
-            const double j = block_sse(x0, y0, s) + lambda * (approx_bits(q, scan) + 2.0 + (l > min_log2));
-            if (j < best) { best = j; best_mode = m; save(x0, y0, s, best_rec); }
-            restore(x0, y0, s, before);
-        }
-        mode_at(x0, y0, l) = static_cast<int8_t>(best_mode);
-        restore(x0, y0, s, best_rec);
-        if (l <= min_log2) return best;
-        // 分割候補: 早期打ち切り (葉コストが極小なら分割しない)
-        if (best < lambda * 4.0) { split_at(x0, y0, l) = 0; return best; }
-        restore(x0, y0, s, before);
-        const int h = s / 2;
-        double js = lambda * 1.0;
-        js += rd_node(x0, y0, l - 1);
-        js += rd_node(x0 + h, y0, l - 1);
-        js += rd_node(x0, y0 + h, l - 1);
-        js += rd_node(x0 + h, y0 + h, l - 1);
-        if (best <= js) { split_at(x0, y0, l) = 0; restore(x0, y0, s, best_rec); return best; }
-        split_at(x0, y0, l) = 1;
-        return js;
-    }
-
-    // 構文の符号化/復号 + 再構成 (符号器/復号器共通)
-    void code_node(SymIO& io, Models& md, int x0, int y0, int l) {
-        int split = 0;
-        if (l > min_log2) split = io.bit(md.split, 0, static_cast<uint32_t>(l), static_cast<uint32_t>(plane), io.w ? split_at(x0, y0, l) : 0);
-        if (split) {
-            const int h = 1 << (l - 1);
-            code_node(io, md, x0, y0, l - 1);
-            code_node(io, md, x0 + h, y0, l - 1);
-            code_node(io, md, x0, y0 + h, l - 1);
-            code_node(io, md, x0 + h, y0 + h, l - 1);
-            return;
-        }
-        const int s = 1 << l;
-        const uint32_t pc = plane ? 1u : 0u;
-        int mode = io.w ? mode_at(x0, y0, l) : 0;
-        mode = io.bit(md.mode, 0, l, pc, mode >> 1) << 1;
-        mode |= io.bit(md.mode, 1 + (mode >> 1), l, pc, io.w ? (mode_at(x0, y0, l) & 1) : 0);
-        std::vector<int32_t> pred, q;
-        if (io.w) analyze_block(x0, y0, l, mode, pred, q);
-        else { pred.resize(s * s); q.assign(s * s, 0); intra_pred(*rec, x0, y0, s, mode, mid, pred.data()); }
-        const auto& scan = diag_scan(l);
-        int last = -1;
-        if (io.w) for (int i = s * s - 1; i >= 0; --i) if (q[scan[i]]) { last = i; break; }
-        const int cbf = io.bit(md.cbf, 0, l, pc * 4 + static_cast<uint32_t>(mode), last >= 0);
-        if (cbf) {
-            last = static_cast<int>(io.uint(md.last, l, pc, static_cast<uint32_t>(last)));
-            if (last >= s * s) throw std::runtime_error("corrupt stream: last");
-            CMModel& cm = plane ? md.coef_c : md.coef_y;
-            for (int i = 0; i <= last; ++i) {
-                const int pos = scan[i];
-                const int u = pos & (s - 1), v = pos >> l;
-                const int32_t n1 = i > 0 ? std::abs(q[scan[i - 1]]) : 0;
-                const int32_t n2 = i > 1 ? std::abs(q[scan[i - 2]]) : 0;
-                const uint32_t a = static_cast<uint32_t>(std::min(n1 + n2, 15)) | (static_cast<uint32_t>(std::min(u + v, 15)) << 4);
-                const uint32_t b = static_cast<uint32_t>(l) * 4 + (i == last ? 1u : 0u) + (i == 0 ? 2u : 0u);
-                if (i == last) {
-                    // 最終係数は非ゼロ確定: |c|-1 と符号
-                    const int32_t cv = io.w ? q[pos] : 0;
-                    const uint32_t mag = io.uint(cm, a, b, io.w ? static_cast<uint32_t>(std::abs(cv)) - 1u : 0u) + 1u;
-                    const int neg = io.bit(cm, 1, a, b, cv < 0);
-                    if (!io.w) q[pos] = neg ? -static_cast<int32_t>(mag) : static_cast<int32_t>(mag);
-                } else {
-                    q[pos] = io.sint(cm, a, b, q[pos]);
-                }
-            }
-        } else if (io.w) {
-            std::fill(q.begin(), q.end(), 0);
-        }
-        reconstruct(x0, y0, l, pred, q);
-    }
-};
 
 // ---------------- PQMF 帯域符号化 ----------------
 void code_bands(SymIO& io, Models& md, int pqmf_log2, const Plane* org, Plane& rec, double step, double rnd,
@@ -375,13 +130,40 @@ struct FrameParams {
     int qp = 32;
     bool lossy = true, l2 = false;
     int pqmf_log2 = 0;
-    int min_log2 = 2, max_log2 = kCtuLog2, nmodes = kNumModes;
+    int min_log2 = 2, max_log2 = kCtuLog2;
+    Tools tools;    // ビットストリームで伝送
+    Search search;  // 符号器のみ
 };
+
+uint8_t tools_byte(const Tools& t) {
+    return static_cast<uint8_t>((t.ibc ? 1 : 0) | (t.tns ? 2 : 0) | (t.e8 ? 4 : 0) | (t.cfl ? 8 : 0) | (t.nf ? 16 : 0) |
+                                (t.all_angular ? 32 : 0));
+}
+Tools tools_from_byte(uint8_t b) {
+    Tools t;
+    t.ibc = b & 1; t.tns = b & 2; t.e8 = b & 4; t.cfl = b & 8; t.nf = b & 16; t.all_angular = b & 32;
+    return t;
+}
+
+// 色差の CfL 用: 輝度再構成を色差解像度に縮小 (パディング込み)
+Plane luma_at_chroma(const Plane& luma, const VideoInfo& info, int W, int H) {
+    Plane o(W, H);
+    const bool sub = info.chroma == ChromaFormat::C420;
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x) {
+            if (!sub) { o.at(x, y) = luma.at(std::min(x, luma.w - 1), std::min(y, luma.h - 1)); continue; }
+            const int x0 = std::min(2 * x, luma.w - 1), x1 = std::min(2 * x + 1, luma.w - 1);
+            const int y0 = std::min(2 * y, luma.h - 1), y1 = std::min(2 * y + 1, luma.h - 1);
+            o.at(x, y) = (luma.at(x0, y0) + luma.at(x1, y0) + luma.at(x0, y1) + luma.at(x1, y1) + 2) >> 2;
+        }
+    return o;
+}
 
 // フレームのペイロード (rANS) を符号化/復号。org==nullptr なら復号。
 void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const Frame* org, Frame& rec) {
     Models md;
     rec.p.resize(3);
+    Plane luma_rec;  // 輝度の非可逆再構成 (パディング済み)
     for (int pi = 0; pi < 3; ++pi) {
         const int w = pi ? info.chroma_w() : info.width, h = pi ? info.chroma_h() : info.height;
         int32_t lo, hi;
@@ -396,29 +178,16 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             if (fp.pqmf_log2 > 0) {
                 code_bands(io, md, fp.pqmf_log2, org ? &opad : nullptr, R, step, 1.0 / 3.0, lo, hi);
             } else {
-                PlaneCoder pc;
-                pc.rec = &R; pc.org = org ? &opad : nullptr; pc.plane = pi;
-                pc.lo = lo; pc.hi = hi; pc.mid = mid;
-                pc.step = step;
-                pc.lambda = 0.57 * std::pow(2.0, (fp.qp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
-                pc.rnd = 1.0 / 3.0;
-                pc.min_log2 = fp.min_log2; pc.max_log2 = fp.max_log2; pc.nmodes = fp.nmodes;
-                pc.split_map.resize(kCtuLog2 + 1); pc.mode_map.resize(kCtuLog2 + 1);
-                for (int l = 0; l <= kCtuLog2; ++l) {
-                    pc.split_map[l].assign(static_cast<size_t>(W >> l) * (H >> l), 0);
-                    pc.mode_map[l].assign(static_cast<size_t>(W >> l) * (H >> l), 0);
-                }
+                Plane lds;
+                if (pi > 0 && fp.tools.cfl) lds = luma_at_chroma(luma_rec, info, W, H);
+                const double lambda = 0.57 * std::pow(2.0, (fp.qp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
+                BlockCoder bc(&R, org ? &opad : nullptr, (pi > 0 && fp.tools.cfl) ? &lds : nullptr, pi, lo, hi, step,
+                              lambda, fp.min_log2, fp.max_log2, fp.tools, fp.search);
                 for (int cy = 0; cy < H; cy += kCtu)
-                    for (int cx = 0; cx < W; cx += kCtu) {
-                        // CTU を max_log2 のブロックに固定分割
-                        for (int by = cy; by < cy + kCtu; by += 1 << fp.max_log2)
-                            for (int bx = cx; bx < cx + kCtu; bx += 1 << fp.max_log2) {
-                                if (io.w) pc.rd_node(bx, by, fp.max_log2);
-                                pc.code_node(io, md, bx, by, fp.max_log2);
-                            }
-                    }
+                    for (int cx = 0; cx < W; cx += kCtu) bc.code_ctu(io, md, cx, cy, kCtu);
             }
         }
+        if (pi == 0) luma_rec = R;
         Plane out(w, h);
         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) out.at(x, y) = R.at(x, y);
         if (fp.l2 || !fp.lossy) code_lossless(io, md, pi, w, h, org ? &org->p[pi] : nullptr, out, fp.lossy, mid);
@@ -432,13 +201,33 @@ FrameParams params_from(const EncoderConfig& c) {
     fp.lossy = c.lossy_layer;
     fp.l2 = c.l2_lossless;
     fp.pqmf_log2 = std::clamp(c.pqmf_log2, 0, 4);
+    Tools& t = fp.tools;
+    Search& s = fp.search;
+    t.cfl = true;
+    t.nf = c.psy;
     switch (c.preset) {
-    case Preset::Faster:  fp.min_log2 = 3; fp.max_log2 = 5; fp.nmodes = 2; break;
-    case Preset::Fast:    fp.min_log2 = 3; fp.max_log2 = 6; fp.nmodes = 4; break;
-    case Preset::Medium:  fp.min_log2 = 2; fp.max_log2 = 6; fp.nmodes = 4; break;
-    case Preset::Slow:    fp.min_log2 = 2; fp.max_log2 = 6; fp.nmodes = 4; break;
-    case Preset::Placebo: fp.min_log2 = 2; fp.max_log2 = 6; fp.nmodes = 4; break;
+    case Preset::Faster:
+        fp.min_log2 = 3; fp.max_log2 = 5; t.all_angular = false; s.rd_modes = 1;
+        break;
+    case Preset::Fast:
+        fp.min_log2 = 3; fp.max_log2 = 6; s.rd_modes = 2;
+        break;
+    case Preset::Medium:
+        fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 3;
+        break;
+    case Preset::Slow:
+        fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 6;
+        t.tns = t.ibc = true; s.try_tns = true; s.ibc_range = 32;
+        break;
+    case Preset::Placebo:
+        fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 35;
+        t.tns = t.e8 = t.ibc = true; s.try_tns = s.try_e8 = true; s.ibc_range = 96;
+        break;
     }
+    if (c.ibc >= 0) t.ibc = c.ibc != 0;
+    if (c.e8 >= 0) { t.e8 = s.try_e8 = c.e8 != 0; }
+    if (c.tns >= 0) { t.tns = s.try_tns = c.tns != 0; }
+    if (c.cfl >= 0) t.cfl = c.cfl != 0;
     return fp;
 }
 
@@ -474,7 +263,7 @@ std::vector<uint8_t> Encoder::encode(const Frame& f, Frame* recon) {
     put_u8(p, static_cast<uint32_t>(fp.qp));
     put_u8(p, (fp.l2 ? 1u : 0u) | (fp.lossy ? 2u : 0u) | (static_cast<uint32_t>(fp.pqmf_log2) << 2));
     put_u8(p, static_cast<uint32_t>(fp.min_log2) | (static_cast<uint32_t>(fp.max_log2) << 4));
-    put_u8(p, static_cast<uint32_t>(fp.nmodes));
+    put_u8(p, tools_byte(fp.tools));
     auto bytes = ew.finish();
     p.insert(p.end(), bytes.begin(), bytes.end());
     put_unit(out, UnitType::Frame, p);
@@ -527,9 +316,8 @@ bool Decoder::next(Frame& f) {
         fp.pqmf_log2 = (pl[2] >> 2) & 7;
         fp.min_log2 = pl[3] & 15;
         fp.max_log2 = pl[3] >> 4;
-        fp.nmodes = pl[4];
-        if (fp.pqmf_log2 > 4 || fp.min_log2 < 2 || fp.max_log2 > kCtuLog2 || fp.min_log2 > fp.max_log2 ||
-            fp.nmodes < 1 || fp.nmodes > kNumModes) { ok_ = false; return false; }
+        fp.tools = tools_from_byte(pl[4]);
+        if (fp.pqmf_log2 > 4 || fp.min_log2 < 2 || fp.max_log2 > kCtuLog2 || fp.min_log2 > fp.max_log2) { ok_ = false; return false; }
         EntropyReader er(pl + 5, len - 5);
         SymIO io;
         io.r = &er;

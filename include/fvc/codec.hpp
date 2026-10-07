@@ -16,6 +16,9 @@ struct EncoderConfig {
     bool l2_lossless = false; // true: 最終残差をロスレス符号化 → 完全可逆
     int pqmf_log2 = 0;        // 0: 帯域分解なし, 1..4: M = 2^n (帯域数 M^2 ≤ 256)
     Preset preset = Preset::Medium;
+    bool psy = false;         // ノイズ補完 (PSNR は下がるが質感保持)
+    int ibc = -1;             // -1: プリセット依存, 0/1: 強制
+    int e8 = -1, tns = -1, cfl = -1;
 };
 
 // ユニット種別 (仕様 §12.1)
