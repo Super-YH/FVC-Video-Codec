@@ -654,7 +654,7 @@ FrameParams params_from(const EncoderConfig& c) {
     if (c.fir >= 0) { t.fir = s.try_fir = c.fir != 0; }
     if (c.loop_filter >= 0) fp.lf = fp.lf_freq = fp.lf_map = c.loop_filter != 0;
     t.tmvp = c.preset != Preset::Faster;
-    t.rect = c.preset >= Preset::Medium;
+    t.rect = c.preset == Preset::Placebo;  // vtest では効果 ±0・時間 +30% のため placebo のみ
     if (c.rect >= 0) t.rect = c.rect != 0;
     if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
