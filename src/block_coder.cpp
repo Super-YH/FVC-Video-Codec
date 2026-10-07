@@ -446,7 +446,7 @@ void BlockCoder::code_leaf(SymIO& io, Models& md, Leaf& lf, int x0, int y0, int 
         lf.last = -1;
         lf.q.assign(lf.qmode == 0 ? n : 0, 0);
         lf.tns_on = false;
-        if (tools_.nf && !io.w) lf.nf = 0;
+        lf.nf = 0;
     } else {
         if (tools_.e8) lf.qmode = io.bit(md.e8, 0, L, pc, lf.qmode);
         else lf.qmode = 0;
