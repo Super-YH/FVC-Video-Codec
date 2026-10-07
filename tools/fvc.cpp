@@ -21,13 +21,14 @@ static bool ends_with(const std::string& s, const char* suf) {
 static int usage() {
     std::fprintf(stderr,
                  "usage:\n  fvc enc [-q QP] [--preset faster|fast|medium|slow|placebo] [--lossless] [--l2] [--pqmf N]"
-                 " [--frames N] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
+                 " [--frames N]\n      [--keyint N] [--bframes 0|1] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
     return 2;
 }
 
 static int cmd_enc(int argc, char** argv) {
     EncoderConfig cfg;
     int max_frames = 1 << 30;
+    bool verbose = false;
     std::string in, out;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -42,6 +43,14 @@ static int cmd_enc(int argc, char** argv) {
         else if (a.rfind("--cfl=", 0) == 0) cfg.cfl = std::atoi(a.c_str() + 6);
         else if (a == "--pqmf" && i + 1 < argc) cfg.pqmf_log2 = std::atoi(argv[++i]);
         else if (a == "--frames" && i + 1 < argc) max_frames = std::atoi(argv[++i]);
+        else if (a == "--keyint" && i + 1 < argc) cfg.keyint = std::atoi(argv[++i]);
+        else if (a == "--bframes" && i + 1 < argc) cfg.bframes = std::atoi(argv[++i]);
+        else if (a == "--refs" && i + 1 < argc) cfg.refs = std::atoi(argv[++i]);
+        else if (a == "--no-copy") cfg.copy_frames = false;
+        else if (a == "-v") verbose = true;
+        else if (a.rfind("--dict=", 0) == 0) cfg.dict = std::atoi(a.c_str() + 7);
+        else if (a.rfind("--shapes=", 0) == 0) cfg.shapes = std::atoi(a.c_str() + 9);
+        else if (a.rfind("--fir=", 0) == 0) cfg.fir = std::atoi(a.c_str() + 6);
         else if (a == "--preset" && i + 1 < argc) {
             const std::string p = argv[++i];
             if (p == "faster") cfg.preset = Preset::Faster;
@@ -66,28 +75,36 @@ static int cmd_enc(int argc, char** argv) {
         if (!y4m.open(in)) { std::fprintf(stderr, "cannot read %s\n", in.c_str()); return 1; }
         info = y4m.info();
     }
+    cfg.keep_recon = false;
     Encoder enc(info, cfg);
     std::vector<uint8_t> stream = enc.sequence_header();
-    Frame f, rec;
+    Frame f;
     int n = 0;
-    double psnr_sum[3] = {0, 0, 0};
     const auto t0 = std::chrono::steady_clock::now();
     while (n < max_frames) {
         if (is_ppm) { if (n) break; f = single; }
         else if (!y4m.read(f)) break;
-        const auto u = enc.encode(f, &rec);
+        const auto u = enc.encode(f);
         stream.insert(stream.end(), u.begin(), u.end());
-        for (int p = 0; p < 3; ++p) psnr_sum[p] += plane_psnr(f.p[p], rec.p[p], info.bit_depth);
         ++n;
     }
-    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    const auto e = enc.end_of_stream();
+    const auto e = enc.flush();
     stream.insert(stream.end(), e.begin(), e.end());
+    const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::ofstream(out, std::ios::binary).write(reinterpret_cast<const char*>(stream.data()), static_cast<std::streamsize>(stream.size()));
+    double ps[3] = {0, 0, 0};
+    int cnt[4] = {0, 0, 0, 0};
+    for (const auto& st : enc.stats()) {
+        if (verbose) std::printf("  poc=%3d %c bytes=%7zu PSNR-Y=%.2f\n", st.poc, "IPBC"[static_cast<int>(st.type)], st.bytes, st.psnr[0]);
+        for (int p = 0; p < 3; ++p) ps[p] += st.psnr[p];
+        ++cnt[static_cast<int>(st.type)];
+    }
     const double pixels = static_cast<double>(info.width) * info.height * n;
-    std::printf("frames=%d bytes=%zu bpp=%.4f PSNR(Y/C1/C2)=%.3f/%.3f/%.3f fps=%.3f\n", n, stream.size(),
-                stream.size() * 8.0 / std::max(1.0, pixels), psnr_sum[0] / std::max(1, n), psnr_sum[1] / std::max(1, n),
-                psnr_sum[2] / std::max(1, n), n / std::max(sec, 1e-9));
+    const double fps = static_cast<double>(info.fps_num) / std::max(1, info.fps_den);
+    std::printf("frames=%d (I%d P%d B%d C%d) bytes=%zu bpp=%.4f kbps=%.1f PSNR(Y/C1/C2)=%.3f/%.3f/%.3f fps=%.3f\n", n, cnt[0],
+                cnt[1], cnt[2], cnt[3], stream.size(), stream.size() * 8.0 / std::max(1.0, pixels),
+                stream.size() * 8.0 / 1000.0 / std::max(1e-9, n / fps), ps[0] / std::max(1, n), ps[1] / std::max(1, n),
+                ps[2] / std::max(1, n), n / std::max(sec, 1e-9));
     return 0;
 }
 

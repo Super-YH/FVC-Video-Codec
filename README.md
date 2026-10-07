@@ -28,3 +28,11 @@ cmake -S . -B build && cmake --build build -j && ./build/fvc_tests
 | placebo | + E8 格子 VQ, 全モード RD | 0.296 / 35.79 | 0.04 fps |
 
 追加オプション: `--psy` (ノイズ補完), `--ibc/--no-ibc`, `--e8=0|1`, `--tns=0|1`, `--cfl=0|1`
+
+## 動画 (段階 4〜8)
+
+```sh
+./build/fvc enc --preset medium -q 32 --keyint 64 --bframes 1 -v in.y4m out.fvc   # I/P/B/COPY
+```
+
+追加オプション: `--refs N`, `--no-copy`, `--dict=0|1`, `--shapes=0|1`, `--fir=0|1`, `-v` (フレーム別統計)

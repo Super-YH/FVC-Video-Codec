@@ -168,44 +168,77 @@ static void test_entropy() {
                 bytes.size() * 8.0 / vals.size(), ok ? "ok" : "NG");
 }
 
-static void test_codec() {
-    VideoInfo info;
-    info.width = 83; info.height = 61; info.chroma = ChromaFormat::C420; info.ct = ColorTransform::Identity;
+static Frame synth_frame(const VideoInfo& info, int t) {
     Frame f;
     for (int p = 0; p < 3; ++p) {
         const int w = p ? info.chroma_w() : info.width, h = p ? info.chroma_h() : info.height;
+        const int sc = p && info.chroma == ChromaFormat::C420 ? 2 : 1;
         Plane pl(w, h);
         for (int y = 0; y < h; ++y)
-            for (int x = 0; x < w; ++x)
-                pl.at(x, y) = std::clamp(static_cast<int>(128 + 70 * std::sin(x * 0.13 + p) * std::cos(y * 0.09) + ((x * 13 + y * 7) % 11)), 0, 255);
+            for (int x = 0; x < w; ++x) {
+                const double X = x * sc - 1.5 * t, Y = y * sc - 0.75 * t;  // 平行移動 (1/4 画素成分を含む)
+                int v = static_cast<int>(128 + 70 * std::sin(X * 0.13 + p) * std::cos(Y * 0.09) + ((static_cast<int>(X) * 13 + static_cast<int>(Y) * 7) & 7));
+                if (t >= 4 && t < 6) v = static_cast<int>(128 + 70 * std::sin((x * sc - 6) * 0.13 + p) * std::cos((y * sc - 3) * 0.09));  // 静止区間
+                pl.at(x, y) = std::clamp(v, 0, 255);
+            }
         f.p.push_back(pl);
     }
-    struct Case { bool lossy, l2; int pqmf, qp; Preset pr; };
-    const Case cases[] = {{false, false, 0, 0, Preset::Medium}, {true, true, 0, 30, Preset::Medium}, {true, false, 0, 30, Preset::Faster},
-                          {true, false, 0, 40, Preset::Placebo}, {true, true, 2, 30, Preset::Medium}, {true, false, 1, 25, Preset::Medium},
-                          {true, false, 0, 34, Preset::Slow},     {true, true, 0, 28, Preset::Placebo}};
+    return f;
+}
+
+static void test_codec() {
+    VideoInfo info;
+    info.width = 83; info.height = 61; info.chroma = ChromaFormat::C420; info.ct = ColorTransform::Identity;
+    struct Case { const char* name; bool lossy, l2; int pqmf, qp; Preset pr; int frames, bframes, keyint; bool psy; };
+    const Case cases[] = {
+        {"lossless", false, false, 0, 0, Preset::Medium, 2, 0, 0, false},
+        {"l2", true, true, 0, 30, Preset::Medium, 3, 0, 0, false},
+        {"faster-P", true, false, 0, 30, Preset::Faster, 4, 0, 0, false},
+        {"medium-PB", true, false, 0, 32, Preset::Medium, 7, 1, 0, false},
+        {"slow-PB-psy", true, false, 0, 34, Preset::Slow, 6, 1, 4, true},
+        {"placebo-PB", true, false, 0, 30, Preset::Placebo, 5, 1, 0, false},
+        {"placebo-l2", true, true, 0, 28, Preset::Placebo, 3, 1, 0, false},
+        {"pqmf-l2", true, true, 2, 30, Preset::Medium, 2, 0, 0, false},
+        {"pqmf-psy", true, false, 1, 25, Preset::Medium, 3, 0, 0, true},
+    };
     for (const Case& c : cases) {
         EncoderConfig cfg;
-        cfg.psy = c.pr == Preset::Slow;  // ノイズ補完の往復も検証
         cfg.lossy_layer = c.lossy; cfg.l2_lossless = c.l2; cfg.pqmf_log2 = c.pqmf; cfg.qp = c.qp; cfg.preset = c.pr;
+        cfg.bframes = c.bframes; cfg.keyint = c.keyint; cfg.psy = c.psy; cfg.keep_recon = true;
         Encoder enc(info, cfg);
         auto s = enc.sequence_header();
-        Frame rec, dec;
-        for (int k = 0; k < 2; ++k) { auto u = enc.encode(f, &rec); s.insert(s.end(), u.begin(), u.end()); }
-        auto e = enc.end_of_stream(); s.insert(s.end(), e.begin(), e.end());
+        std::vector<Frame> src;
+        for (int t = 0; t < c.frames; ++t) {
+            src.push_back(synth_frame(info, t));
+            auto u = enc.encode(src.back());
+            s.insert(s.end(), u.begin(), u.end());
+        }
+        auto e = enc.flush();
+        s.insert(s.end(), e.begin(), e.end());
         Decoder d(s);
         CHECK(d.ok());
         int n = 0;
-        while (d.next(dec)) {
-            ++n;
-            for (int p = 0; p < 3; ++p) {
-                CHECK(dec.p[p].v == rec.p[p].v);                       // 符号器と復号器の再構成一致
-                if (!c.lossy || c.l2) CHECK(dec.p[p].v == f.p[p].v);    // 可逆
+        Frame dec;
+        double ps = 0;
+        try {
+            while (d.next(dec)) {
+                const Frame& rec = enc.recon().at(n);
+                for (int p = 0; p < 3; ++p) {
+                    CHECK(dec.p[p].v == rec.p[p].v);                         // 符号器と復号器の再構成一致
+                    if (!c.lossy || c.l2) CHECK(dec.p[p].v == src[n].p[p].v);  // 可逆
+                }
+                ps += plane_psnr(src[n].p[0], dec.p[0], 8);
+                ++n;
             }
+        } catch (const std::exception& ex) {
+            std::printf("decode exception: %s\n", ex.what());
+            CHECK(false);
         }
-        CHECK(n == 2);
-        std::printf("codec: lossy=%d l2=%d pqmf=%d qp=%d -> %zu bytes, PSNR-Y %.2f\n", c.lossy, c.l2, c.pqmf, c.qp, s.size(),
-                    plane_psnr(f.p[0], rec.p[0], 8));
+        CHECK(n == c.frames);
+        int types[4] = {0, 0, 0, 0};
+        for (const auto& st : enc.stats()) ++types[static_cast<int>(st.type)];
+        std::printf("codec %-12s: %d frames (I%d P%d B%d C%d) -> %zu bytes, PSNR-Y %.2f\n", c.name, n, types[0], types[1],
+                    types[2], types[3], s.size(), ps / std::max(1, n));
     }
 }
 
