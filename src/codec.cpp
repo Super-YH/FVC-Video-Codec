@@ -560,11 +560,11 @@ FrameParams params_from(const EncoderConfig& c) {
     switch (c.preset) {
     case Preset::Faster:
         fp.min_log2 = 3; fp.max_log2 = 5; t.all_angular = false; s.rd_modes = 1;
-        t.fir = false; s.me_range = 2; s.me_bi = false; s.qpel = false; s.inter_skip_intra = true; s.max_rd_cands = 1;
+        t.fir = false; s.me_range = 2; s.me_bi = false; s.qpel = false; s.inter_skip_intra = true; s.max_rd_cands = 1; s.skip_split_on_skip = true; s.approx_subpel = true;
         break;
     case Preset::Fast:
         fp.min_log2 = 3; fp.max_log2 = 6; s.rd_modes = 2; s.me_range = 4;
-        fp.lf_map = true; s.inter_skip_intra = true; s.max_rd_cands = 2;
+        fp.lf_map = true; s.inter_skip_intra = true; s.max_rd_cands = 2; s.skip_split_on_skip = true; s.approx_subpel = true;
         break;
     case Preset::Medium:
         fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 3; s.me_range = 8;

@@ -302,6 +302,25 @@ void BlockCoder::mv_pred(int x0, int y0, int list, int ref, int& px, int& py) co
 }
 
 int64_t BlockCoder::me_cost(int x0, int y0, int s, const MotionInfo& mi) const {
+    if (search_.approx_subpel && mi.psi == 0 && (mi.dir == 1 || mi.dir == 2)) {
+        // 探索用近似: 1/4 画素位置を双線形補間で評価 (8 タップより大幅に軽い)
+        const int l = mi.dir == 2 ? 1 : 0;
+        const RefPlane& rp = (l ? inter_.l1 : inter_.l0)[mi.ref[l]];
+        const Plane& p = *rp.p;
+        const int ix = mi.mvx[l] >> 2, iy = mi.mvy[l] >> 2, fx = mi.mvx[l] & 3, fy = mi.mvy[l] & 3;
+        const int w00 = (4 - fx) * (4 - fy), w10 = fx * (4 - fy), w01 = (4 - fx) * fy, w11 = fx * fy;
+        int64_t sad = 0;
+        for (int y = 0; y < s; ++y) {
+            const int ry0 = std::clamp(y0 + y + iy, 0, p.h - 1), ry1 = std::clamp(y0 + y + iy + 1, 0, p.h - 1);
+            for (int x = 0; x < s; ++x) {
+                const int rx0 = std::clamp(x0 + x + ix, 0, p.w - 1), rx1 = std::clamp(x0 + x + ix + 1, 0, p.w - 1);
+                int32_t v = (w00 * p.at(rx0, ry0) + w10 * p.at(rx1, ry0) + w01 * p.at(rx0, ry1) + w11 * p.at(rx1, ry1) + 8) >> 4;
+                v = ((v * rp.gain_q + 32) >> 6) + rp.off;
+                sad += std::abs(org_->at(x0 + x, y0 + y) - v);
+            }
+        }
+        return sad;
+    }
     std::vector<int32_t> pred(static_cast<size_t>(s) * s);
     inter_predict(mi, inter_.l0, inter_.l1, x0, y0, s, s, 0, lo_, hi_, pred.data());
     int64_t sad = 0;
@@ -622,43 +641,58 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             if (lf.bvx || lf.bvy) cands.push_back(lf);
         }
     }
+    // 候補ごとの予測を一度だけ計算して以降で再利用
+    std::vector<std::vector<int32_t>> preds(cands.size());
+    for (size_t i = 0; i < cands.size(); ++i) {
+        preds[i].resize(static_cast<size_t>(n));
+        predict(cands[i], x0, y0, l, preds[i].data());
+    }
+    auto keep_only = [&](const std::vector<size_t>& idx) {
+        std::vector<Leaf> c2;
+        std::vector<std::vector<int32_t>> p2;
+        for (size_t i : idx) { c2.push_back(cands[i]); p2.push_back(std::move(preds[i])); }
+        cands.swap(c2);
+        preds.swap(p2);
+    };
     // 高速化: インターで十分よい候補 (残差なし相当) があればイントラ候補を省く
     if (inter_.enabled && search_.inter_skip_intra && is_luma()) {
         int64_t best_sad = INT64_MAX;
-        for (const Leaf& c : cands)
-            if (c.pt == 2) {
-                predict(c, x0, y0, l, pred.data());
+        for (size_t i = 0; i < cands.size(); ++i)
+            if (cands[i].pt == 2) {
                 int64_t sad = 0;
                 for (int y = 0; y < s; ++y)
-                    for (int x = 0; x < s; ++x) sad += std::abs(org_->at(x0 + x, y0 + y) - pred[y * s + x]);
+                    for (int x = 0; x < s; ++x) sad += std::abs(org_->at(x0 + x, y0 + y) - preds[i][y * s + x]);
                 best_sad = std::min(best_sad, sad);
             }
-        if (best_sad < static_cast<int64_t>(step_ * 0.5 * n))
-            cands.erase(std::remove_if(cands.begin(), cands.end(), [](const Leaf& c) { return c.pt != 2; }), cands.end());
+        if (best_sad < static_cast<int64_t>(step_ * 0.5 * n)) {
+            std::vector<size_t> idx;
+            for (size_t i = 0; i < cands.size(); ++i) if (cands[i].pt == 2) idx.push_back(i);
+            keep_only(idx);
+        }
     }
-    // 高速化: 予測 SAD 上位 K 候補のみ RD 評価
+    // 高速化: SATD 上位 K 候補のみ RD 評価
     if (search_.max_rd_cands > 0 && static_cast<int>(cands.size()) > search_.max_rd_cands) {
         std::vector<std::pair<double, size_t>> rank;
         std::vector<int32_t> res(static_cast<size_t>(n));
         const double lsad = std::sqrt(lambda_);
         for (size_t i = 0; i < cands.size(); ++i) {
-            predict(cands[i], x0, y0, l, pred.data());
             for (int y = 0; y < s; ++y)
-                for (int x = 0; x < s; ++x) res[y * s + x] = org_->at(x0 + x, y0 + y) - pred[y * s + x];
+                for (int x = 0; x < s; ++x) res[y * s + x] = org_->at(x0 + x, y0 + y) - preds[i][y * s + x];
             Leaf t = cands[i];
             t.last = -1;
             rank.push_back({static_cast<double>(satd4(res.data(), s)) + lsad * leaf_bits(t, x0, y0, l), i});
         }
         std::stable_sort(rank.begin(), rank.end());
-        std::vector<Leaf> keep;
-        for (int k = 0; k < search_.max_rd_cands; ++k) keep.push_back(cands[rank[k].second]);
-        cands.swap(keep);
+        std::vector<size_t> idx;
+        for (int k = 0; k < search_.max_rd_cands; ++k) idx.push_back(rank[k].second);
+        keep_only(idx);
     }
     // 量子化モード/TNS の組み合わせ
     double best = 1e300;
     Leaf best_leaf;
-    for (const Leaf& base : cands) {
-        predict(base, x0, y0, l, pred.data());
+    for (size_t ci = 0; ci < cands.size(); ++ci) {
+        const Leaf& base = cands[ci];
+        std::copy(preds[ci].begin(), preds[ci].end(), pred.begin());
         for (int qm = 0; qm <= (tools_.e8 && search_.try_e8 ? 1 : 0); ++qm)
             for (int tn = 0; tn <= (tools_.tns && search_.try_tns && s >= 8 ? 1 : 0); ++tn) {
                 Leaf lf = base;
@@ -677,7 +711,10 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     if (inter_.enabled && is_luma()) inter_.mf->fill(x0, y0, s, s, best_leaf.pt == 2 ? best_leaf.mi : MotionInfo{});
     set_modes4(x0, y0, s, best_leaf.pt ? kModePlanar : best_leaf.mode);
     if (l <= min_log2_) return best;
-    if (best < lambda_ * 4.0) { split_at(x0, y0, l) = 0; return best; }
+    if (best < lambda_ * 4.0 || (search_.skip_split_on_skip && best_leaf.pt == 2 && best_leaf.last < 0)) {
+        split_at(x0, y0, l) = 0;
+        return best;
+    }
     restore(x0, y0, s, before);
     const int sbx = bv_px_, sby = bv_py_;
     const int h = s / 2;
