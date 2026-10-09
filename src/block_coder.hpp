@@ -116,6 +116,8 @@ struct Search {
     bool approx_subpel = false;    // サブ画素探索コストを双線形で近似
     bool rdoq = false;             // レート歪み最適化量子化
     bool try_mts = false;          // MTS の RD 探索
+    double psy = 0;                // 心理視覚歪みの強さ (0: SSE)
+    double chroma_weight = 1.0;    // 色差歪みの重み
 };
 
 class BlockCoder {

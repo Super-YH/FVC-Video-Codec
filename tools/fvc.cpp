@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <iterator>
 #include <string>
 
@@ -24,7 +25,7 @@ static bool ends_with(const std::string& s, const char* suf) {
 static int usage() {
     std::fprintf(stderr,
                  "usage:\n  fvc enc [-q QP] [--preset faster|fast|medium|slow|placebo] [--lossless] [--l2] [--pqmf N]"
-                 " [--frames N]\n      [--keyint N] [--bframes N] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] [--aqp=0|1] [--rect=0|1] [--tmvp=0|1] [--alf=0|1] [--mts=0|1]\n      [--ssim TARGET] [-v] [--quiet] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
+                 " [--frames N]\n      [--keyint N] [--bframes N] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] [--aqp=0|1] [--rect=0|1] [--tmvp=0|1] [--alf=0|1] [--mts=0|1] [--tune psy|psnr] [--psy-rd X]\n      [--ssim TARGET] [-v] [--quiet] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
     return 2;
 }
 
@@ -61,6 +62,8 @@ static int cmd_enc(int argc, char** argv) {
         else if (a.rfind("--tmvp=", 0) == 0) cfg.tmvp = std::atoi(a.c_str() + 7);
         else if (a.rfind("--alf=", 0) == 0) cfg.alf = std::atoi(a.c_str() + 6);
         else if (a.rfind("--mts=", 0) == 0) cfg.mts = std::atoi(a.c_str() + 6);
+        else if (a == "--tune" && i + 1 < argc) cfg.tune_psnr = std::string(argv[++i]) == "psnr";
+        else if (a == "--psy-rd" && i + 1 < argc) cfg.psy_strength = std::atof(argv[++i]);
         else if (a.rfind("--dict=", 0) == 0) cfg.dict = std::atoi(a.c_str() + 7);
         else if (a.rfind("--shapes=", 0) == 0) cfg.shapes = std::atoi(a.c_str() + 9);
         else if (a.rfind("--fir=", 0) == 0) cfg.fir = std::atoi(a.c_str() + 6);
@@ -117,7 +120,17 @@ static int cmd_enc(int argc, char** argv) {
                      cfg.threads > 0 ? std::to_string(cfg.threads).c_str() : "auto");
         std::fprintf(stderr, "\n    Frame          |  CPU time/estim | REAL time/estim | play/CPU |    ETA  |   kbps | PSNR-Y |  SSIM\n");
     }
-    std::vector<uint8_t> stream = enc.sequence_header();
+    // ストリーミング出力: ユニットが出来た順にファイルへ書き、都度フラッシュする
+    std::ofstream os(out, std::ios::binary);
+    if (!os) { std::fprintf(stderr, "cannot write %s\n", out.c_str()); return 1; }
+    size_t stream_size = 0;
+    auto emit = [&](const std::vector<uint8_t>& u) {
+        if (u.empty()) return;
+        os.write(reinterpret_cast<const char*>(u.data()), static_cast<std::streamsize>(u.size()));
+        os.flush();
+        stream_size += u.size();
+    };
+    emit(enc.sequence_header());
     Frame f;
     int n = 0;
     const auto t0 = std::chrono::steady_clock::now();
@@ -155,16 +168,14 @@ static int cmd_enc(int argc, char** argv) {
     while (n < max_frames) {
         if (is_ppm) { if (n) break; f = single; }
         else if (!y4m.read(f)) break;
-        const auto u = enc.encode(f);
-        stream.insert(stream.end(), u.begin(), u.end());
+        emit(enc.encode(f));
         ++n;
         progress(false);
     }
-    const auto e = enc.flush();
-    stream.insert(stream.end(), e.begin(), e.end());
+    emit(enc.flush());
     progress(true);
     const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::ofstream(out, std::ios::binary).write(reinterpret_cast<const char*>(stream.data()), static_cast<std::streamsize>(stream.size()));
+    os.close();
 
     // ---- 集計
     const auto& stats = enc.stats();
@@ -195,7 +206,7 @@ static int cmd_enc(int argc, char** argv) {
             std::string hist;
             for (const auto& kv : qh[t]) hist += std::to_string(kv.first) + ":" + std::to_string(kv.second) + " ";
             std::printf("  %-6s          %8d   %6.1f%%   %10.0f   %10.1f%%   %s\n", tn[t], cnt[t], 100.0 * cnt[t] / n,
-                        static_cast<double>(tbytes[t]) / cnt[t], 100.0 * tbytes[t] / std::max<size_t>(1, stream.size()), hist.c_str());
+                        static_cast<double>(tbytes[t]) / cnt[t], 100.0 * tbytes[t] / std::max<size_t>(1, stream_size), hist.c_str());
         }
         const double area = static_cast<double>(u.intra + u.inter + u.ibc + u.dict);
         if (area > 0) {
@@ -218,25 +229,30 @@ static int cmd_enc(int argc, char** argv) {
         }
         std::printf("\nAverage PSNR  Y %.3f  Cb/Co %.3f  Cr/Cg %.3f dB   SSIM %.5f (%.2f dB)\n", ps[0] / n, ps[1] / n, ps[2] / n,
                     ss / n, -10.0 * std::log10(std::max(1e-9, 1.0 - ss / n)));
-        std::printf("Size %zu bytes  %.1f kbps  %.4f bpp   speed %.3f fps (%.3fx realtime)%s\n\n", stream.size(),
-                    stream.size() * 8.0 / 1000.0 / std::max(1e-9, n / fps), stream.size() * 8.0 / std::max(1.0, pixels),
+        std::printf("Size %zu bytes  %.1f kbps  %.4f bpp   speed %.3f fps (%.3fx realtime)%s\n\n", stream_size,
+                    stream_size * 8.0 / 1000.0 / std::max(1e-9, n / fps), stream_size * 8.0 / std::max(1.0, pixels),
                     n / std::max(sec, 1e-9), (n / fps) / std::max(sec, 1e-9),
                     cfg.target_ssim > 0 ? ("   QP search encodes " + std::to_string(trials)).c_str() : "");
     }
     // 機械可読な 1 行要約
     std::printf("frames=%d (I%d P%d B%d C%d) bytes=%zu bpp=%.4f kbps=%.1f PSNR(Y/C1/C2)=%.3f/%.3f/%.3f SSIM=%.5f fps=%.3f\n", n,
-                cnt[0], cnt[1], cnt[2], cnt[3], stream.size(), stream.size() * 8.0 / std::max(1.0, pixels),
-                stream.size() * 8.0 / 1000.0 / std::max(1e-9, n / fps), ps[0] / std::max(1, n), ps[1] / std::max(1, n),
+                cnt[0], cnt[1], cnt[2], cnt[3], stream_size, stream_size * 8.0 / std::max(1.0, pixels),
+                stream_size * 8.0 / 1000.0 / std::max(1e-9, n / fps), ps[0] / std::max(1, n), ps[1] / std::max(1, n),
                 ps[2] / std::max(1, n), ss / std::max(1, n), n / std::max(sec, 1e-9));
     return 0;
 }
 
 static int cmd_dec(int argc, char** argv) {
     if (argc != 2) return usage();
-    std::ifstream is(argv[0], std::ios::binary);
-    if (!is) { std::fprintf(stderr, "cannot read %s\n", argv[0]); return 1; }
-    std::vector<uint8_t> s((std::istreambuf_iterator<char>(is)), std::istreambuf_iterator<char>());
-    Decoder dec(s);
+    // ストリーミング復号: 入力を逐次読み、フレームが揃い次第出力する ("-" で標準入力)
+    std::ifstream ifs;
+    std::istream* is = &std::cin;
+    if (std::string(argv[0]) != "-") {
+        ifs.open(argv[0], std::ios::binary);
+        if (!ifs) { std::fprintf(stderr, "cannot read %s\n", argv[0]); return 1; }
+        is = &ifs;
+    }
+    Decoder dec(*is);
     if (!dec.ok()) { std::fprintf(stderr, "bad stream\n"); return 1; }
     const std::string out = argv[1];
     Frame f;

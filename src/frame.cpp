@@ -75,6 +75,7 @@ bool Y4MWriter::open(const std::string& path, const VideoInfo& info) {
 
 bool Y4MWriter::write(const Frame& f) {
     std::fputs("FRAME\n", fp_);
+    struct Flush { FILE* f; ~Flush() { std::fflush(f); } } fl{fp_};  // ストリーミング: フレームごとに出力
     for (const Plane& pl : f.p) {
         std::vector<uint8_t> buf(pl.v.size());
         for (size_t k = 0; k < buf.size(); ++k) buf[k] = static_cast<uint8_t>(std::min(255, std::max(0, pl.v[k])));

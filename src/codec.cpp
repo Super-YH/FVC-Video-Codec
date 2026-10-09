@@ -57,7 +57,7 @@ void code_bands(SymIO& io, Models& md, int pqmf_log2, const Plane* org, Plane& r
     Pqmf2D fb(M, M);
     const int32_t off = (lo + hi + 1) / 2;
     std::vector<std::vector<double>> bands, src;
-    if (io.w) {
+    if (io.enc) {
         std::vector<double> x(static_cast<size_t>(W) * H);
         for (size_t i = 0; i < x.size(); ++i) x[i] = org->v[i] - off;
         fb.analyze(x, W, H, bands);
@@ -66,12 +66,17 @@ void code_bands(SymIO& io, Models& md, int pqmf_log2, const Plane* org, Plane& r
         bands.assign(M * M, std::vector<double>(static_cast<size_t>(W / M) * (H / M), 0.0));
     }
     const int bw = W / M, bh = H / M;
+    constexpr int kPB = 8;  // 帯域間予測のブロック (帯域画像の画素)
+    std::vector<std::vector<int32_t>> qs(M * M, std::vector<int32_t>(static_cast<size_t>(bw) * bh, 0));
+    double ll_step = 1.0;
     for (int ky = 0; ky < M; ++ky)
         for (int kx = 0; kx < M; ++kx) {
             const int k = ky * M + kx;
             auto& b = bands[k];
+            auto& q = qs[k];
             const double st = step / fb.band_norm(kx, ky) * (1.0 + 0.08 * (kx + ky));
             const bool ll = kx == 0 && ky == 0;
+            if (ll) ll_step = st;
             // 参照帯域 (再構成済み): 左隣 or 上隣。奇数帯域のスペクトル鏡像は (-1)^n 変調で補正
             const int rk = kx > 0 ? k - 1 : (ky > 0 ? k - M : -1);
             const bool horiz = kx > 0;
@@ -79,32 +84,19 @@ void code_bands(SymIO& io, Models& md, int pqmf_log2, const Plane* org, Plane& r
                 const double v = bands[rk][static_cast<size_t>(y) * bw + x];
                 return ((horiz ? x : y) & 1) ? -v : v;
             };
-            int mode = 0, gain_q = 0, rms_q = 0;
-            if (io.w && band_tools && !ll) {
+            // 帯域モード: 0 = 通常 (ブロック単位の帯域間予測つき), 2 = ノイズ置換
+            int mode = 0, rms_q = 0;
+            if (io.enc && band_tools && !ll && psy) {
                 double e = 0;
                 for (double v : src[k]) e += v * v;
                 const double rms = std::sqrt(e / src[k].size());
-                if (rk >= 0) {
-                    double num = 0, den = 0;
-                    for (int y = 0; y < bh; ++y)
-                        for (int x = 0; x < bw; ++x) { const double r = refv(x, y); num += r * src[k][y * bw + x]; den += r * r; }
-                    if (den > 0) {
-                        gain_q = std::clamp(static_cast<int>(std::lround(num / den * 64.0)), -128, 128);
-                        const double red = num * num / den;
-                        if (gain_q != 0 && red > 0.2 * e && e > 4.0 * st * st * src[k].size() * 0.05) mode = 1;
-                    }
-                }
-                if (mode == 0 && psy && rms < 0.5 * st && rms > 0.15 * st) {
-                    mode = 2;
-                    rms_q = std::clamp(static_cast<int>(std::lround(rms / st * 32.0)), 1, 63);
-                }
+                if (rms < 0.5 * st && rms > 0.15 * st) { mode = 2; rms_q = std::clamp(static_cast<int>(std::lround(rms / st * 32.0)), 1, 63); }
             }
             if (band_tools && !ll) {
                 mode = static_cast<int>(io.uint(md.band_mode, 0, static_cast<uint32_t>(std::min(kx + ky, 15)), static_cast<uint32_t>(mode)));
-                if (mode > 2 || (mode == 1 && rk < 0)) throw std::runtime_error("corrupt stream: band mode");
-                if (mode == 1) gain_q = io.sint(md.band_mode, 1, 0, gain_q);
+                if (mode != 0 && mode != 2) throw std::runtime_error("corrupt stream: band mode");
                 if (mode == 2) rms_q = static_cast<int>(io.uint(md.band_mode, 2, 0, static_cast<uint32_t>(rms_q)));
-                if (std::abs(gain_q) > 128 || rms_q > 63) throw std::runtime_error("corrupt stream: band params");
+                if (rms_q > 63) throw std::runtime_error("corrupt stream: band params");
             }
             if (mode == 2) {
                 SplitMix64 rng(seed * 1315423911ull + static_cast<uint64_t>(k));
@@ -112,26 +104,70 @@ void code_bands(SymIO& io, Models& md, int pqmf_log2, const Plane* org, Plane& r
                 for (auto& v : b) v = (rng.next() >> 63) ? amp : -amp;
                 continue;
             }
+            // ブロック単位の帯域間予測ゲイン g ∈ {-4..4}/4 (常時有効、g=0 は予測なし)
+            const int nbx = (bw + kPB - 1) / kPB, nby = (bh + kPB - 1) / kPB;
+            std::vector<int> gain(static_cast<size_t>(nbx) * nby, 0);
             std::vector<double> pr(b.size(), 0.0);
-            if (mode == 1)
-                for (int y = 0; y < bh; ++y)
-                    for (int x = 0; x < bw; ++x) pr[y * bw + x] = gain_q / 64.0 * refv(x, y);
-            std::vector<int32_t> q(b.size(), 0);
+            if (!ll && rk >= 0) {
+                int prevg = 0;
+                for (int by = 0; by < nby; ++by)
+                    for (int bx = 0; bx < nbx; ++bx) {
+                        int g = 0;
+                        if (io.enc) {
+                            double num = 0, den = 0, e0 = 0;
+                            for (int y = by * kPB; y < std::min(bh, (by + 1) * kPB); ++y)
+                                for (int x = bx * kPB; x < std::min(bw, (bx + 1) * kPB); ++x) {
+                                    const double r = refv(x, y), t = src[k][static_cast<size_t>(y) * bw + x];
+                                    num += r * t; den += r * r; e0 += t * t;
+                                }
+                            if (den > 0) {
+                                const int gq = std::clamp(static_cast<int>(std::lround(num / den * 4.0)), -4, 4);
+                                const double a = gq / 4.0;
+                                const double e1 = e0 - 2 * a * num + a * a * den;
+                                // 予測で残差エネルギーが量子化ステップ相当以上減る場合のみ (副情報 ~3 ビット)
+                                if (gq != 0 && e0 - e1 > 3.0 * st * st) g = gq;
+                            }
+                        }
+                        g = prevg + io.sint(md.band_mode, 3, static_cast<uint32_t>(std::min(kx + ky, 15)), g - prevg);
+                        if (g < -4 || g > 4) throw std::runtime_error("corrupt stream: band gain");
+                        gain[by * nbx + bx] = g;
+                        prevg = g;
+                        for (int y = by * kPB; y < std::min(bh, (by + 1) * kPB); ++y)
+                            for (int x = bx * kPB; x < std::min(bw, (bx + 1) * kPB); ++x)
+                                pr[static_cast<size_t>(y) * bw + x] = g / 4.0 * refv(x, y);
+                    }
+            }
+            // 高域ほどデッドゾーンを広げる
+            const double r_band = std::max(0.18, rnd - 0.02 * (kx + ky));
+            const auto& LL = qs[0];
             for (int y = 0; y < bh; ++y)
                 for (int x = 0; x < bw; ++x) {
                     const size_t i = static_cast<size_t>(y) * bw + x;
                     const int32_t qw = x ? q[i - 1] : 0, qn = y ? q[i - bw] : 0, qnw = (x && y) ? q[i - bw - 1] : 0;
+                    const int32_t qne = (y && x + 1 < bw) ? q[i - bw + 1] : 0;
                     if (ll) {
                         int32_t p;
                         if (!x && !y) p = 0; else if (!y) p = qw; else if (!x) p = qn;
                         else { const int32_t mx = std::max(qw, qn), mn = std::min(qw, qn); p = qnw >= mx ? mn : qnw <= mn ? mx : qw + qn - qnw; }
                         const uint32_t act = static_cast<uint32_t>(std::min(std::abs(qw - qnw) + std::abs(qn - qnw), 31));
-                        const int32_t d = io.sint(md.band_ll, act, 0, io.w ? quant_dz(src[k][i], st, 0.5) - p : 0);
+                        const int32_t d = io.sint(md.band_ll, act, 0, io.enc ? quant_dz(src[k][i], st, 0.5) - p : 0);
                         q[i] = p + d;
                     } else {
-                        const uint32_t a = static_cast<uint32_t>(std::min(std::abs(qw) + std::abs(qn) + std::abs(qnw), 31));
-                        q[i] = io.sint(md.band_hi, a, static_cast<uint32_t>(std::min(kx + ky, 31)) + (mode == 1 ? 32u : 0u),
-                                       io.w ? quant_dz(src[k][i] - pr[i], st, rnd) : 0);
+                        // 文脈 (帯域間相関の常時利用): 空間近傍 + 隣接帯域の同位置 + LL 帯域の局所勾配
+                        int cross = 0;
+                        if (kx > 0) cross += std::abs(qs[k - 1][i]);
+                        if (ky > 0) cross += std::abs(qs[k - M][i]);
+                        if (kx > 0 && ky > 0) cross += std::abs(qs[k - M - 1][i]);
+                        const int xl = std::max(x - 1, 0), xr = std::min(x + 1, bw - 1), yu = std::max(y - 1, 0), yd = std::min(y + 1, bh - 1);
+                        const int32_t grad = std::abs(LL[static_cast<size_t>(y) * bw + xr] - LL[static_cast<size_t>(y) * bw + xl]) +
+                                             std::abs(LL[static_cast<size_t>(yd) * bw + x] - LL[static_cast<size_t>(yu) * bw + x]);
+                        const double gs = grad * ll_step / st;  // 当該帯域のステップ単位
+                        const int gb = gs < 0.5 ? 0 : gs < 2 ? 1 : gs < 6 ? 2 : gs < 16 ? 3 : 4;
+                        const uint32_t a = static_cast<uint32_t>(std::min(std::abs(qw) + std::abs(qn) + std::abs(qnw) + std::abs(qne), 15)) |
+                                           (static_cast<uint32_t>(std::min(cross, 7)) << 4);
+                        const uint32_t bctx = static_cast<uint32_t>(std::min(kx + ky, 15)) | (static_cast<uint32_t>(gb) << 4) |
+                                              (pr[i] != 0.0 ? 128u : 0u);
+                        q[i] = io.sint(md.band_hi, a, bctx, io.enc ? quant_dz(src[k][i] - pr[i], st, r_band) : 0);
                     }
                     b[i] = pr[i] + q[i] * st;
                 }
@@ -661,12 +697,15 @@ FrameParams params_from(const EncoderConfig& c) {
     t.rect = c.preset == Preset::Placebo;  // vtest では効果 ±0・時間 +30% のため placebo のみ
     if (c.rect >= 0) t.rect = c.rect != 0;
     fp.alf = c.preset >= Preset::Fast;
-    t.mts = s.try_mts = c.preset >= Preset::Medium;
+    t.mts = s.try_mts = c.preset >= Preset::Slow;  // 実測 +1% / 時間 2 倍
+    s.psy = c.tune_psnr ? 0.0 : c.psy_strength;
+    s.chroma_weight = c.tune_psnr ? 1.0 : 2.0;
     if (c.mts >= 0) t.mts = s.try_mts = c.mts != 0;
     if (c.alf >= 0) fp.alf = c.alf != 0;
     if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
-    const int dt = c.preset == Preset::Placebo ? 1 : 2;
+    // 実測: 2x2 は 1x1 より 4-7% 効率が落ちるため、medium 以上は 1x1 (速度より効率)
+    const int dt = c.preset >= Preset::Medium ? 1 : 2;
     fp.tile_cols = std::clamp(c.tile_cols > 0 ? c.tile_cols : dt, 1, 16);
     fp.tile_rows = std::clamp(c.tile_rows > 0 ? c.tile_rows : dt, 1, 16);
     fp.threads = c.threads > 0 ? c.threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
@@ -1000,13 +1039,35 @@ std::vector<uint8_t> Encoder::flush() {
 }
 
 // ---------------- Decoder ----------------
-Decoder::Decoder(const std::vector<uint8_t>& stream, int threads) : s_(stream), st_(new CodecState) {
-    threads_ = threads > 0 ? threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
-    ByteReader br{s_.data(), s_.size()};
-    if (br.u8() != static_cast<uint8_t>(UnitType::Seq)) return;
+// 1 ユニットを取り出す (メモリ上のストリーム or 入力ストリームから逐次)
+bool Decoder::read_unit(uint8_t& type, std::vector<uint8_t>& payload) {
+    if (in_) {
+        uint8_t h[5];
+        if (!in_->read(reinterpret_cast<char*>(h), 5)) return false;
+        type = h[0];
+        const uint32_t len = (static_cast<uint32_t>(h[1]) << 24) | (static_cast<uint32_t>(h[2]) << 16) |
+                             (static_cast<uint32_t>(h[3]) << 8) | h[4];
+        if (len > (1u << 30)) { ok_ = false; return false; }
+        payload.resize(len);
+        if (len && !in_->read(reinterpret_cast<char*>(payload.data()), len)) { ok_ = false; return false; }
+        return true;
+    }
+    if (pos_ + 5 > s_.size()) return false;
+    ByteReader br{s_.data() + pos_, s_.size() - pos_};
+    type = static_cast<uint8_t>(br.u8());
     const uint32_t len = br.u32();
-    const size_t start = br.pos;
-    if (br.u32() != kMagic) return;
+    if (pos_ + 5 + len > s_.size()) { ok_ = false; return false; }
+    payload.assign(s_.data() + pos_ + 5, s_.data() + pos_ + 5 + len);
+    pos_ += 5 + len;
+    return true;
+}
+
+bool Decoder::parse_seq() {
+    uint8_t t;
+    std::vector<uint8_t> pl;
+    if (!read_unit(t, pl) || t != static_cast<uint8_t>(UnitType::Seq)) return false;
+    ByteReader br{pl.data(), pl.size()};
+    if (br.u32() != kMagic) return false;
     br.u8();
     info_.width = static_cast<int>(br.u16());
     info_.height = static_cast<int>(br.u16());
@@ -1015,20 +1076,27 @@ Decoder::Decoder(const std::vector<uint8_t>& stream, int threads) : s_(stream), 
     info_.ct = static_cast<ColorTransform>(br.u8());
     info_.fps_num = static_cast<int>(br.u32());
     info_.fps_den = static_cast<int>(br.u32());
-    if (br.fail || info_.width <= 0 || info_.height <= 0 || info_.bit_depth < 8 || info_.bit_depth > 16) return;
-    pos_ = start + len;
-    ok_ = pos_ <= s_.size();
+    return !br.fail && info_.width > 0 && info_.height > 0 && info_.bit_depth >= 8 && info_.bit_depth <= 16;
+}
+
+Decoder::Decoder(const std::vector<uint8_t>& stream, int threads) : s_(stream), st_(new CodecState) {
+    threads_ = threads > 0 ? threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    ok_ = parse_seq();
+}
+
+Decoder::Decoder(std::istream& in, int threads) : st_(new CodecState), in_(&in) {
+    threads_ = threads > 0 ? threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    ok_ = parse_seq();
 }
 Decoder::~Decoder() = default;
 
 bool Decoder::decode_unit() {
-    while (ok_ && !eos_ && pos_ + 5 <= s_.size()) {
-        ByteReader br{s_.data() + pos_, s_.size() - pos_};
-        const auto type = static_cast<UnitType>(br.u8());
-        const uint32_t len = br.u32();
-        if (pos_ + 5 + len > s_.size()) { ok_ = false; return false; }
-        const uint8_t* pl = s_.data() + pos_ + 5;
-        pos_ += 5 + len;
+    uint8_t utype;
+    std::vector<uint8_t> buf;
+    while (ok_ && !eos_ && read_unit(utype, buf)) {
+        const auto type = static_cast<UnitType>(utype);
+        const uint32_t len = static_cast<uint32_t>(buf.size());
+        const uint8_t* pl = buf.data();
         if (type == UnitType::Eos) { eos_ = true; return false; }
         if (type != UnitType::Frame) continue;
         ByteReader hr{pl, len};

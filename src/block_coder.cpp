@@ -229,7 +229,19 @@ void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) c
                 const int lx = std::min((x0 + bx) << cs, inter_.mf->w4 * 4 - 1);
                 const int ly = std::min((y0 + by) << cs, inter_.mf->h4 * 4 - 1);
                 MotionInfo mi = inter_.mf->at(lx, ly);
-                if (mi.dir == 0) { mi = MotionInfo{}; mi.dir = 1; }
+                if (mi.dir == 0) {
+                    // 輝度がイントラの位置: 近傍 (左・上・右・下、最大 16 輝度画素) のインター動きを借りる。
+                    // 動きベクトル 0 で代用すると動物体の色が前位置に残る (色の残像・褪色) ため。
+                    const int W4 = inter_.mf->w4 * 4, H4 = inter_.mf->h4 * 4;
+                    for (int d = 4; d <= 16 && mi.dir == 0; d += 4)
+                        for (const auto& o : {std::pair<int, int>{-d, 0}, {0, -d}, {d, 0}, {0, d}}) {
+                            const int nx = lx + o.first, ny = ly + o.second;
+                            if (nx < 0 || ny < 0 || nx >= W4 || ny >= H4) continue;
+                            const MotionInfo& m2 = inter_.mf->at(nx, ny);
+                            if (m2.dir != 0) { mi = m2; break; }
+                        }
+                    if (mi.dir == 0) { mi = MotionInfo{}; mi.dir = 1; }
+                }
                 return mi;
             };
             // 高速経路: ブロック内の動きが一様なら 1 回で補償
@@ -745,7 +757,37 @@ double BlockCoder::sse(int x0, int y0, int s) const {
     double e = 0;
     for (int y = 0; y < s; ++y)
         for (int x = 0; x < s; ++x) { const double d = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y); e += d * d; }
-    return e;
+    // 色差の誤差は数値が小さくても彩度変化として目立つため重み付け (輝度と同 QP 時に約 2 倍)
+    const double cw = plane_ ? search_.chroma_weight : 1.0;
+    if (search_.psy <= 0) return e * cw;
+    // 心理視覚歪み (§13.2): 誤差を 3x3 二項フィルタで低域 e_lp と高域 e_hf に分ける。
+    //   D = ||e_lp||² + w_hf ||e_hf||²,  w_hf = 1 / (1 + psy · σ²_org / Δ²)
+    // 低域誤差 (ブロック化・構造の崩れ) は常に評価し、高域誤差はテクスチャ部でマスキングする。
+    // 平坦部では w_hf ≈ 1 なのでモスキートノイズを抑え、テクスチャ部のノイズ再符号化 (ちらつき) を避ける。
+    std::vector<double> err(static_cast<size_t>(s) * s);
+    double m = 0, v = 0;
+    for (int y = 0; y < s; ++y)
+        for (int x = 0; x < s; ++x) {
+            err[y * s + x] = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y);
+            m += org_->at(x0 + x, y0 + y);
+        }
+    m /= s * s;
+    for (int y = 0; y < s; ++y)
+        for (int x = 0; x < s; ++x) { const double d = org_->at(x0 + x, y0 + y) - m; v += d * d; }
+    v /= s * s;
+    const double whf = 1.0 / (1.0 + search_.psy * v / (step_ * step_));
+    double lp = 0, hf = 0;
+    auto at = [&](int x, int y) { return err[std::clamp(y, 0, s - 1) * s + std::clamp(x, 0, s - 1)]; };
+    for (int y = 0; y < s; ++y)
+        for (int x = 0; x < s; ++x) {
+            const double l = (4 * at(x, y) + 2 * (at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1)) +
+                              at(x - 1, y - 1) + at(x + 1, y - 1) + at(x - 1, y + 1) + at(x + 1, y + 1)) / 16.0;
+            const double h = at(x, y) - l;
+            lp += l * l;
+            hf += h * h;
+        }
+    (void)e;
+    return (lp + whf * hf) * cw;
 }
 
 void BlockCoder::save(int x0, int y0, int s, std::vector<int32_t>& b) const {

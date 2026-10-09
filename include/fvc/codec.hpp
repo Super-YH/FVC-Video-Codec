@@ -1,6 +1,7 @@
 // FVC: 符号器 / 復号器 (I/P/B/COPY フレーム, ブロック変換 or PQMF 帯域, 図形, 辞書, L2 ロスレス層)
 #pragma once
 #include <cstdint>
+#include <istream>
 #include <map>
 #include <memory>
 #include <vector>
@@ -29,6 +30,8 @@ struct EncoderConfig {
     int tile_cols = 0, tile_rows = 0;  // 0: プリセット依存
     int threads = 0;          // 0: ハードウェアスレッド数
     int chroma_qp_offset = 0; // 色差 QP オフセット (-12..12)
+    bool tune_psnr = false;     // true: 歪みを純粋な SSE で評価 (PSNR 最大化)
+    double psy_strength = 1.0;  // 心理視覚マスキングの強さ
     double target_ssim = 0;   // >0: フレームごとに輝度 SSIM がこの値以上となる最大 QP を探索
 };
 
@@ -94,6 +97,8 @@ private:
 class Decoder {
 public:
     explicit Decoder(const std::vector<uint8_t>& stream, int threads = 0);
+    // ストリーミング復号: 入力からユニットを逐次読み、表示順にそろったフレームから返す
+    explicit Decoder(std::istream& in, int threads = 0);
     ~Decoder();
     bool ok() const { return ok_; }
     const VideoInfo& info() const { return info_; }
@@ -109,6 +114,9 @@ private:
     bool eos_ = false;
     int threads_ = 1;
     bool decode_unit();
+    bool read_unit(uint8_t& type, std::vector<uint8_t>& payload);
+    bool parse_seq();
+    std::istream* in_ = nullptr;
 };
 
 }  // namespace fvc
