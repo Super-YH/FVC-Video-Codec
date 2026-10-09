@@ -5,7 +5,7 @@
 
 namespace fvc {
 
-enum class TxType : uint8_t { DCT2 = 0, DST7 = 1, IDTX = 2 };
+enum class TxType : uint8_t { DCT2 = 0, DST7 = 1, IDTX = 2, DCT8 = 3 };
 
 // 正規直交基底行列 (N x N, row k = 基底 k)。キャッシュ付き。
 const std::vector<double>& tx_matrix(TxType t, int N);

@@ -17,6 +17,7 @@
 #include "block_coder.hpp"
 #include "dictionary.hpp"
 #include "inter.hpp"
+#include "alf.hpp"
 #include "loop_filter.hpp"
 #include "shapes.hpp"
 #include "fvc/quant.hpp"
@@ -212,6 +213,7 @@ struct FrameParams {
     int tile_cols = 1, tile_rows = 1;                  // タイル分割 (CTU 単位で均等)
     int cqp_off = 0;                                   // 色差 QP オフセット
     bool aqp = false;                                  // CTU 単位の適応 QP
+    bool alf = false;                                  // 適応ウィーナーフィルタ (§9.4)
     // 符号器: 輝度 64x64 CTU ごとの dQP (先読みによる静止度から決定)
     std::vector<int8_t> aqp_map;
     int aqp_w = 0;
@@ -553,6 +555,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     code_loop_filter(io, md.lf, R, org ? &opad : nullptr, einfo, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, pqp,
                                      info.bit_depth, step, lambda, fp.lf_freq, fp.lf_map, lo, hi);
                 }
+                if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lambda, lo, hi);
             }
         }
         if (pi == 0) luma_rec = R;
@@ -657,6 +660,10 @@ FrameParams params_from(const EncoderConfig& c) {
     t.tmvp = c.preset != Preset::Faster;
     t.rect = c.preset == Preset::Placebo;  // vtest では効果 ±0・時間 +30% のため placebo のみ
     if (c.rect >= 0) t.rect = c.rect != 0;
+    fp.alf = c.preset >= Preset::Fast;
+    t.mts = s.try_mts = c.preset >= Preset::Medium;
+    if (c.mts >= 0) t.mts = s.try_mts = c.mts != 0;
+    if (c.alf >= 0) fp.alf = c.alf != 0;
     if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
     const int dt = c.preset == Preset::Placebo ? 1 : 2;
@@ -677,6 +684,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
                   (fp.lf_freq ? 16u : 0u) | (fp.lf_map ? 32u : 0u) | (fp.tools.rect ? 64u : 0u) | (fp.tools.tmvp ? 128u : 0u));
     put_u8(p, static_cast<uint32_t>((fp.tile_cols - 1) | ((fp.tile_rows - 1) << 4)));
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
+    put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_u32(p, static_cast<uint32_t>(poc));
@@ -704,6 +712,9 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     const uint32_t cq = br.u8();
     fp.aqp = (cq >> 7) & 1;
     fp.cqp_off = static_cast<int>(cq & 127) - 32;
+    const uint32_t f3 = br.u8();
+    fp.alf = f3 & 1;
+    fp.tools.mts = (f3 >> 1) & 1;
     if (fp.cqp_off < -12 || fp.cqp_off > 12) return false;
     for (int l = 0; l < 2; ++l) {
         const uint32_t n = br.u8();

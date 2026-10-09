@@ -28,6 +28,9 @@ std::vector<double> build_matrix(TxType t, int N) {
             case TxType::IDTX:
                 v = (k == n) ? 1.0 : 0.0;
                 break;
+            case TxType::DCT8:
+                v = std::sqrt(4.0 / (2 * N + 1)) * std::cos(kPi * (2 * k + 1) * (2 * n + 1) / (4.0 * N + 2));
+                break;
             }
             m[static_cast<size_t>(k) * N + n] = v;
         }
@@ -38,11 +41,11 @@ int log2i(int n) { int l = 0; while ((1 << l) < n) ++l; return l; }
 
 struct MatrixCache {
     // 2 冪サイズはロックなしの固定表、それ以外はロック付き map
-    std::vector<double> pow2[3][11];
+    std::vector<double> pow2[4][11];
     std::mutex mu;
     std::map<std::pair<int, int>, std::vector<double>> other;
     MatrixCache() {
-        for (int t = 0; t < 3; ++t)
+        for (int t = 0; t < 4; ++t)
             for (int l = 0; l <= 10; ++l) pow2[t][l] = build_matrix(static_cast<TxType>(t), 1 << l);
     }
 };

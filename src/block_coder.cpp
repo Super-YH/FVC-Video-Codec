@@ -55,6 +55,23 @@ int64_t satd4(const int32_t* r, int s) {
     return total / 2;
 }
 
+// 係数の文脈: 走査順で既に符号化済みの低域側 2D テンプレート
+//   (u-1,v) (u,v-1) (u-1,v-1) (u-2,v) (u,v-2) の min(|q|,3) の和と非ゼロ数、および周波数位置 u+v
+uint32_t coef_ctx(const int32_t* q, int u, int v, int l) {
+    const int s = 1 << l;
+    int sum = 0, cnt = 0;
+    auto add = [&](int x, int y) {
+        if (x < 0 || y < 0) return;
+        const int32_t a = std::abs(q[(y << l) + x]);
+        sum += std::min<int32_t>(a, 3);
+        cnt += a != 0;
+    };
+    add(u - 1, v); add(u, v - 1); add(u - 1, v - 1); add(u - 2, v); add(u, v - 2);
+    (void)s;
+    return static_cast<uint32_t>(std::min(sum, 15)) | (static_cast<uint32_t>(std::min(cnt, 5)) << 4) |
+           (static_cast<uint32_t>(std::min(u + v, 15)) << 7);
+}
+
 namespace {
 // HEVC 互換の角度表 (モード 2..34)
 constexpr int kAngle[35] = {0, 0, 32, 26, 21, 17, 13, 9, 5, 2, 0, -2, -5, -9, -13, -17, -21, -26,
@@ -556,11 +573,11 @@ void BlockCoder::rdoq(Leaf& lf, int l, const std::vector<double>& e) const {
     double tail_d = 0;                     // 打ち切った場合の歪み (e^2) の累積
     std::vector<double> d0(n);
     for (int i = 0; i < n; ++i) d0[i] = e[i] * e[i];
+    std::vector<int32_t> rq(n, 0);  // 決定済みレベル (ラスタ順、文脈用)
     for (int i = 0; i <= last0; ++i) {
         const int pos = scan[i];
         const int u = pos & (s - 1), v = pos >> l;
-        const int32_t n1 = i > 0 ? std::abs(lv[i - 1]) : 0, n2 = i > 1 ? std::abs(lv[i - 2]) : 0;
-        const uint32_t a = static_cast<uint32_t>(std::min(n1 + n2, 15)) | (static_cast<uint32_t>(std::min(u + v, 15)) << 4);
+        const uint32_t a = coef_ctx(rq.data(), u, v, l);
         const uint32_t b = L * 4 + (i == 0 ? 2u : 0u);
         const double x = e[i] / step_;
         const int32_t r = static_cast<int32_t>(std::lround(std::abs(x)));
@@ -575,6 +592,7 @@ void BlockCoder::rdoq(Leaf& lf, int l, const std::vector<double>& e) const {
             if (m == 0) break;
         }
         lv[i] = bv;
+        rq[pos] = bv;
         jcum[i + 1] = jcum[i] + best;
     }
     (void)tail_d;
@@ -602,7 +620,9 @@ void BlockCoder::quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) 
     std::vector<double> r(n), c(n), e(n);
     for (int y = 0; y < s; ++y)
         for (int x = 0; x < s; ++x) r[y * s + x] = org_->at(x0 + x, y0 + y) - pred[y * s + x];
-    forward_2d(tx_for(s), tx_for(s), r.data(), s, s, c.data());
+    TxType th, tv;
+    tx_pair(lf.mts, s, th, tv);
+    forward_2d(th, tv, r.data(), s, s, c.data());
     for (int i = 0; i < n; ++i) e[i] = c[scan[i]];
     if (lf.tns_on) {
         lf.tns = tns_design(e.data(), n, 4, 4);
@@ -665,7 +685,9 @@ void BlockCoder::reconstruct(const Leaf& lf, int x0, int y0, int l, const int32_
         }
         if (lf.tns_on) { std::vector<double> t(n); tns_synthesis(lf.tns, e.data(), n, t.data()); e.swap(t); }
         for (int i = 0; i < n; ++i) c[scan[i]] = e[i];
-        inverse_2d(tx_for(s), tx_for(s), c.data(), s, s, r.data());
+        TxType th, tv;
+        tx_pair(lf.mts, s, th, tv);
+        inverse_2d(th, tv, c.data(), s, s, r.data());
     }
     for (int y = 0; y < s; ++y)
         for (int x = 0; x < s; ++x)
@@ -833,10 +855,13 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     for (size_t ci = 0; ci < cands.size(); ++ci) {
         const Leaf& base = cands[ci];
         std::copy(preds[ci].begin(), preds[ci].end(), pred.begin());
+        const int nmts = (tools_.mts && search_.try_mts && is_luma() && s <= 32) ? 5 : 1;
+        for (int mt = 0; mt < nmts; ++mt)
         for (int qm = 0; qm <= (tools_.e8 && search_.try_e8 ? 1 : 0); ++qm)
             for (int tn = 0; tn <= (tools_.tns && search_.try_tns && s >= 8 ? 1 : 0); ++tn) {
                 Leaf lf = base;
                 lf.qmode = qm;
+                lf.mts = mt;
                 lf.tns_on = tn;
                 quantize(lf, x0, y0, l, pred.data());
                 if (tn && !lf.tns_on) continue;
@@ -950,7 +975,19 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         lf.q.assign(lf.qmode == 0 ? n : 0, 0);
         lf.tns_on = false;
         lf.nf = 0;
+        lf.mts = 0;
     } else {
+        if (tools_.mts && is_luma() && s <= 32) {
+            int m = io.bit(md.e8, 5, L, static_cast<uint32_t>(lf.pt), lf.mts != 0);
+            if (m) {
+                const int hi2 = io.bit(md.e8, 6, L, 0, (lf.mts - 1) >> 1);
+                const int lo2 = io.bit(md.e8, 7, L, static_cast<uint32_t>(hi2), (lf.mts - 1) & 1);
+                m = 1 + hi2 * 2 + lo2;
+            }
+            lf.mts = m;
+        } else {
+            lf.mts = 0;
+        }
         if (tools_.e8) lf.qmode = io.bit(md.e8, 0, L, pc, lf.qmode);
         else lf.qmode = 0;
         if (tools_.tns && s >= 8) {
@@ -977,9 +1014,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
             for (int i = 0; i <= lf.last; ++i) {
                 const int pos = scan[i];
                 const int u = pos & (s - 1), v = pos >> l;
-                const int32_t n1 = i > 0 ? std::abs(lf.q[scan[i - 1]]) : 0;
-                const int32_t n2 = i > 1 ? std::abs(lf.q[scan[i - 2]]) : 0;
-                const uint32_t a = static_cast<uint32_t>(std::min(n1 + n2, 15)) | (static_cast<uint32_t>(std::min(u + v, 15)) << 4);
+                const uint32_t a = coef_ctx(lf.q.data(), u, v, l);
                 const uint32_t b = L * 4 + (i == lf.last ? 1u : 0u) + (i == 0 ? 2u : 0u) + (lf.tns_on ? 64u : 0u);
                 if (i == lf.last) {
                     const int32_t cv = lf.q[pos];

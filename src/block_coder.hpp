@@ -82,6 +82,7 @@ struct Tools {
     bool fir = true;          // FIR 動き平滑 (§7.3)
     bool rect = false;        // 長方形予測分割 (2NxN / Nx2N)
     bool tmvp = false;        // 時間方向動きベクトル候補
+    bool mts = false;         // 複数変換選択 (DCT2/DST7/DCT8)
 };
 
 // インター予測の文脈 (プレーン単位)
@@ -114,6 +115,7 @@ struct Search {
     bool skip_split_on_skip = false; // 残差なしインター葉なら分割を試さない
     bool approx_subpel = false;    // サブ画素探索コストを双線形で近似
     bool rdoq = false;             // レート歪み最適化量子化
+    bool try_mts = false;          // MTS の RD 探索
 };
 
 class BlockCoder {
@@ -144,6 +146,7 @@ private:
         int dict_idx = 0, dict_gain = 0;  // pt==3: サイズ別リスト内の位置, ゲイン (1/16)
         int mode = kModePlanar, alpha = 0, bvx = 0, bvy = 0;
         int qmode = 0;  // 0: デッドゾーンスカラ, 1: E8 格子 VQ
+        int mts = 0;    // 変換の組 (輝度, 4..32)
         bool tns_on = false;
         TnsFilter tns;
         int nf = 0;     // ノイズ補完レベル 0..7
@@ -175,6 +178,13 @@ private:
     int8_t& split_at(int x, int y, int l) { return split_map_[l][gidx(x, y, l)]; }
     Leaf& leaf_at(int x, int y, int l) { return leaf_map_[l][gidx(x, y, l)]; }
     TxType tx_for(int s) const { return s == 4 ? TxType::DST7 : TxType::DCT2; }
+    // MTS (§5.2): 0 = 既定, 1..4 = (水平, 垂直) ∈ {DST7,DST7} {DCT8,DST7} {DST7,DCT8} {DCT8,DCT8}
+    void tx_pair(int mts, int s, TxType& th, TxType& tv) const {
+        static constexpr TxType kH[5] = {TxType::DCT2, TxType::DST7, TxType::DCT8, TxType::DST7, TxType::DCT8};
+        static constexpr TxType kV[5] = {TxType::DCT2, TxType::DST7, TxType::DST7, TxType::DCT8, TxType::DCT8};
+        if (mts == 0) { th = tv = tx_for(s); return; }
+        th = kH[mts]; tv = kV[mts];
+    }
 
     void mpm(int x0, int y0, int& m0, int& m1) const;
     void set_modes4(int x0, int y0, int s, int mode);
