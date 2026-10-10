@@ -11,7 +11,7 @@ endif()
 
 add_library(fvc src/color.cpp src/pqmf.cpp src/quant.cpp src/transform.cpp src/entropy.cpp
   src/frame.cpp src/codec.cpp src/block_coder.cpp
-  src/inter.cpp src/dictionary.cpp src/shapes.cpp src/loop_filter.cpp src/alf.cpp)
+  src/inter.cpp src/dictionary.cpp src/shapes.cpp src/loop_filter.cpp src/alf.cpp src/cdef.cpp)
 target_include_directories(fvc PUBLIC include)
 find_package(Threads REQUIRED)
 target_link_libraries(fvc PUBLIC Threads::Threads)

@@ -51,6 +51,25 @@ struct SymIO {
         if (w) { w->uint(m, a, b, v); return v; }
         return r->uint(m, a, b);
     }
+    uint32_t uintc(CMModel& m, uint32_t a, uint32_t b, uint32_t v) {
+        if (cost) {
+            const uint32_t vp = v + 1;
+            int e = 0;
+            while ((vp >> (e + 1)) != 0) ++e;
+            for (int i = 0; i < e; ++i) bit(m, 2 + i, a, b, 1);
+            if (e < 31) bit(m, 2 + e, a, b, 0);
+            uint32_t tree = 1;
+            for (int i = e - 1, k = 0; i >= 0; --i, ++k) {
+                const int bt = (vp >> i) & 1;
+                const uint32_t node = k < 5 ? 3000u + static_cast<uint32_t>(e) * 64u + tree : 5000u + static_cast<uint32_t>(e) * 32u + static_cast<uint32_t>(k);
+                bit(m, node, a, b, bt);
+                if (k < 5) tree = (tree << 1) | static_cast<uint32_t>(bt);
+            }
+            return v;
+        }
+        if (w) { w->uintc(m, a, b, v); return v; }
+        return r->uintc(m, a, b);
+    }
     int32_t sint(CMModel& m, uint32_t a, uint32_t b, int32_t v) {
         if (cost) {
             bit(m, 0, a, b, v != 0);
@@ -72,7 +91,9 @@ double qp_step(int qp, int bit_depth);
 int32_t quant_dz(double c, double step, double rnd);
 
 // イントラモード: 0=DC, 1=Planar, 2..34=角度 (HEVC 番号互換), 35=CfL (色差のみ)
-constexpr int kModeDC = 0, kModePlanar = 1, kModeHor = 10, kModeVer = 26, kNumIntra = 35, kModeCfl = 35;
+// 36 = Smooth, 37 = Paeth (AV1 型)。35 (CfL) は通常モードの番号空間に含めない
+constexpr int kModeDC = 0, kModePlanar = 1, kModeHor = 10, kModeVer = 26, kNumIntra = 38, kModeCfl = 35;
+constexpr int kModeSmooth = 36, kModePaeth = 37;
 
 // フレーム単位のツール有効化 (フレームヘッダで伝送)
 struct Tools {
@@ -202,9 +223,11 @@ private:
     }
 
     void mpm(int x0, int y0, int& m0, int& m1) const;
+    void mpm6(int x0, int y0, int* out) const;  // 6 候補 MPM (全角度モード時)
     void set_modes4(int x0, int y0, int s, int mode);
     void predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) const;
     void intra_angular(int x0, int y0, int s, int mode, int32_t* pred) const;
+    bool coded_before(int px, int py, int x0, int y0) const;
     void intra_cfl(int x0, int y0, int s, int alpha, int32_t* pred) const;
     int fit_cfl_alpha(int x0, int y0, int s) const;
     bool ibc_valid(int rx, int ry, int s) const;

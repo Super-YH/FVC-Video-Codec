@@ -116,6 +116,25 @@ void BlockCoder::mpm(int x0, int y0, int& m0, int& m1) const {
     m1 = above != left ? above : (left != kModePlanar ? kModePlanar : kModeDC);
 }
 
+void BlockCoder::mpm6(int x0, int y0, int* out) const {
+    int m0, m1;
+    mpm(x0, y0, m0, m1);
+    const int gw = rec_->w / 4;
+    const int left = x0 > tx0_ ? modes4_[(y0 / 4) * gw + (x0 / 4 - 1)] : kModePlanar;
+    const int above = y0 > ty0_ ? modes4_[(y0 / 4 - 1) * gw + (x0 / 4)] : kModePlanar;
+    int n = 0;
+    auto push = [&](int m) {
+        if (n >= 6 || m < 0 || m >= kNumIntra || m == kModeCfl) return;
+        for (int i = 0; i < n; ++i) if (out[i] == m) return;
+        out[n++] = m;
+    };
+    push(left); push(above); push(kModePlanar); push(kModeDC);
+    for (int m : {left, above})
+        if (m >= 2 && m <= 34) { push(m == 2 ? 34 : m - 1); push(m == 34 ? 2 : m + 1); }
+    for (int m : {kModeVer, kModeHor, 2, 18, kModeSmooth, kModePaeth}) push(m);
+    (void)m0; (void)m1;
+}
+
 void BlockCoder::set_modes4(int x0, int y0, int s, int mode) {
     const int gw = rec_->w / 4;
     const int m = (mode == kModeCfl || mode < 0) ? kModePlanar : mode;
@@ -123,17 +142,73 @@ void BlockCoder::set_modes4(int x0, int y0, int s, int mode) {
         for (int x = x0 / 4; x < (x0 + s) / 4; ++x) modes4_[y * gw + x] = static_cast<int8_t>(m);
 }
 
+// (px,py) の 4x4 単位がブロック (x0,y0) より前に再構成済みか (タイル内の CTU ラスタ順 + CTU 内 Z 順)。
+// RD の状態に依存しない幾何学的規則なので符号器/復号器で一致する。
+bool BlockCoder::coded_before(int px, int py, int x0, int y0) const {
+    if (px < tx0_ || py < ty0_ || px >= tx1_ || py >= ty1_) return false;
+    const int cx = px / ctu_ * ctu_, cy = py / ctu_ * ctu_;
+    if (cy != cy_) return cy < cy_;
+    if (cx != cx_) return cx < cx_;
+    auto morton = [](int x, int y) {
+        int m = 0;
+        for (int b = 0; b < 8; ++b) m |= (((x >> b) & 1) << (2 * b)) | (((y >> b) & 1) << (2 * b + 1));
+        return m;
+    };
+    return morton((px - cx) >> 2, (py - cy) >> 2) < morton((x0 - cx_) >> 2, (y0 - cy_) >> 2);
+}
+
 void BlockCoder::intra_angular(int x0, int y0, int s, int mode, int32_t* pred) const {
     const Plane& r = *rec_;
     const bool ht = y0 > ty0_, hl = x0 > tx0_;
-    // 参照: corner, top[0..2s), left[0..2s)。右上/左下は端値で延長
+    // 参照: corner, top[0..2s), left[0..2s)。右上/左下は復号済みなら実画素、なければ端値で延長
     std::vector<int32_t> top(2 * s), left(2 * s);
-    for (int i = 0; i < 2 * s; ++i) {
-        const int ii = std::min(i, s - 1);
-        top[i] = ht ? r.at(x0 + ii, y0 - 1) : (hl ? r.at(x0 - 1, y0) : mid_);
-        left[i] = hl ? r.at(x0 - 1, y0 + ii) : (ht ? r.at(x0, y0 - 1) : mid_);
+    for (int i = 0; i < s; ++i) {
+        top[i] = ht ? r.at(x0 + i, y0 - 1) : (hl ? r.at(x0 - 1, y0) : mid_);
+        left[i] = hl ? r.at(x0 - 1, y0 + i) : (ht ? r.at(x0, y0 - 1) : mid_);
     }
-    const int32_t corner = (ht && hl) ? r.at(x0 - 1, y0 - 1) : (ht ? top[0] : left[0]);
+    for (int i = s; i < 2 * s; ++i) {
+        top[i] = (ht && coded_before(x0 + i, y0 - 1, x0, y0)) ? r.at(x0 + i, y0 - 1) : top[i - 1];
+        left[i] = (hl && coded_before(x0 - 1, y0 + i, x0, y0)) ? r.at(x0 - 1, y0 + i) : left[i - 1];
+    }
+    int32_t corner = (ht && hl) ? r.at(x0 - 1, y0 - 1) : (ht ? top[0] : left[0]);
+    if (mode == kModePaeth) {
+        for (int y = 0; y < s; ++y)
+            for (int x = 0; x < s; ++x) {
+                const int32_t base = top[x] + left[y] - corner;
+                const int32_t pl = std::abs(base - left[y]), pt = std::abs(base - top[x]), pc = std::abs(base - corner);
+                pred[y * s + x] = (pl <= pt && pl <= pc) ? left[y] : (pt <= pc ? top[x] : corner);
+            }
+        return;
+    }
+    if (mode == kModeSmooth) {
+        // 2 次の重み w(i) = 256 (1 - i/s)^2 で上/左と右上/左下を補間
+        const int64_t ss = static_cast<int64_t>(s) * s;
+        auto w = [&](int i) { return static_cast<int64_t>((256 * (s - i) * (s - i) + ss / 2) / ss); };
+        const int32_t tr = top[s - 1], bl = left[s - 1];
+        for (int y = 0; y < s; ++y)
+            for (int x = 0; x < s; ++x) {
+                const int64_t wy = w(y), wx = w(x);
+                const int64_t v = wy * top[x] + (256 - wy) * bl + wx * left[y] + (256 - wx) * tr;
+                pred[y * s + x] = static_cast<int32_t>((v + 256) >> 9);
+            }
+        return;
+    }
+    // 参照画素の平滑化 [1,2,1] (HEVC 規則: 8x8 以上、Planar と H/V から離れた角度)
+    if (s >= 8 && mode != kModeDC) {
+        const int thr = s == 8 ? 7 : s == 16 ? 1 : 0;
+        const int dist = mode == kModePlanar ? 99 : std::min(std::abs(mode - kModeHor), std::abs(mode - kModeVer));
+        if (dist > thr) {
+            std::vector<int32_t> t2 = top, l2 = left;
+            const int32_t c2 = (left[0] + 2 * corner + top[0] + 2) >> 2;
+            t2[0] = (corner + 2 * top[0] + top[1] + 2) >> 2;
+            l2[0] = (corner + 2 * left[0] + left[1] + 2) >> 2;
+            for (int i = 1; i < 2 * s - 1; ++i) {
+                t2[i] = (top[i - 1] + 2 * top[i] + top[i + 1] + 2) >> 2;
+                l2[i] = (left[i - 1] + 2 * left[i] + left[i + 1] + 2) >> 2;
+            }
+            top.swap(t2); left.swap(l2); corner = c2;
+        }
+    }
     if (mode == kModeDC) {
         int64_t sum = 0;
         for (int i = 0; i < s; ++i) sum += top[i] + left[i];
@@ -644,7 +719,7 @@ void BlockCoder::rdoq(Leaf& lf, int l, const std::vector<double>& e, uint32_t xb
     for (int k = 0; k <= last0; ++k) {
         if (lv[k] == 0) continue;
         cost_acc = 0;
-        io.uint(md_->last, L, plane_ ? 1u : 0u, static_cast<uint32_t>(k));
+        io.uintc(md_->last, L, plane_ ? 1u : 0u, static_cast<uint32_t>(k));
         const double j = jcum[k + 1] + suffix[k + 1] + lambda_ * cost_acc;
         if (j < bestj) { bestj = j; bestk = k; }
     }
@@ -802,9 +877,15 @@ double BlockCoder::leaf_bits(const Leaf& lf, int x0, int y0, int l) const {
     } else if (lf.mode == kModeCfl) {
         b += 1.0 + 2.0 + std::log2(1.0 + std::abs(lf.alpha));
     } else {
-        int m0, m1;
-        mpm(x0, y0, m0, m1);
-        b += (lf.mode == m0 || lf.mode == m1) ? 2.0 : (tools_.all_angular ? 6.5 : 3.0);
+        if (tools_.all_angular) {
+            int mp[6];
+            mpm6(x0, y0, mp);
+            b += std::find(mp, mp + 6, lf.mode) != mp + 6 ? 2.5 : 6.0;
+        } else {
+            int m0, m1;
+            mpm(x0, y0, m0, m1);
+            b += (lf.mode == m0 || lf.mode == m1) ? 2.0 : 3.0;
+        }
     }
     if (lf.last < 0) return b;
     if (tools_.e8) b += 1.0;
@@ -908,7 +989,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     {
         std::vector<std::pair<int64_t, int>> sads;
         std::vector<int> modes;
-        if (tools_.all_angular) for (int m = 0; m < kNumIntra; ++m) modes.push_back(m);
+        if (tools_.all_angular) for (int m = 0; m < kNumIntra; ++m) { if (m != kModeCfl) modes.push_back(m); }
         else modes = {kModeDC, kModePlanar, kModeHor, kModeVer};
         Leaf t;
         for (int m : modes) {
@@ -1142,13 +1223,39 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
             lf.alpha = io.sint(md.cfl, 1, L, lf.alpha);
             if (lf.alpha < -16 || lf.alpha > 16) throw std::runtime_error("corrupt stream: cfl alpha");
         } else {
+            if (tools_.all_angular) {
+                // 6 候補 MPM: 切り詰め単進のインデックス、それ以外は残り 31 モードを 5 ビット (二分木文脈)
+                int mp[6];
+                mpm6(x0, y0, mp);
+                int idx = -1;
+                for (int i = 0; i < 6; ++i) if (mp[i] == lf.mode) idx = i;
+                const int is_mpm = io.bit(md.mode, 0, L, pc, idx >= 0);
+                if (is_mpm) {
+                    int k = 0;
+                    while (k < 5 && io.bit(md.mode, 10 + static_cast<uint32_t>(k), L, pc, idx > k)) ++k;
+                    lf.mode = mp[k];
+                } else {
+                    std::vector<int> rest;
+                    for (int m = 0; m < kNumIntra; ++m)
+                        if (m != kModeCfl && std::find(mp, mp + 6, m) == mp + 6) rest.push_back(m);
+                    int r = 0;
+                    if (io.enc) r = static_cast<int>(std::find(rest.begin(), rest.end(), lf.mode) - rest.begin());
+                    uint32_t tree = 1;
+                    int val = 0;
+                    for (int b = 4; b >= 0; --b) {
+                        const int bt = io.bit(md.mode, 32 + tree, L, pc, (r >> b) & 1);
+                        tree = (tree << 1) | static_cast<uint32_t>(bt);
+                        val = (val << 1) | bt;
+                    }
+                    if (val >= static_cast<int>(rest.size())) throw std::runtime_error("corrupt stream: intra mode rest");
+                    lf.mode = rest[val];
+                }
+            } else {
             int m0, m1;
             mpm(x0, y0, m0, m1);
             const int is_mpm = io.bit(md.mode, 0, L, pc, lf.mode == m0 || lf.mode == m1);
             if (is_mpm) {
                 lf.mode = io.bit(md.mode, 1, L, pc, lf.mode == m1) ? m1 : m0;
-            } else if (tools_.all_angular) {
-                lf.mode = static_cast<int>(io.uint(md.mode, 2, pc, static_cast<uint32_t>(lf.mode)));
             } else {
                 static constexpr int kSet[4] = {kModeDC, kModePlanar, kModeHor, kModeVer};
                 int idx = 0;
@@ -1157,7 +1264,8 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
                 idx += io.bit(md.mode, 4, 0, pc, io.enc ? (lf.mode == kSet[idx + 1]) : 0);
                 lf.mode = kSet[idx];
             }
-            if (lf.mode < 0 || lf.mode >= kNumIntra) throw std::runtime_error("corrupt stream: intra mode");
+            }
+            if (lf.mode < 0 || lf.mode >= kNumIntra || lf.mode == kModeCfl) throw std::runtime_error("corrupt stream: intra mode");
         }
     }
     }
@@ -1209,7 +1317,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         }
         const auto& scan = diag_scan(l);
         if (lf.qmode == 0) {
-            lf.last = static_cast<int>(io.uint(md.last, L, pc, static_cast<uint32_t>(lf.last)));
+            lf.last = static_cast<int>(io.uintc(md.last, L, pc, static_cast<uint32_t>(lf.last)));
             if (lf.last >= n) throw std::runtime_error("corrupt stream: last");
             if (!io.enc) lf.q.assign(n, 0);
             CMModel& cm = plane_ ? md.coef_c : md.coef_y;
@@ -1234,7 +1342,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
                 if (lf.nf > 3) throw std::runtime_error("corrupt stream: nf");
             }
         } else {
-            lf.last = static_cast<int>(io.uint(md.last, L, pc + 2, static_cast<uint32_t>(lf.last)));
+            lf.last = static_cast<int>(io.uintc(md.last, L, pc + 2, static_cast<uint32_t>(lf.last)));
             if ((lf.last + 1) * 8 > std::max(n, 8)) throw std::runtime_error("corrupt stream: e8 chunks");
             if (!io.enc) lf.q.assign(static_cast<size_t>(lf.last + 1) * 8, 0);
             int32_t prev_l1 = 0;

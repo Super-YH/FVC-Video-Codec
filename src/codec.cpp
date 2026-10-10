@@ -19,6 +19,7 @@
 #include "dictionary.hpp"
 #include "inter.hpp"
 #include "alf.hpp"
+#include "cdef.hpp"
 #include "loop_filter.hpp"
 #include "shapes.hpp"
 #include "fvc/quant.hpp"
@@ -479,6 +480,7 @@ struct FrameParams {
     bool alf = false;                                  // 適応ウィーナーフィルタ (§9.4)
     bool band_blocks = true;                           // 帯域画像をブロック符号化 (false: 標本単位)
     bool band_ns = false;                              // 帯域の時間差分ノイズ置換 (心理視覚)
+    bool cdef = false;                                 // 方向性デリンギングフィルタ (§9.5)
     // 符号器: 輝度 64x64 CTU ごとの dQP (先読みによる静止度から決定)
     std::vector<int8_t> aqp_map;
     int aqp_w = 0;
@@ -813,6 +815,18 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 }
                 for (const auto& e : errs) if (!e.empty()) throw std::runtime_error(e);
                 if (io.enc) for (int t = 0; t < nt; ++t) ts.out.push_back(tw[t]->finish());
+                if (io.w && std::getenv("FVC_BITS")) {
+                    Models sum;
+                    const char* names[] = {"split", "mode", "cbf", "last", "coef_y", "coef_c", "ibc", "cfl", "tns", "e8", "nf", "inter", "mvd", "dict", "aqp"};
+                    for (int t = 0; t < nt; ++t) {
+                        const CMModel* src[] = {&tmd[t]->split, &tmd[t]->mode, &tmd[t]->cbf, &tmd[t]->last, &tmd[t]->coef_y, &tmd[t]->coef_c,
+                                                &tmd[t]->ibc, &tmd[t]->cfl, &tmd[t]->tns, &tmd[t]->e8, &tmd[t]->nf, &tmd[t]->inter,
+                                                &tmd[t]->mvd, &tmd[t]->dict, &tmd[t]->aqp};
+                        for (int i = 0; i < 15; ++i)
+                            std::fprintf(stderr, "[bits] plane=%d %-7s n0=%9.0f n1=%9.0f rest=%9.0f\n", pi, names[i], src[i]->stat_bits[0],
+                                         src[i]->stat_bits[1], src[i]->stat_bits[2]);
+                    }
+                }
                 if (cur_usage) for (int t = 0; t < nt; ++t) cur_usage->add(coders[t]->usage());
                 // ループフィルタ用のブロック情報をタイルから合成
                 EdgeInfo einfo;
@@ -843,6 +857,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     code_loop_filter(io, md.lf, R, org ? &opad : nullptr, einfo, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, pqp,
                                      info.bit_depth, step, lambda, fp.lf_freq, fp.lf_map, lo, hi);
                 }
+                if (fp.cdef) code_cdef(io, md.lf, R, org ? &opad : nullptr, pi == 0, pqp, info.bit_depth, lambda, lo, hi);
                 if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lambda, lo, hi);
             }
                 };
@@ -991,6 +1006,7 @@ FrameParams params_from(const EncoderConfig& c) {
     fp.band_blocks = !c.band_samples;
     fp.band_ns = !c.tune_psnr;
     t.inter_ns = !c.tune_psnr;
+    fp.cdef = c.cdef >= 0 ? c.cdef != 0 : c.preset >= Preset::Medium;
     if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
     // 実測: 2x2 は 1x1 より 4-7% 効率が落ちるため、medium 以上は 1x1 (速度より効率)
@@ -1013,7 +1029,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>((fp.tile_cols - 1) | ((fp.tile_rows - 1) << 4)));
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
     put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u) |
-                  (fp.tools.inter_ns ? 16u : 0u));
+                  (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_u32(p, static_cast<uint32_t>(poc));
@@ -1047,6 +1063,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.band_blocks = (f3 >> 2) & 1;
     fp.band_ns = (f3 >> 3) & 1;
     fp.tools.inter_ns = (f3 >> 4) & 1;
+    fp.cdef = (f3 >> 5) & 1;
     if (fp.cqp_off < -12 || fp.cqp_off > 12) return false;
     for (int l = 0; l < 2; ++l) {
         const uint32_t n = br.u8();

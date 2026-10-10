@@ -124,7 +124,9 @@ void CMModel::update(int bit) {
 
 // ---------------- 2値化 ----------------
 void EntropyWriter::bit(CMModel& m, uint32_t node, uint32_t a, uint32_t b, int v) {
-    enc_.put(v, m.predict(node, a, b));
+    const uint32_t p = m.predict(node, a, b);
+    m.stat_bits[node == 0 ? 0 : node == 1 ? 1 : 2] += -std::log2((v ? p : kProbScale - p) / static_cast<double>(kProbScale));
+    enc_.put(v, p);
     m.update(v);
 }
 
@@ -146,6 +148,37 @@ void EntropyWriter::uint(CMModel& m, uint32_t a, uint32_t b, uint32_t v) {
         if (e - 1 - i < 3) bit(m, node, a, b, (vp >> i) & 1);
         else bypass((vp >> i) & 1);  // 下位ビットは均等確率
     }
+}
+
+// uintc の仮数ノード: 上位 5 ビットまでは (指数, 二分木の位置), それ以降は (指数, ビット位置)
+static inline uint32_t uintc_node(int e, int k, uint32_t tree) {
+    return k < 5 ? 3000u + static_cast<uint32_t>(e) * 64u + tree : 5000u + static_cast<uint32_t>(e) * 32u + static_cast<uint32_t>(k);
+}
+
+void EntropyWriter::uintc(CMModel& m, uint32_t a, uint32_t b, uint32_t v) {
+    const uint32_t vp = v + 1;
+    int e = 0;
+    while ((vp >> (e + 1)) != 0) ++e;
+    for (int i = 0; i < e; ++i) bit(m, 2 + i, a, b, 1);
+    if (e < 31) bit(m, 2 + e, a, b, 0);
+    uint32_t tree = 1;
+    for (int i = e - 1, k = 0; i >= 0; --i, ++k) {
+        const int bt = (vp >> i) & 1;
+        bit(m, uintc_node(e, k, tree), a, b, bt);
+        if (k < 5) tree = (tree << 1) | static_cast<uint32_t>(bt);
+    }
+}
+
+uint32_t EntropyReader::uintc(CMModel& m, uint32_t a, uint32_t b) {
+    int e = 0;
+    while (e < 31 && bit(m, 2 + e, a, b)) ++e;
+    uint32_t vp = 1, tree = 1;
+    for (int i = e - 1, k = 0; i >= 0; --i, ++k) {
+        const int bt = bit(m, uintc_node(e, k, tree), a, b);
+        if (k < 5) tree = (tree << 1) | static_cast<uint32_t>(bt);
+        vp = (vp << 1) | static_cast<uint32_t>(bt);
+    }
+    return vp - 1;
 }
 
 uint32_t EntropyReader::uint(CMModel& m, uint32_t a, uint32_t b) {

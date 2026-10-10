@@ -25,7 +25,7 @@ static bool ends_with(const std::string& s, const char* suf) {
 static int usage() {
     std::fprintf(stderr,
                  "usage:\n  fvc enc [-q QP] [--preset faster|fast|medium|slow|placebo] [--lossless] [--l2] [--pqmf N]"
-                 " [--frames N]\n      [--keyint N] [--bframes N] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] [--aqp=0|1] [--rect=0|1] [--tmvp=0|1] [--alf=0|1] [--mts=0|1] [--tune psy|psnr] [--band-coder blocks|samples] [--psy-rd X]\n      [--ssim TARGET] [-v] [--quiet] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
+                 " [--frames N]\n      [--keyint N] [--bframes N] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] [--aqp=0|1] [--rect=0|1] [--tmvp=0|1] [--alf=0|1] [--mts=0|1] [--cdef=0|1] [--tune psy|psnr] [--band-coder blocks|samples] [--psy-rd X]\n      [--ssim TARGET] [-v] [--quiet] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
     return 2;
 }
 
@@ -62,6 +62,7 @@ static int cmd_enc(int argc, char** argv) {
         else if (a.rfind("--tmvp=", 0) == 0) cfg.tmvp = std::atoi(a.c_str() + 7);
         else if (a.rfind("--alf=", 0) == 0) cfg.alf = std::atoi(a.c_str() + 6);
         else if (a.rfind("--mts=", 0) == 0) cfg.mts = std::atoi(a.c_str() + 6);
+        else if (a.rfind("--cdef=", 0) == 0) cfg.cdef = std::atoi(a.c_str() + 7);
         else if (a == "--band-coder" && i + 1 < argc) cfg.band_samples = std::string(argv[++i]) == "samples";
         else if (a == "--tune" && i + 1 < argc) cfg.tune_psnr = std::string(argv[++i]) == "psnr";
         else if (a == "--psy-rd" && i + 1 < argc) cfg.psy_strength = std::atof(argv[++i]);

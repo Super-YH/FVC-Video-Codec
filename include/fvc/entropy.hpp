@@ -57,6 +57,8 @@ public:
     // ctx_a, ctx_b: 呼び出し側が与える文脈 (近傍シンボル、帯域番号、位置など)
     uint32_t predict(uint32_t node, uint32_t ctx_a, uint32_t ctx_b);
     void update(int bit);
+    double stat_bits[3] = {0, 0, 0};  // 計測用: 実符号化ビット (ノード 0 / 1 / その他)
+    uint32_t last_node = 0;
 
 private:
     void init();
@@ -78,6 +80,8 @@ public:
     // 符号付き整数: 0 フラグ / 符号 / 指数 (単進) / 仮数 (指数別文脈)
     void sint(CMModel& m, uint32_t ctx_a, uint32_t ctx_b, int32_t v);
     void uint(CMModel& m, uint32_t ctx_a, uint32_t ctx_b, uint32_t v);
+    // 指数部と仮数部の全ビットを文脈モデル化 (仮数の上位 5 ビットは二分木の位置も文脈に含む)
+    void uintc(CMModel& m, uint32_t ctx_a, uint32_t ctx_b, uint32_t v);
     std::vector<uint8_t> finish() { return enc_.finish(); }
 private:
     RansBitEncoder enc_;
@@ -90,6 +94,7 @@ public:
     int bypass() { return dec_.get(kProbScale / 2); }
     int32_t sint(CMModel& m, uint32_t ctx_a, uint32_t ctx_b);
     uint32_t uint(CMModel& m, uint32_t ctx_a, uint32_t ctx_b);
+    uint32_t uintc(CMModel& m, uint32_t ctx_a, uint32_t ctx_b);
 private:
     RansBitDecoder dec_;
 };
