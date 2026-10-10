@@ -85,6 +85,7 @@ struct Tools {
     bool mts = false;         // 複数変換選択 (DCT2/DST7/DCT8)
     bool pred_only = false;   // 予測のみ (残差は別経路: 動画 PQMF)
     bool band_ns = false;     // 帯域の時間差分ノイズ置換 (心理視覚)
+    bool inter_ns = false;    // インター残差なしブロックの高域ノイズ置換 (心理視覚)
 };
 
 // インター予測の文脈 (プレーン単位)
@@ -227,6 +228,9 @@ private:
     const Plane* cband_ = nullptr;
     uint64_t noise_seed_ = 0;
     uint32_t cb_ctx(int x0, int y0, int s) const;
+    bool ns_allowed(const Leaf& lf) const {
+        return (tools_.band_ns && lf.pt == 4 && lf.xsrc == 1) || (tools_.inter_ns && lf.pt == 2 && plane_ == 0);
+    }
     void quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) const;
     void reconstruct(const Leaf& lf, int x0, int y0, int l, const int32_t* pred);
     double leaf_bits(const Leaf& lf, int x0, int y0, int l) const;

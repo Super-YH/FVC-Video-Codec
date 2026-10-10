@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
@@ -731,7 +733,31 @@ void BlockCoder::reconstruct(const Leaf& lf, int x0, int y0, int l, const int32_
         tx_pair(lf.mts, s, th, tv);
         inverse_2d(th, tv, c.data(), s, s, r.data());
     }
-    if (lf.ns && tband_) {
+    if (lf.ns && lf.pt == 2) {
+        // インターの高域ノイズ置換: 白色ノイズを 3x3 二項フィルタで高域通過し、
+        // 予測ブロックの高域振幅を包絡として掛ける (テクスチャのある場所ほど粒状感を残す)
+        SplitMix64 rng(noise_seed_ * 0x9E3779B97F4A7C15ull + static_cast<uint64_t>(x0) * 0x10001ull + static_cast<uint64_t>(y0) + 7);
+        std::vector<double> w(static_cast<size_t>(n)), hp(static_cast<size_t>(n)), env(static_cast<size_t>(n));
+        for (auto& v : w) v = (rng.next() >> 63) ? 1.0 : -1.0;
+        auto blur = [&](const std::vector<double>& a, int x, int y) {
+            auto at = [&](int xx, int yy) { return a[std::clamp(yy, 0, s - 1) * s + std::clamp(xx, 0, s - 1)]; };
+            return (4 * at(x, y) + 2 * (at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1)) + at(x - 1, y - 1) +
+                    at(x + 1, y - 1) + at(x - 1, y + 1) + at(x + 1, y + 1)) / 16.0;
+        };
+        std::vector<double> pd(pred, pred + n);
+        double hpe = 0, pm = 0;
+        for (int y = 0; y < s; ++y)
+            for (int x = 0; x < s; ++x) {
+                hp[y * s + x] = w[y * s + x] - blur(w, x, y);
+                hpe += hp[y * s + x] * hp[y * s + x];
+                env[y * s + x] = std::abs(pd[y * s + x] - blur(pd, x, y));
+                pm += env[y * s + x];
+            }
+        const double norm = std::sqrt(n / std::max(hpe, 1e-9));  // 高域ノイズを単位 RMS に
+        pm = pm / n + 1e-9;
+        const double amp = lf.ns / 8.0 * step_;
+        for (int i = 0; i < n; ++i) r[i] += amp * norm * hp[i] * std::clamp(env[i] / pm, 0.5, 1.5);
+    } else if (lf.ns && tband_) {
         // ノイズ置換: 振幅 = ns/8·Δ × 包絡 (参照帯域の |値| / ブロック平均, [0.25, 2] に制限)
         double m = 0;
         for (int y = 0; y < s; ++y)
@@ -1145,8 +1171,8 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         lf.nf = 0;
         lf.mts = 0;
         // 時間方向予測で残差なし: 高域ノイズを強さだけで置換 (包絡は参照帯域の振幅から)
-        if (tools_.band_ns && lf.pt == 4 && lf.xsrc == 1) {
-            lf.ns = static_cast<int>(io.uint(md.nf, 8, cbc, static_cast<uint32_t>(lf.ns)));
+        if (ns_allowed(lf)) {
+            lf.ns = static_cast<int>(io.uint(md.nf, 8 + (lf.pt == 2 ? 1u : 0u), cbc, static_cast<uint32_t>(lf.ns)));
             if (lf.ns > 7) throw std::runtime_error("corrupt stream: band noise");
         } else {
             lf.ns = 0;
@@ -1294,10 +1320,22 @@ void BlockCoder::code_leaf(SymIO& io, Models& md, Leaf& lf, int x0, int y0, int 
         predict(lf, x0, y0, l, pred.data());
         quantize(lf, x0, y0, l, pred.data());  // 再構成ずれを防ぐため現在の再構成から再量子化
         lf.ns = 0;
-        if (tools_.band_ns && lf.pt == 4 && lf.xsrc == 1 && lf.last < 0) {
-            double e = 0;
+        if (ns_allowed(lf) && lf.last < 0) {
+            // 失われた残差の (インターは高域成分の) エネルギーを測る
+            std::vector<double> d(static_cast<size_t>(n));
             for (int y = 0; y < s; ++y)
-                for (int x = 0; x < s; ++x) { const double d = org_->at(x0 + x, y0 + y) - pred[y * s + x]; e += d * d; }
+                for (int x = 0; x < s; ++x) d[y * s + x] = org_->at(x0 + x, y0 + y) - pred[y * s + x];
+            if (lf.pt == 2) {
+                std::vector<double> lp(static_cast<size_t>(n));
+                auto at = [&](int x, int y) { return d[std::clamp(y, 0, s - 1) * s + std::clamp(x, 0, s - 1)]; };
+                for (int y = 0; y < s; ++y)
+                    for (int x = 0; x < s; ++x)
+                        lp[y * s + x] = (4 * at(x, y) + 2 * (at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1)) +
+                                         at(x - 1, y - 1) + at(x + 1, y - 1) + at(x - 1, y + 1) + at(x + 1, y + 1)) / 16.0;
+                for (int i = 0; i < n; ++i) d[i] -= lp[i];
+            }
+            double e = 0;
+            for (double v : d) e += v * v;
             // 失われた残差エネルギーの 7 割をノイズで補う (知覚上のざらつきを保ちつつ過剰にしない)
             lf.ns = std::clamp(static_cast<int>(std::lround(0.7 * std::sqrt(e / n) / (step_ / 8.0))), 0, 7);
         }

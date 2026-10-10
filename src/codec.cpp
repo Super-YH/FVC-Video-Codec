@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -700,6 +701,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         if (org) opad = pad_plane(org->p[pi], W, H);
         Plane R(W, H, 0);
         BlockUsage* cur_usage = usage;
+        bool allow_ns = true;  // 方式判定の試行中はノイズ置換を止める (知覚目的の加算を SSE 判定に含めない)
         // プレーンの非可逆符号化 (bands: PQMF 帯域方式 / false: 画素領域のブロック方式)
         auto code_lossy = [&](SymIO& io, Models& md, TileStreams& ts, bool bands, Plane& R) {
             const int pqp = std::clamp(fp.qp + (pi ? fp.cqp_off : 0), 0, 63);
@@ -778,6 +780,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                             y0, x1 - x0, y1 - y0, t << 24);
                         tmd[t] = std::make_unique<Models>();
                         if (fp.aqp) coders[t]->enable_aqp(pqp, info.bit_depth, aqp_lookup, &actx);
+                        coders[t]->set_noise_seed(static_cast<uint64_t>(fp.poc) * 7919u + static_cast<uint64_t>(pi) * 104729u + static_cast<uint64_t>(t));
                         if (io.enc) {
                             tw[t] = std::make_unique<EntropyWriter>();
                             tio[t].w = tw[t].get();
@@ -831,7 +834,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     const Plane P = R;
                     if (fp.band_blocks)
                         code_bands_blocks(io, md, fp.pqmf_log2, org ? &opad : nullptr, &P, R, step, lambda, lo, hi, pi, fp.tools,
-                                          fp.search, fp.min_log2, fp.max_log2, fp.band_ns,
+                                          fp.search, fp.min_log2, fp.max_log2, fp.band_ns && allow_ns,
                                           static_cast<uint64_t>(fp.poc) * 3 + static_cast<uint64_t>(pi));
                     else
                         code_bands_video(io, md, fp.pqmf_log2, org ? &opad : nullptr, P, R, step, lambda, lo, hi);
@@ -860,7 +863,9 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                         TileStreams tts;
                         Plane Rt(W, H, 0);
                         cur_usage = nullptr;
+                        allow_ns = false;
                         code_lossy(tio, mt, tts, b != 0, Rt);
+                        allow_ns = true;
                         size_t bytes = tw.finish().size();
                         for (const auto& t : tts.out) bytes += t.size();
                         double d = 0;
@@ -985,6 +990,7 @@ FrameParams params_from(const EncoderConfig& c) {
     if (c.alf >= 0) fp.alf = c.alf != 0;
     fp.band_blocks = !c.band_samples;
     fp.band_ns = !c.tune_psnr;
+    t.inter_ns = !c.tune_psnr;
     if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
     // 実測: 2x2 は 1x1 より 4-7% 効率が落ちるため、medium 以上は 1x1 (速度より効率)
@@ -1006,7 +1012,8 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
                   (fp.lf_freq ? 16u : 0u) | (fp.lf_map ? 32u : 0u) | (fp.tools.rect ? 64u : 0u) | (fp.tools.tmvp ? 128u : 0u));
     put_u8(p, static_cast<uint32_t>((fp.tile_cols - 1) | ((fp.tile_rows - 1) << 4)));
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
-    put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u));
+    put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u) |
+                  (fp.tools.inter_ns ? 16u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_u32(p, static_cast<uint32_t>(poc));
@@ -1039,6 +1046,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.tools.mts = (f3 >> 1) & 1;
     fp.band_blocks = (f3 >> 2) & 1;
     fp.band_ns = (f3 >> 3) & 1;
+    fp.tools.inter_ns = (f3 >> 4) & 1;
     if (fp.cqp_off < -12 || fp.cqp_off > 12) return false;
     for (int l = 0; l < 2; ++l) {
         const uint32_t n = br.u8();
@@ -1113,7 +1121,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
     fp.aqp = false;
     fp.aqp_map.clear();
     // B フレーム: 参照との差が大きい (動きがある) CTU は QP を下げ、動物体の崩れを防ぐ
-    if (aqp_on && cfg_.lossy_layer && fp.type == FrameType::B && fp.pqmf_log2 == 0 && look.empty()) {
+    if (aqp_on && cfg_.lossy_layer && fp.type == FrameType::B && look.empty()) {
         const Frame* r0 = st_->find(fp.ref_poc[0][0]);
         const Frame* r1 = fp.ref_poc[1].empty() ? nullptr : st_->find(fp.ref_poc[1][0]);
         const Plane& A = f.p[0];
@@ -1142,7 +1150,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         if (!any) fp.aqp_map.clear();
         return;
     }
-    if (aqp_on && cfg_.lossy_layer && !look.empty() && fp.pqmf_log2 == 0) {
+    if (aqp_on && cfg_.lossy_layer && !look.empty()) {
         const Plane& A = f.p[0];
         const int aw = (A.w + kCtu - 1) / kCtu, ah = (A.h + kCtu - 1) / kCtu;
         fp.aqp_w = aw;
