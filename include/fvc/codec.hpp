@@ -30,6 +30,7 @@ struct EncoderConfig {
     int tile_cols = 0, tile_rows = 0;  // 0: プリセット依存
     int threads = 0;          // 0: ハードウェアスレッド数
     int chroma_qp_offset = 0; // 色差 QP オフセット (-12..12)
+    bool band_samples = false;  // PQMF 帯域を標本単位で符号化 (既定はブロック符号化)
     bool tune_psnr = false;     // true: 歪みを純粋な SSE で評価 (PSNR 最大化)
     double psy_strength = 1.0;  // 心理視覚マスキングの強さ
     double target_ssim = 0;   // >0: フレームごとに輝度 SSIM がこの値以上となる最大 QP を探索

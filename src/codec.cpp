@@ -314,6 +314,65 @@ void code_bands_video(SymIO& io, Models& md, int pqmf_log2, const Plane* org, co
     for (size_t i = 0; i < y.size(); ++i) rec.v[i] = std::clamp(static_cast<int32_t>(std::lround(y[i])) + off, lo, hi);
 }
 
+// ---------------- 帯域画像のブロック符号化 (§3 + §5) ----------------
+// 各帯域画像を合成利得で正規化した整数プレーンにし、既存のブロック符号化器
+// (分割・イントラ予測・変換・RDOQ・CM) で符号化する。P != nullptr (P/B) のときは
+// 帯域ごとの残差 X_k - P_k を符号化する。帯域ごとに量子化ステップを高域ほど粗くする。
+void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, const Plane* P, Plane& rec, double step,
+                       double lambda, int32_t lo, int32_t hi, int plane, const Tools& tools, const Search& search,
+                       int min_log2, int max_log2) {
+    const int M = 1 << pqmf_log2, W = rec.w, H = rec.h, bw = W / M, bh = H / M;
+    const int BW = (bw + kCtu - 1) / kCtu * kCtu, BH = (bh + kCtu - 1) / kCtu * kCtu;
+    Pqmf2D fb(M, M);
+    const int32_t off = (lo + hi + 1) / 2;
+    std::vector<std::vector<double>> pb, xb;
+    {
+        std::vector<double> t(static_cast<size_t>(W) * H);
+        if (P) {
+            for (size_t i = 0; i < t.size(); ++i) t[i] = P->v[i] - off;
+            fb.analyze(t, W, H, pb);
+        }
+        if (io.enc) {
+            for (size_t i = 0; i < t.size(); ++i) t[i] = org->v[i] - off;
+            fb.analyze(t, W, H, xb);
+        }
+    }
+    std::vector<std::vector<double>> rb(M * M, std::vector<double>(static_cast<size_t>(bw) * bh, 0.0));
+    Tools bt = tools;
+    bt.cfl = false; bt.ibc = false; bt.dict = false; bt.pred_only = false; bt.rect = false; bt.tmvp = false;
+    Search bs = search;
+    const int32_t range = 8 * (hi - lo + 1) * M;  // 帯域値の取りうる範囲 (正規化後) に十分な余裕
+    for (int ky = 0; ky < M; ++ky)
+        for (int kx = 0; kx < M; ++kx) {
+            const int k = ky * M + kx;
+            const double nrm = fb.band_norm(kx, ky);
+            constexpr double kBw = 0.08;  // 実測: 0/0.08/0.2/0.4 で同等、0.08 が僅かに最良
+            const double bstep = step * (1.0 + kBw * (kx + ky));
+            Plane target, R(BW, BH, 0);
+            if (io.enc) {
+                target = Plane(BW, BH);
+                for (int y = 0; y < BH; ++y)
+                    for (int x = 0; x < BW; ++x) {
+                        const size_t i = static_cast<size_t>(std::min(y, bh - 1)) * bw + std::min(x, bw - 1);
+                        const double v = xb[k][i] - (P ? pb[k][i] : 0.0);
+                        target.at(x, y) = static_cast<int32_t>(std::lround(v * nrm));
+                    }
+            }
+            BlockCoder bc(&R, io.enc ? &target : nullptr, nullptr, plane, -range, range, bstep, lambda,
+                          std::min(min_log2, 3), max_log2, bt, bs);
+            for (int cy = 0; cy < BH; cy += kCtu)
+                for (int cx = 0; cx < BW; cx += kCtu) bc.code_ctu(io, md, cx, cy, kCtu);
+            for (int y = 0; y < bh; ++y)
+                for (int x = 0; x < bw; ++x) {
+                    const size_t i = static_cast<size_t>(y) * bw + x;
+                    rb[k][i] = R.at(x, y) / nrm + (P ? pb[k][i] : 0.0);
+                }
+        }
+    std::vector<double> y;
+    fb.synthesize(rb, W, H, y);
+    for (size_t i = 0; i < y.size(); ++i) rec.v[i] = std::clamp(static_cast<int32_t>(std::lround(y[i])) + off, lo, hi);
+}
+
 // ---------------- ロスレス層 ----------------
 // lossy=false: 原画を MED 予測で直接符号化。lossy=true: e = X - R (L2 残差) を符号化。
 void code_lossless(SymIO& io, Models& md, int plane, int w, int h, const Plane* org, Plane& rec, bool lossy, int32_t mid) {
@@ -387,6 +446,7 @@ struct FrameParams {
     int cqp_off = 0;                                   // 色差 QP オフセット
     bool aqp = false;                                  // CTU 単位の適応 QP
     bool alf = false;                                  // 適応ウィーナーフィルタ (§9.4)
+    bool band_blocks = true;                           // 帯域画像をブロック符号化 (false: 標本単位)
     // 符号器: 輝度 64x64 CTU ごとの dQP (先読みによる静止度から決定)
     std::vector<int8_t> aqp_map;
     int aqp_w = 0;
@@ -611,7 +671,12 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         if (fp.lossy) {
             const int pqp = std::clamp(fp.qp + (pi ? fp.cqp_off : 0), 0, 63);
             const double step = qp_step(pqp, info.bit_depth);
-            if (fp.pqmf_log2 > 0 && !inter) {
+            if (fp.pqmf_log2 > 0 && !inter && fp.band_blocks) {
+                const double lam = 0.57 * std::pow(2.0, (pqp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
+                code_bands_blocks(io, md, fp.pqmf_log2, org ? &opad : nullptr, nullptr, R, step, lam, lo, hi, pi, fp.tools,
+                                  fp.search, fp.min_log2, fp.max_log2);
+                if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lam, lo, hi);
+            } else if (fp.pqmf_log2 > 0 && !inter) {
                 code_bands(io, md, fp.pqmf_log2, org ? &opad : nullptr, R, step, 1.0 / 3.0, lo, hi, fp.band_tools, fp.psy,
                            static_cast<uint64_t>(fp.poc) * 3 + pi);
             } else {
@@ -731,7 +796,11 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     // 帯域領域の予測符号化: P (動き補償予測) の帯域を時間方向予測とし、
                     // 帯域ブロックごとにゲイン・帯域間予測・スキップを探索して符号化
                     const Plane P = R;
-                    code_bands_video(io, md, fp.pqmf_log2, org ? &opad : nullptr, P, R, step, lambda, lo, hi);
+                    if (fp.band_blocks)
+                        code_bands_blocks(io, md, fp.pqmf_log2, org ? &opad : nullptr, &P, R, step, lambda, lo, hi, pi, fp.tools,
+                                          fp.search, fp.min_log2, fp.max_log2);
+                    else
+                        code_bands_video(io, md, fp.pqmf_log2, org ? &opad : nullptr, P, R, step, lambda, lo, hi);
                 }
                 if (fp.lf) {
                     code_loop_filter(io, md.lf, R, org ? &opad : nullptr, einfo, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, pqp,
@@ -848,6 +917,7 @@ FrameParams params_from(const EncoderConfig& c) {
     s.chroma_weight = c.tune_psnr ? 1.0 : 2.0;
     if (c.mts >= 0) t.mts = s.try_mts = c.mts != 0;
     if (c.alf >= 0) fp.alf = c.alf != 0;
+    fp.band_blocks = !c.band_samples;
     if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
     // 実測: 2x2 は 1x1 より 4-7% 効率が落ちるため、medium 以上は 1x1 (速度より効率)
@@ -869,7 +939,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
                   (fp.lf_freq ? 16u : 0u) | (fp.lf_map ? 32u : 0u) | (fp.tools.rect ? 64u : 0u) | (fp.tools.tmvp ? 128u : 0u));
     put_u8(p, static_cast<uint32_t>((fp.tile_cols - 1) | ((fp.tile_rows - 1) << 4)));
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
-    put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u));
+    put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_u32(p, static_cast<uint32_t>(poc));
@@ -900,6 +970,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     const uint32_t f3 = br.u8();
     fp.alf = f3 & 1;
     fp.tools.mts = (f3 >> 1) & 1;
+    fp.band_blocks = (f3 >> 2) & 1;
     if (fp.cqp_off < -12 || fp.cqp_off > 12) return false;
     for (int l = 0; l < 2; ++l) {
         const uint32_t n = br.u8();
