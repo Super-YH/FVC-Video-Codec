@@ -66,12 +66,20 @@ void put_unit(std::vector<uint8_t>& out, UnitType t, const std::vector<uint8_t>&
     out.insert(out.end(), payload.begin(), payload.end());
 }
 
+// PQMF の構成 (§3.2): 帯域数 2^lx x 2^ly とプロトタイプフィルタ (遅延 m, Kaiser β) の選択
+struct PqmfCfg { int lx = 0, ly = 0, filter = 0; };
+struct PqmfFilter { int m; double beta; };
+constexpr PqmfFilter kPqmfFilters[4] = {{6, 9.0}, {4, 7.0}, {8, 10.0}, {3, 5.0}};
+
+struct FrameParams;
+PqmfCfg pqmf_cfg(const FrameParams& fp);
+
 // ---------------- PQMF 帯域符号化 (§3, 帯域間差分 §3.3, ノイズ置換 §5.6) ----------------
 // band_mode: 0 = 通常 (量子化値を符号化), 1 = 帯域間差分 (左/上の隣接帯域を鏡像参照, ゲイン a/64), 2 = ノイズ置換 (RMS のみ)
-void code_bands(SymIO& io, Models& md, int pqmf_log2, const Plane* org, Plane& rec, double step, double rnd,
+void code_bands(SymIO& io, Models& md, const PqmfCfg& pq, const Plane* org, Plane& rec, double step, double rnd,
                 int32_t lo, int32_t hi, bool band_tools, bool psy, uint64_t seed) {
-    const int M = 1 << pqmf_log2, W = rec.w, H = rec.h;
-    Pqmf2D fb(M, M);
+    const int Mx = 1 << pq.lx, My = 1 << pq.ly, W = rec.w, H = rec.h;
+    Pqmf2D fb(Mx, My, kPqmfFilters[pq.filter].m, kPqmfFilters[pq.filter].beta);
     const int32_t off = (lo + hi + 1) / 2;
     std::vector<std::vector<double>> bands, src;
     if (io.enc) {
@@ -80,22 +88,22 @@ void code_bands(SymIO& io, Models& md, int pqmf_log2, const Plane* org, Plane& r
         fb.analyze(x, W, H, bands);
         src = bands;
     } else {
-        bands.assign(M * M, std::vector<double>(static_cast<size_t>(W / M) * (H / M), 0.0));
+        bands.assign(Mx * My, std::vector<double>(static_cast<size_t>(W / Mx) * (H / My), 0.0));
     }
-    const int bw = W / M, bh = H / M;
+    const int bw = W / Mx, bh = H / My;
     constexpr int kPB = 8;  // 帯域間予測のブロック (帯域画像の画素)
-    std::vector<std::vector<int32_t>> qs(M * M, std::vector<int32_t>(static_cast<size_t>(bw) * bh, 0));
+    std::vector<std::vector<int32_t>> qs(Mx * My, std::vector<int32_t>(static_cast<size_t>(bw) * bh, 0));
     double ll_step = 1.0;
-    for (int ky = 0; ky < M; ++ky)
-        for (int kx = 0; kx < M; ++kx) {
-            const int k = ky * M + kx;
+    for (int ky = 0; ky < My; ++ky)
+        for (int kx = 0; kx < Mx; ++kx) {
+            const int k = ky * Mx + kx;
             auto& b = bands[k];
             auto& q = qs[k];
             const double st = step / fb.band_norm(kx, ky) * (1.0 + 0.08 * (kx + ky));
             const bool ll = kx == 0 && ky == 0;
             if (ll) ll_step = st;
             // 参照帯域 (再構成済み): 左隣 or 上隣。奇数帯域のスペクトル鏡像は (-1)^n 変調で補正
-            const int rk = kx > 0 ? k - 1 : (ky > 0 ? k - M : -1);
+            const int rk = kx > 0 ? k - 1 : (ky > 0 ? k - Mx : -1);
             const bool horiz = kx > 0;
             auto refv = [&](int x, int y) {
                 const double v = bands[rk][static_cast<size_t>(y) * bw + x];
@@ -173,8 +181,8 @@ void code_bands(SymIO& io, Models& md, int pqmf_log2, const Plane* org, Plane& r
                         // 文脈 (帯域間相関の常時利用): 空間近傍 + 隣接帯域の同位置 + LL 帯域の局所勾配
                         int cross = 0;
                         if (kx > 0) cross += std::abs(qs[k - 1][i]);
-                        if (ky > 0) cross += std::abs(qs[k - M][i]);
-                        if (kx > 0 && ky > 0) cross += std::abs(qs[k - M - 1][i]);
+                        if (ky > 0) cross += std::abs(qs[k - Mx][i]);
+                        if (kx > 0 && ky > 0) cross += std::abs(qs[k - Mx - 1][i]);
                         const int xl = std::max(x - 1, 0), xr = std::min(x + 1, bw - 1), yu = std::max(y - 1, 0), yd = std::min(y + 1, bh - 1);
                         const int32_t grad = std::abs(LL[static_cast<size_t>(y) * bw + xr] - LL[static_cast<size_t>(y) * bw + xl]) +
                                              std::abs(LL[static_cast<size_t>(yd) * bw + x] - LL[static_cast<size_t>(yu) * bw + x]);
@@ -199,10 +207,10 @@ void code_bands(SymIO& io, Models& md, int pqmf_log2, const Plane* org, Plane& r
 //   pred = g_t · P_k + g_c · T_s(R_j - P_j)     (R_j: 現フレームで符号化済みの隣接帯域 j の再構成)
 // を探索する。g_t ∈ {0, .5, .75, 1, 1.25}, g_c ∈ {-4..4}/4, T_s は鏡像 + シフト (±1 帯域標本, 9 通り)。
 // 残差は RD でスキップ (係数なし) または帯域間文脈つきで符号化する。
-void code_bands_video(SymIO& io, Models& md, int pqmf_log2, const Plane* org, const Plane& P, Plane& rec, double step,
+void code_bands_video(SymIO& io, Models& md, const PqmfCfg& pq, const Plane* org, const Plane& P, Plane& rec, double step,
                       double lambda, int32_t lo, int32_t hi) {
-    const int M = 1 << pqmf_log2, W = rec.w, H = rec.h, bw = W / M, bh = H / M;
-    Pqmf2D fb(M, M);
+    const int Mx = 1 << pq.lx, My = 1 << pq.ly, W = rec.w, H = rec.h, bw = W / Mx, bh = H / My;
+    Pqmf2D fb(Mx, My, kPqmfFilters[pq.filter].m, kPqmfFilters[pq.filter].beta);
     const int32_t off = (lo + hi + 1) / 2;
     std::vector<std::vector<double>> pb, xb;
     {
@@ -214,18 +222,18 @@ void code_bands_video(SymIO& io, Models& md, int pqmf_log2, const Plane* org, co
             fb.analyze(t, W, H, xb);
         }
     }
-    std::vector<std::vector<double>> rb(M * M, std::vector<double>(static_cast<size_t>(bw) * bh, 0.0));
-    std::vector<std::vector<int32_t>> qs(M * M, std::vector<int32_t>(static_cast<size_t>(bw) * bh, 0));
+    std::vector<std::vector<double>> rb(Mx * My, std::vector<double>(static_cast<size_t>(bw) * bh, 0.0));
+    std::vector<std::vector<int32_t>> qs(Mx * My, std::vector<int32_t>(static_cast<size_t>(bw) * bh, 0));
     constexpr int kB = 8;
     constexpr double kGt[5] = {0.0, 0.5, 0.75, 1.0, 1.25};
     const int nbx = (bw + kB - 1) / kB, nby = (bh + kB - 1) / kB;
-    for (int ky = 0; ky < M; ++ky)
-        for (int kx = 0; kx < M; ++kx) {
-            const int k = ky * M + kx;
+    for (int ky = 0; ky < My; ++ky)
+        for (int kx = 0; kx < Mx; ++kx) {
+            const int k = ky * Mx + kx;
             const double nrm = fb.band_norm(kx, ky);
             const double st = step / nrm * (1.0 + 0.08 * (kx + ky));
             const double lam = lambda / (nrm * nrm);  // 帯域領域の SSE と画素領域の SSE の換算
-            const int rk = kx > 0 ? k - 1 : (ky > 0 ? k - M : -1);
+            const int rk = kx > 0 ? k - 1 : (ky > 0 ? k - Mx : -1);
             const bool horiz = kx > 0;
             // 参照帯域の再構成残差 (鏡像補正つき)、シフト s ∈ [0,9)
             auto cref = [&](int x, int y, int sh) {
@@ -316,7 +324,7 @@ void code_bands_video(SymIO& io, Models& md, int pqmf_log2, const Plane* org, co
                                 const int32_t qne = (y && x + 1 < bw) ? qk[i - bw + 1] : 0;
                                 int cross = 0;
                                 if (kx > 0) cross += std::abs(qs[k - 1][i]);
-                                if (ky > 0) cross += std::abs(qs[k - M][i]);
+                                if (ky > 0) cross += std::abs(qs[k - Mx][i]);
                                 const uint32_t a = static_cast<uint32_t>(std::min(std::abs(qw) + std::abs(qn) + std::abs(qnw) + std::abs(qne), 15)) |
                                                    (static_cast<uint32_t>(std::min(cross, 7)) << 4);
                                 v = io.sint(md.band_hi, a, bc | 64u, io.enc ? q[li] : 0);
@@ -335,12 +343,12 @@ void code_bands_video(SymIO& io, Models& md, int pqmf_log2, const Plane* org, co
 // 各帯域画像を合成利得で正規化した整数プレーンにし、既存のブロック符号化器
 // (分割・イントラ予測・変換・RDOQ・CM) で符号化する。P != nullptr (P/B) のときは
 // 帯域ごとの残差 X_k - P_k を符号化する。帯域ごとに量子化ステップを高域ほど粗くする。
-void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, const Plane* P, Plane& rec, double step,
+void code_bands_blocks(SymIO& io, Models& md, const PqmfCfg& pq, const Plane* org, const Plane* P, Plane& rec, double step,
                        double lambda, int32_t lo, int32_t hi, int plane, const Tools& tools, const Search& search,
                        int min_log2, int max_log2, bool band_ns, uint64_t seed) {
-    const int M = 1 << pqmf_log2, W = rec.w, H = rec.h, bw = W / M, bh = H / M;
+    const int Mx = 1 << pq.lx, My = 1 << pq.ly, W = rec.w, H = rec.h, bw = W / Mx, bh = H / My;
     const int BW = (bw + kCtu - 1) / kCtu * kCtu, BH = (bh + kCtu - 1) / kCtu * kCtu;
-    Pqmf2D fb(M, M);
+    Pqmf2D fb(Mx, My, kPqmfFilters[pq.filter].m, kPqmfFilters[pq.filter].beta);
     const int32_t off = (lo + hi + 1) / 2;
     std::vector<std::vector<double>> pb, xb;
     {
@@ -354,16 +362,16 @@ void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, c
             fb.analyze(t, W, H, xb);
         }
     }
-    std::vector<std::vector<double>> rb(M * M, std::vector<double>(static_cast<size_t>(bw) * bh, 0.0));
+    std::vector<std::vector<double>> rb(Mx * My, std::vector<double>(static_cast<size_t>(bw) * bh, 0.0));
     Tools bt = tools;
     bt.cfl = false; bt.ibc = false; bt.dict = false; bt.pred_only = false; bt.rect = false; bt.tmvp = false;
     Search bs = search;
-    const int32_t range = 8 * (hi - lo + 1) * M;  // 帯域値の取りうる範囲 (正規化後) に十分な余裕
-    std::vector<Plane> rk_plane(M * M);           // 各帯域の再構成 (正規化整数, パディング込み)
+    const int32_t range = 8 * (hi - lo + 1) * std::max(Mx, My);  // 帯域値の取りうる範囲 (正規化後) に十分な余裕
+    std::vector<Plane> rk_plane(Mx * My);           // 各帯域の再構成 (正規化整数, パディング込み)
     Plane tp0, chg;                               // LL 帯域の時間方向予測と変化マスク
-    for (int ky = 0; ky < M; ++ky)
-        for (int kx = 0; kx < M; ++kx) {
-            const int k = ky * M + kx;
+    for (int ky = 0; ky < My; ++ky)
+        for (int kx = 0; kx < Mx; ++kx) {
+            const int k = ky * Mx + kx;
             const double nrm = fb.band_norm(kx, ky);
             constexpr double kBw = 0.08;  // 実測: 0/0.08/0.2/0.4 で同等、0.08 が僅かに最良
             const double bstep = step * (1.0 + kBw * (kx + ky));
@@ -382,7 +390,7 @@ void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, c
                           std::min(min_log2, 3), max_log2, bt, bs);
             // 帯域間相関: 左 (なければ上) の符号化済み帯域を鏡像補正して文脈・予測に使う
             Plane xp;
-            const int rk = kx > 0 ? k - 1 : (ky > 0 ? k - M : -1);
+            const int rk = kx > 0 ? k - 1 : (ky > 0 ? k - Mx : -1);
             if (rk >= 0) {
                 xp = rk_plane[rk];
                 const bool horiz = kx > 0;
@@ -483,6 +491,8 @@ struct FrameParams {
     int qp = 32;
     bool lossy = true, l2 = false;
     int pqmf_log2 = 0;
+    int pqmf_log2y = 0;  // 縦の帯域数 (log2)。符号器が §3.2 の選択で決める (0: pqmf_log2 と同じ)
+    int pqmf_filter = 0; // プロトタイプ (kPqmfFilters の番号)
     int min_log2 = 2, max_log2 = kCtuLog2;
     Tools tools;               // ビットストリームで伝送
     bool shapes = false;       // 図形レイヤ (I のみ)
@@ -619,6 +629,51 @@ void estimate_global_motion(const Plane& cur, const Plane& ref, int& gx, int& gy
 }
 
 // 小さな最小二乗 (正規方程式 + ガウス消去)。A: rows x n
+PqmfCfg pqmf_cfg(const FrameParams& fp) {
+    PqmfCfg c;
+    c.lx = fp.pqmf_log2;
+    c.ly = fp.pqmf_log2y ? fp.pqmf_log2y : fp.pqmf_log2;
+    c.filter = fp.pqmf_filter;
+    return c;
+}
+
+// §3.2 符号器の簡易選択: 候補 (フィルタ x 帯域形状) ごとに、帯域係数の重み付き L1 (合成側の寄与) と
+//  合成残差 (完全再構成からのずれ) の L1 の和が最小のものを選ぶ (疎さの推定)
+PqmfCfg choose_pqmf(const Plane& Y, int L) {
+    PqmfCfg best;
+    best.lx = best.ly = L;
+    if (L <= 0) return best;
+    std::vector<std::pair<int, int>> shapes = {{L, L}};
+    if (L >= 2) { shapes.push_back({L, L - 1}); shapes.push_back({L - 1, L}); }
+    double bc = 1e300;
+    for (auto [lx, ly] : shapes) {
+        const int Mx = 1 << lx, My = 1 << ly;
+        const int W = Y.w / Mx * Mx, H = Y.h / My * My;
+        if (W <= 0 || H <= 0) continue;
+        std::vector<double> img(static_cast<size_t>(W) * H);
+        for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) img[static_cast<size_t>(y) * W + x] = Y.at(x, y);
+        for (int f = 0; f < 4; ++f) {
+            Pqmf2D fb(Mx, My, kPqmfFilters[f].m, kPqmfFilters[f].beta);
+            std::vector<std::vector<double>> bands;
+            fb.analyze(img, W, H, bands);
+            double cost = 0;
+            for (int ky = 0; ky < My; ++ky)
+                for (int kx = 0; kx < Mx; ++kx) {
+                    if (!kx && !ky) continue;  // LL は予測で大半が除かれるため評価しない
+                    double a = 0;
+                    for (double v : bands[ky * Mx + kx]) a += std::abs(v);
+                    cost += a * fb.band_norm(kx, ky);
+                }
+            std::vector<double> rec;
+            fb.synthesize(bands, W, H, rec);
+            for (size_t i = 0; i < rec.size(); ++i) cost += std::abs(rec[i] - img[i]);
+            cost /= static_cast<double>(W) * H;
+            if (cost < bc) { bc = cost; best.lx = lx; best.ly = ly; best.filter = f; }
+        }
+    }
+    return best;
+}
+
 bool solve_ls(const std::vector<std::vector<double>>& A, const std::vector<double>& b, int n, std::vector<double>& x) {
     std::vector<double> M(static_cast<size_t>(n) * (n + 1), 0.0);
     for (size_t r = 0; r < A.size(); ++r)
@@ -916,11 +971,11 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             const double step = qp_step(pqp, info.bit_depth);
             if (bands && !inter && fp.band_blocks) {
                 const double lam = 0.57 * std::pow(2.0, (pqp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
-                code_bands_blocks(io, md, fp.pqmf_log2, org ? &opad : nullptr, nullptr, R, step, lam, lo, hi, pi, fp.tools,
+                code_bands_blocks(io, md, pqmf_cfg(fp), org ? &opad : nullptr, nullptr, R, step, lam, lo, hi, pi, fp.tools,
                                   fp.search, fp.min_log2, fp.max_log2, false, 0);
                 if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lam, lo, hi);
             } else if (bands && !inter) {
-                code_bands(io, md, fp.pqmf_log2, org ? &opad : nullptr, R, step, 1.0 / 3.0, lo, hi, fp.band_tools, fp.psy,
+                code_bands(io, md, pqmf_cfg(fp), org ? &opad : nullptr, R, step, 1.0 / 3.0, lo, hi, fp.band_tools, fp.psy,
                            static_cast<uint64_t>(fp.poc) * 3 + pi);
             } else {
                 Plane lds;
@@ -1053,11 +1108,11 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     // 帯域ブロックごとにゲイン・帯域間予測・スキップを探索して符号化
                     const Plane P = R;
                     if (fp.band_blocks)
-                        code_bands_blocks(io, md, fp.pqmf_log2, org ? &opad : nullptr, &P, R, step, lambda, lo, hi, pi, fp.tools,
+                        code_bands_blocks(io, md, pqmf_cfg(fp), org ? &opad : nullptr, &P, R, step, lambda, lo, hi, pi, fp.tools,
                                           fp.search, fp.min_log2, fp.max_log2, fp.band_ns && allow_ns,
                                           static_cast<uint64_t>(fp.poc) * 3 + static_cast<uint64_t>(pi));
                     else
-                        code_bands_video(io, md, fp.pqmf_log2, org ? &opad : nullptr, P, R, step, lambda, lo, hi);
+                        code_bands_video(io, md, pqmf_cfg(fp), org ? &opad : nullptr, P, R, step, lambda, lo, hi);
                 }
                 if (fp.lf) {
                     code_loop_filter(io, md.lf, R, org ? &opad : nullptr, einfo, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, pqp,
@@ -1233,7 +1288,9 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>(fp.type));
     put_uv(p, static_cast<uint32_t>(fp.poc));
     put_u8(p, static_cast<uint32_t>(fp.qp));
-    put_u8(p, (fp.l2 ? 1u : 0u) | (fp.lossy ? 2u : 0u) | (static_cast<uint32_t>(fp.pqmf_log2) << 2));
+    put_u8(p, (fp.l2 ? 1u : 0u) | (fp.lossy ? 2u : 0u) | (static_cast<uint32_t>(fp.pqmf_log2) << 2) |
+                  (static_cast<uint32_t>(fp.pqmf_filter) << 5));
+    put_u8(p, static_cast<uint32_t>(fp.pqmf_log2y));
     put_u8(p, static_cast<uint32_t>(fp.min_log2) | (static_cast<uint32_t>(fp.max_log2) << 4));
     put_u8(p, tools_byte(fp.tools));
     put_u8(p, (fp.shapes ? 1u : 0u) | (fp.band_tools ? 2u : 0u) | (fp.dict_reset ? 4u : 0u) | (fp.lf ? 8u : 0u) |
@@ -1255,7 +1312,9 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.poc = static_cast<int>(br.uv());
     fp.qp = static_cast<int>(br.u8());
     const uint32_t f = br.u8();
-    fp.l2 = f & 1; fp.lossy = (f >> 1) & 1; fp.pqmf_log2 = (f >> 2) & 7;
+    fp.l2 = f & 1; fp.lossy = (f >> 1) & 1; fp.pqmf_log2 = (f >> 2) & 7; fp.pqmf_filter = (f >> 5) & 3;
+    fp.pqmf_log2y = static_cast<int>(br.u8());
+    if (fp.pqmf_log2y > 4 || (fp.pqmf_log2y && fp.pqmf_log2 == 0)) return false;
     const uint32_t lg = br.u8();
     fp.min_log2 = lg & 15; fp.max_log2 = lg >> 4;
     fp.tools = tools_from_byte(static_cast<uint8_t>(br.u8()));
@@ -1317,6 +1376,10 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
                                              const std::vector<const Frame*>& look) {
     FrameParams fp = params_from(cfg_);
     fp.dict_add = cfg_.total_frames != 1;
+    if (fp.pqmf_log2 > 0) {
+        const PqmfCfg pc = choose_pqmf(f.p[0], fp.pqmf_log2);
+        fp.pqmf_log2 = pc.lx; fp.pqmf_log2y = pc.ly; fp.pqmf_filter = pc.filter;
+    }
     fp.poc = poc;
     fp.type = type;
     if (type == FrameType::I) {
