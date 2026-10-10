@@ -265,6 +265,12 @@ void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) c
                         for (int x = 0; x < b; ++x) pred[(by + y) * s + bx + x] = sub[y * b + x];
                 }
         }
+    } else if (lf.pt == 4) {
+        for (int y = 0; y < s; ++y)
+            for (int x = 0; x < s; ++x) {
+                const int64_t v = static_cast<int64_t>(lf.xgain) * xband_->at(x0 + x, y0 + y);
+                pred[y * s + x] = std::clamp(static_cast<int32_t>(v >= 0 ? (v + 2) / 4 : -((-v + 2) / 4)), lo_, hi_);
+            }
     } else if (lf.pt == 3) {
         intra_angular(x0, y0, s, kModeDC, pred);
         const std::vector<int32_t>& d = dict_->data(dict_->ids_for(s)[lf.dict_idx]);
@@ -562,10 +568,20 @@ void BlockCoder::dict_search(int x0, int y0, int s, std::vector<Leaf>& cands) co
     if (bi >= 0 && bg != 0) { Leaf lf; lf.pt = 3; lf.dict_idx = bi; lf.dict_gain = bg; cands.push_back(lf); }
 }
 
+// 帯域間文脈: ブロック位置の隣接帯域の平均振幅 (量子化ステップ単位) を 4 段階 (+1, 0 = 情報なし)
+uint32_t BlockCoder::xb_ctx(int x0, int y0, int s) const {
+    if (!xband_) return 0;
+    double a = 0;
+    for (int y = 0; y < s; ++y)
+        for (int x = 0; x < s; ++x) a += std::abs(xband_->at(x0 + x, y0 + y));
+    a /= static_cast<double>(s) * s * step_;
+    return a < 0.25 ? 1u : a < 1.0 ? 2u : a < 3.0 ? 3u : 4u;
+}
+
 // ---------------- RDOQ (§13.1) ----------------
 // 走査順に、各係数のレベルを {round, round-1, 0} から D + λR 最小で貪欲に選ぶ。
 // R は CM モデルの現在確率から (構文と同じ文脈で) 見積もる。最後に末尾の打ち切り位置を最適化。
-void BlockCoder::rdoq(Leaf& lf, int l, const std::vector<double>& e) const {
+void BlockCoder::rdoq(Leaf& lf, int l, const std::vector<double>& e, uint32_t xb) const {
     const int s = 1 << l, n = s * s;
     const auto& scan = diag_scan(l);
     CMModel& cm = plane_ ? md_->coef_c : md_->coef_y;
@@ -590,7 +606,7 @@ void BlockCoder::rdoq(Leaf& lf, int l, const std::vector<double>& e) const {
         const int pos = scan[i];
         const int u = pos & (s - 1), v = pos >> l;
         const uint32_t a = coef_ctx(rq.data(), u, v, l);
-        const uint32_t b = L * 4 + (i == 0 ? 2u : 0u);
+        const uint32_t b = (L * 4 + (i == 0 ? 2u : 0u)) | (xb << 8);
         const double x = e[i] / step_;
         const int32_t r = static_cast<int32_t>(std::lround(std::abs(x)));
         double best = 1e300;
@@ -654,7 +670,7 @@ void BlockCoder::quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) 
             lf.q[scan[i]] = v;
             if (v) lf.last = i;
         }
-        if (search_.rdoq && md_ && !lf.tns_on && lf.last >= 0) rdoq(lf, l, e);
+        if (search_.rdoq && md_ && !lf.tns_on && lf.last >= 0) rdoq(lf, l, e, xb_ctx(x0, y0, s));
         if (tools_.nf && lf.last + 1 < n) {
             double en = 0;
             for (int i = lf.last + 1; i < n; ++i) en += e[i] * e[i];
@@ -727,6 +743,8 @@ double BlockCoder::leaf_bits(const Leaf& lf, int x0, int y0, int l) const {
                     if (inter_.nref[l] > 1) b += 1.0 + lf.mi.ref[l];
                 }
         }
+    } else if (lf.pt == 4) {
+        b += 1.0 + 3.0;
     } else if (lf.pt == 3) {
         b += 1.0 + std::log2(2.0 + dict_->ids_for(1 << l).size()) + 2.0 + 2.0 * std::log2(1.0 + std::abs(lf.dict_gain));
     } else if (lf.pt == 1) {
@@ -869,6 +887,20 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             else { Leaf lf; lf.pt = 2; cands.push_back(lf); }
         }
         if (tools_.dict && (s == 8 || s == 16)) dict_search(x0, y0, s, cands);
+        if (xband_) {
+            // 帯域間予測: 隣接帯域の最小二乗ゲインを量子化
+            double num = 0, den = 0;
+            for (int y = 0; y < s; ++y)
+                for (int x = 0; x < s; ++x) {
+                    const double r = xband_->at(x0 + x, y0 + y);
+                    num += r * org_->at(x0 + x, y0 + y);
+                    den += r * r;
+                }
+            if (den > 0) {
+                const int g = std::clamp(static_cast<int>(std::lround(num / den * 4.0)), -4, 4);
+                if (g != 0) { Leaf lf; lf.pt = 4; lf.xgain = g; cands.push_back(lf); }
+            }
+        }
         if (tools_.ibc && s >= 8 && s <= 32) {
             Leaf lf; lf.pt = 1;
             ibc_search(x0, y0, s, lf.bvx, lf.bvy);
@@ -938,7 +970,18 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
                 quantize(lf, x0, y0, l, pred.data());
                 if (tn && !lf.tns_on) continue;
                 reconstruct(lf, x0, y0, l, pred.data());
-                const double j = sse(x0, y0, s) + lambda_ * (leaf_rate(lf, x0, y0, l) + split_rate(x0, y0, l, 0));
+                double dist;
+                if (tools_.pred_only) {
+                    // 予測のみの段階: 残差は後段 (帯域符号化) で変換符号化されるため、
+                    // 残差の SATD を符号量+歪みの近似として評価する (SSE だと残差コストを無視してしまう)
+                    std::vector<int32_t> res(static_cast<size_t>(n));
+                    for (int y = 0; y < s; ++y)
+                        for (int x = 0; x < s; ++x) res[y * s + x] = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y);
+                    dist = static_cast<double>(satd4(res.data(), s)) * std::sqrt(lambda_) * 2.0;
+                } else {
+                    dist = sse(x0, y0, s);
+                }
+                const double j = dist + lambda_ * (leaf_rate(lf, x0, y0, l) + split_rate(x0, y0, l, 0));
                 if (j < best) { best = j; best_leaf = lf; save(x0, y0, s, best_rec); }
                 restore(x0, y0, s, before);
             }
@@ -998,6 +1041,10 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
                 code_motion(io, md, L, x0 + (part == 2 ? pw : 0), y0 + (part == 1 ? ph : 0), pw, ph, lf.mi2, lf.merge2);
             }
         }
+    } else if (xband_ && io.bit(md.dict, 20, L, 0, lf.pt == 4)) {
+        lf.pt = 4;
+        lf.xgain = io.sint(md.dict, 21, L, lf.xgain);
+        if (lf.xgain == 0 || std::abs(lf.xgain) > 4) throw std::runtime_error("corrupt stream: xband gain");
     } else if (tools_.dict && (s == 8 || s == 16) && io.bit(md.dict, 0, L, 0, lf.pt == 3)) {
         lf.pt = 3;
         const auto& ids = dict_->ids_for(s);
@@ -1083,11 +1130,12 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
             if (lf.last >= n) throw std::runtime_error("corrupt stream: last");
             if (!io.enc) lf.q.assign(n, 0);
             CMModel& cm = plane_ ? md.coef_c : md.coef_y;
+            const uint32_t xbc = xb_ctx(x0, y0, s);
             for (int i = 0; i <= lf.last; ++i) {
                 const int pos = scan[i];
                 const int u = pos & (s - 1), v = pos >> l;
                 const uint32_t a = coef_ctx(lf.q.data(), u, v, l);
-                const uint32_t b = L * 4 + (i == lf.last ? 1u : 0u) + (i == 0 ? 2u : 0u) + (lf.tns_on ? 64u : 0u);
+                const uint32_t b = (L * 4 + (i == lf.last ? 1u : 0u) + (i == 0 ? 2u : 0u) + (lf.tns_on ? 64u : 0u)) | (xbc << 8);
                 if (i == lf.last) {
                     const int32_t cv = lf.q[pos];
                     const uint32_t mag = io.uint(cm, a, b, io.enc ? static_cast<uint32_t>(std::abs(cv)) - 1u : 0u) + 1u;

@@ -342,6 +342,7 @@ void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, c
     bt.cfl = false; bt.ibc = false; bt.dict = false; bt.pred_only = false; bt.rect = false; bt.tmvp = false;
     Search bs = search;
     const int32_t range = 8 * (hi - lo + 1) * M;  // 帯域値の取りうる範囲 (正規化後) に十分な余裕
+    std::vector<Plane> rk_plane(M * M);           // 各帯域の再構成 (正規化整数, パディング込み)
     for (int ky = 0; ky < M; ++ky)
         for (int kx = 0; kx < M; ++kx) {
             const int k = ky * M + kx;
@@ -360,6 +361,17 @@ void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, c
             }
             BlockCoder bc(&R, io.enc ? &target : nullptr, nullptr, plane, -range, range, bstep, lambda,
                           std::min(min_log2, 3), max_log2, bt, bs);
+            // 帯域間相関: 左 (なければ上) の符号化済み帯域を鏡像補正して文脈・予測に使う
+            Plane xp;
+            const int rk = kx > 0 ? k - 1 : (ky > 0 ? k - M : -1);
+            if (rk >= 0) {
+                xp = rk_plane[rk];
+                const bool horiz = kx > 0;
+                for (int y = 0; y < BH; ++y)
+                    for (int x = 0; x < BW; ++x)
+                        if ((horiz ? x : y) & 1) xp.at(x, y) = -xp.at(x, y);
+                bc.set_xband(&xp);
+            }
             for (int cy = 0; cy < BH; cy += kCtu)
                 for (int cx = 0; cx < BW; cx += kCtu) bc.code_ctu(io, md, cx, cy, kCtu);
             for (int y = 0; y < bh; ++y)
@@ -367,6 +379,7 @@ void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, c
                     const size_t i = static_cast<size_t>(y) * bw + x;
                     rb[k][i] = R.at(x, y) / nrm + (P ? pb[k][i] : 0.0);
                 }
+            rk_plane[k] = std::move(R);
         }
     std::vector<double> y;
     fb.synthesize(rb, W, H, y);
