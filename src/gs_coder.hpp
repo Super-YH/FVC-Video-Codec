@@ -23,6 +23,7 @@ struct GsUnit {
     uint8_t mode = 0;  // 0..5 (上記)
     uint8_t type = 0;  // mode 1: 0 = 非線形スカラ, 1 = E8, 2 = ランダム投影
     uint8_t pn = 0;    // type 0: 前変換 0..5 (Id, Power.75[NonlinearSQ], Power.6, Asinh, SignedLog, PWL)
+    uint8_t gon = 1;   // mode 1: 1 = 利得を送り形状を正規化, 0 = 量子化値をそのまま使う (利得の副情報なし)
     uint8_t perm = 0;  // mode 4: 0 恒等, 1 反転, 2 半周巡回, 3 偶奇交換
     int qg = 0;        // 利得 (mode 5 では復号側で導出した値)
     std::vector<int32_t> sym;  // mode 1: 量子化シンボル, mode 3: 符号 (0/1)

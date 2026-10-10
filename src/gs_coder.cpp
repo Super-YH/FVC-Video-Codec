@@ -91,14 +91,17 @@ void unit_syntax(SymIO& io, CMModel& m, GsUnit& u, int band, int lp, uint32_t pc
     }
     if (mode == 4 && !st.has_vec) throw std::runtime_error("corrupt stream: gs copy");
     u.mode = static_cast<uint8_t>(mode);
-    if (mode >= 1 && mode <= 4) {
+    if (mode == 1) u.gon = static_cast<uint8_t>(io.bit(m, 1, 66, pc * 8 + bc, u.gon));
+    const bool has_gain = (mode >= 2 && mode <= 4) || (mode == 1 && u.gon);
+    if (has_gain) {
         const int pred = st.ngain ? st.qg1 : 8;
         u.qg = pred + io.sint(m, 32 + bc, pc, u.qg - pred);
         if (u.qg < kQgMin || u.qg > kQgMax) throw std::runtime_error("corrupt stream: gs gain");
     } else if (mode == 5) {
         u.qg = st.ngain >= 2 ? std::clamp(2 * st.qg1 - st.qg2, kQgMin, st.qg1) : st.ngain ? std::max(kQgMin, st.qg1 - 4) : 0;
     }
-    if (mode >= 1) { st.qg2 = st.qg1; st.qg1 = u.qg; ++st.ngain; st.has_vec = true; }
+    if (has_gain || mode == 5) { st.qg2 = st.qg1; st.qg1 = u.qg; ++st.ngain; }
+    if (mode >= 1) st.has_vec = true;
     if (mode == 1) {
         const int t1 = io.bit(m, 1, 64, pc, u.type != 0);
         u.type = static_cast<uint8_t>(t1 ? 1 + io.bit(m, 2, 64, pc, u.type == 2) : 0);
@@ -115,8 +118,12 @@ void unit_syntax(SymIO& io, CMModel& m, GsUnit& u, int band, int lp, uint32_t pc
         }
         const int ns = sym_count(u.type, lp);
         if (!io.enc) u.sym.assign(ns, 0);
+        int prev = 0;
         for (int k = 0; k < ns; ++k) {
-            u.sym[k] = io.sint(m, 128 + u.type * 16u + static_cast<uint32_t>(std::min(k, 15)), pc * 8 + bc, u.sym[k]);
+            // 文脈: 種類・位置・バンド・直前シンボルの大きさ
+            u.sym[k] = io.sint(m, 128 + u.type * 16u + static_cast<uint32_t>(std::min(k, 15)),
+                               pc * 8 + bc + 16u * static_cast<uint32_t>(std::min(prev, 3)), u.sym[k]);
+            prev = std::abs(u.sym[k]);
             if (std::abs(u.sym[k]) > (1 << 16)) throw std::runtime_error("corrupt stream: gs symbol");
         }
     } else if (mode == 3) {
@@ -172,7 +179,7 @@ void unit_recon(const GsUnit& u, const std::vector<double>& rho, uint64_t seed, 
     }
     default: break;
     }
-    normalize_to(out, g);
+    if (!(u.mode == 1 && !u.gon)) normalize_to(out, g);
     double e = 0;
     for (double a : out) e += a * a;
     if (e > 0) last = out;
@@ -284,6 +291,7 @@ void gs_encode(const double* x, int l, double lam, CMModel& m, uint32_t pc, uint
         };
         // 利得: 形状 ŝ に対する MSE 最適 ĝ = <x, ŝ/‖ŝ‖> を対数量子化
         auto with_gain = [&](GsUnit u) {
+            if (u.mode == 1) { GsUnit z = u; z.gon = 0; consider(z); }
             std::vector<double> lt = last;
             u.qg = 0;
             unit_recon(u, L.rho[i], us, lt, v);  // 利得 1 の形状
