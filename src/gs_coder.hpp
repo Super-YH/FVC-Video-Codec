@@ -24,9 +24,17 @@ struct GsUnit {
     uint8_t type = 0;  // mode 1: 0 = 非線形スカラ, 1 = E8, 2 = ランダム投影
     uint8_t pn = 0;    // type 0: 前変換 0..5 (Id, Power.75[NonlinearSQ], Power.6, Asinh, SignedLog, PWL)
     uint8_t gon = 1;   // mode 1: 1 = 利得を送り形状を正規化, 0 = 量子化値をそのまま使う (利得の副情報なし)
-    uint8_t perm = 0;  // mode 4: 0 恒等, 1 反転, 2 半周巡回, 3 偶奇交換
+    uint8_t perm = 0;
+    uint8_t src = 0;   // mode 4: コピー元 = src+1 個前の非ゼロパーティション (0..3, 周波数領域コピー §7.6-4)  // mode 4: 0 恒等, 1 反転, 2 半周巡回, 3 偶奇交換
     int qg = 0;        // 利得 (mode 5 では復号側で導出した値)
     std::vector<int32_t> sym;  // mode 1: 量子化シンボル, mode 3: 符号 (0/1)
+};
+
+// 連結 (§5.3 part_join の簡易形): 直前に符号化した利得形状ブロックのバンド別利得。
+// 各バンドの最初の利得はこれ (無ければ直前の利得) から、同じバンドの 2 個目以降は同じバンドの利得から予測する。
+struct GsMem {
+    int qg[16] = {};
+    bool v[16] = {};
 };
 
 struct GsBlock {
@@ -44,9 +52,9 @@ const GsLayout& gs_layout(int l);
 
 // 符号器: x (走査順, ステップ単位, 長さ 4^l) からモードと量子化を RD で決める。
 //  lam = λ/Δ² (ステップ単位の歪みに対するビット単価)。m は現在のモデル (レート推定に使用、更新しない)。
-void gs_encode(const double* x, int l, double lam, CMModel& m, uint32_t pc, uint64_t seed, GsBlock& out);
+void gs_encode(const double* x, int l, double lam, CMModel& m, uint32_t pc, uint64_t seed, const GsMem& mem, GsBlock& out);
 // 構文 (符号化/復号/レート推定共通)
-void gs_syntax(SymIO& io, CMModel& m, GsBlock& g, int l, uint32_t pc);
+void gs_syntax(SymIO& io, CMModel& m, GsBlock& g, int l, uint32_t pc, GsMem& mem);
 // 再構成: xh (走査順, ステップ単位) を書く
 void gs_reconstruct(const GsBlock& g, int l, uint64_t seed, double* xh);
 bool gs_nonzero(const GsBlock& g);

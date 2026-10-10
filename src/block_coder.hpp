@@ -263,6 +263,7 @@ private:
     const Plane* tband_ = nullptr;
     const Plane* cband_ = nullptr;
     uint64_t noise_seed_ = 0;
+    GsMem gs_mem_;  // 利得形状ブロック間の利得予測 (§5.3 連結)
     uint64_t gs_seed(int x0, int y0) const {
         return (noise_seed_ + 0x632BE59BD9B4E019ull) ^ (static_cast<uint64_t>(x0) << 32 | static_cast<uint64_t>(y0) << 4 | static_cast<uint64_t>(plane_));
     }

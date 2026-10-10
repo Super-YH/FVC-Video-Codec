@@ -865,7 +865,7 @@ void BlockCoder::quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) 
         std::vector<double> xs(n);
         for (int i = 0; i < n; ++i) xs[i] = e[i] / step_;
         CMModel& gm = md_->gs;
-        gs_encode(xs.data(), l, lambda_ / (step_ * step_), gm, plane_ ? 1u : 0u, gs_seed(x0, y0), lf.gs);
+        gs_encode(xs.data(), l, lambda_ / (step_ * step_), gm, plane_ ? 1u : 0u, gs_seed(x0, y0), gs_mem_, lf.gs);
         lf.last = gs_nonzero(lf.gs) ? 0 : -1;
         return;
     }
@@ -1486,7 +1486,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         const auto& scan = diag_scan(l);
         if (lf.qmode == 2) {
             if (lf.tns_on) throw std::runtime_error("corrupt stream: gs with tns");
-            gs_syntax(io, md.gs, lf.gs, l, pc);
+            gs_syntax(io, md.gs, lf.gs, l, pc, gs_mem_);
             lf.last = 0;
             lf.nf = 0;
         } else if (lf.qmode == 0) {

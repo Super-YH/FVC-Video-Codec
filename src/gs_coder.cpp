@@ -20,8 +20,12 @@ constexpr int kNumPn = 6;
 // 構文と再構成の両方が参照する状態 (利得予測・コピー元の有無)
 struct GsState {
     int qg1 = 0, qg2 = 0, ngain = 0;
+    int nvec = 0;  // 非ゼロの再構成パーティション数 (コピー元の数)
     bool has_vec = false;
     int prev_mode = 0;
+    int band_qg[16] = {};
+    bool band_set[16] = {};
+    const GsMem* mem = nullptr;
 };
 
 // 前変換 (type 0 の pn): y = sc·f(x)
@@ -90,18 +94,24 @@ void unit_syntax(SymIO& io, CMModel& m, GsUnit& u, int band, int lp, uint32_t pc
         mode = val + 1;
     }
     if (mode == 4 && !st.has_vec) throw std::runtime_error("corrupt stream: gs copy");
+    const int bi = std::min(band, 15);
     u.mode = static_cast<uint8_t>(mode);
     if (mode == 1) u.gon = static_cast<uint8_t>(io.bit(m, 1, 66, pc * 8 + bc, u.gon));
     const bool has_gain = (mode >= 2 && mode <= 4) || (mode == 1 && u.gon);
     if (has_gain) {
-        const int pred = st.ngain ? st.qg1 : 8;
-        u.qg = pred + io.sint(m, 32 + bc, pc, u.qg - pred);
+        // 利得予測: 同じバンドの直前 > 前ブロックの同じバンド > 直前の利得 > 既定
+        int pred, srcc;
+        if (st.band_set[bi]) { pred = st.band_qg[bi]; srcc = 0; }
+        else if (st.mem && st.mem->v[bi]) { pred = st.mem->qg[bi]; srcc = 1; }
+        else if (st.ngain) { pred = st.qg1; srcc = 2; }
+        else { pred = 8; srcc = 3; }
+        u.qg = pred + io.sint(m, 32 + bc, pc + 2 * static_cast<uint32_t>(srcc), u.qg - pred);
         if (u.qg < kQgMin || u.qg > kQgMax) throw std::runtime_error("corrupt stream: gs gain");
     } else if (mode == 5) {
         u.qg = st.ngain >= 2 ? std::clamp(2 * st.qg1 - st.qg2, kQgMin, st.qg1) : st.ngain ? std::max(kQgMin, st.qg1 - 4) : 0;
     }
-    if (has_gain || mode == 5) { st.qg2 = st.qg1; st.qg1 = u.qg; ++st.ngain; }
-    if (mode >= 1) st.has_vec = true;
+    if (has_gain || mode == 5) { st.qg2 = st.qg1; st.qg1 = u.qg; ++st.ngain; st.band_qg[bi] = u.qg; st.band_set[bi] = true; }
+    if (mode >= 1) { st.has_vec = true; ++st.nvec; }
     if (mode == 1) {
         const int t1 = io.bit(m, 1, 64, pc, u.type != 0);
         u.type = static_cast<uint8_t>(t1 ? 1 + io.bit(m, 2, 64, pc, u.type == 2) : 0);
@@ -133,12 +143,21 @@ void unit_syntax(SymIO& io, CMModel& m, GsUnit& u, int band, int lp, uint32_t pc
         const int hi = io.bit(m, 1, 65, pc, u.perm >> 1);
         const int lo = io.bit(m, 2 + static_cast<uint32_t>(hi), 65, pc, u.perm & 1);
         u.perm = static_cast<uint8_t>(hi * 2 + lo);
+        if (st.nvec > 1) {
+            const int s1 = io.bit(m, 1, 67, pc, u.src != 0);
+            int sv = 0;
+            if (s1) { sv = 1; while (sv < std::min(st.nvec, 4) - 1 && io.bit(m, 1 + static_cast<uint32_t>(sv), 68, pc, u.src > sv)) ++sv; }
+            u.src = static_cast<uint8_t>(sv);
+        } else {
+            u.src = 0;
+        }
     }
     st.prev_mode = mode;
 }
 
 // 1 パーティションの再構成 (ステップ単位)。last はコピー元 (非ゼロの直前パーティション) を保持
-void unit_recon(const GsUnit& u, const std::vector<double>& rho, uint64_t seed, std::vector<double>& last, std::vector<double>& out) {
+using GsHist = std::vector<std::vector<double>>;  // mode>=1 のパーティション再構成 (新しい順に最大 4)
+void unit_recon(const GsUnit& u, const std::vector<double>& rho, uint64_t seed, GsHist& hist, std::vector<double>& out) {
     const int lp = static_cast<int>(rho.size());
     out.assign(lp, 0.0);
     if (u.mode == 0) return;
@@ -166,6 +185,8 @@ void unit_recon(const GsUnit& u, const std::vector<double>& rho, uint64_t seed, 
         for (int k = 0; k < lp; ++k) out[k] = (u.sym[k] ? -1.0 : 1.0) / std::max(1.0, rho[k]);
         break;
     case 4: {
+        if (static_cast<int>(hist.size()) <= u.src) break;
+        const std::vector<double>& last = hist[u.src];
         const int n = static_cast<int>(last.size());
         if (!n) break;
         for (int k = 0; k < lp; ++k) {
@@ -180,9 +201,8 @@ void unit_recon(const GsUnit& u, const std::vector<double>& rho, uint64_t seed, 
     default: break;
     }
     if (!(u.mode == 1 && !u.gon)) normalize_to(out, g);
-    double e = 0;
-    for (double a : out) e += a * a;
-    if (e > 0) last = out;
+    hist.insert(hist.begin(), out);
+    if (hist.size() > 4) hist.pop_back();
 }
 
 uint64_t unit_seed(uint64_t seed, size_t i) { return seed * 0x9E3779B97F4A7C15ull + i * 0xD1B54A32D192ED03ull + 1; }
@@ -226,7 +246,7 @@ bool gs_nonzero(const GsBlock& g) {
     return false;
 }
 
-void gs_syntax(SymIO& io, CMModel& m, GsBlock& g, int l, uint32_t pc) {
+void gs_syntax(SymIO& io, CMModel& m, GsBlock& g, int l, uint32_t pc, GsMem& mem) {
     const GsLayout& L = gs_layout(l);
     const int nu = static_cast<int>(L.idx.size());
     g.dc = io.sint(m, 300, pc, g.dc);
@@ -238,8 +258,11 @@ void gs_syntax(SymIO& io, CMModel& m, GsBlock& g, int l, uint32_t pc) {
     if (!io.enc) g.u.assign(nu, GsUnit{});
     else g.u.resize(nu);
     GsState st;
+    st.mem = &mem;
     for (int i = 0; i < used; ++i) unit_syntax(io, m, g.u[i], L.band[i], static_cast<int>(L.idx[i].size()), pc, st);
     for (int i = used; i < nu; ++i) g.u[i] = GsUnit{};
+    if (!io.cost)  // 実際の符号化/復号のときだけ次ブロック用の利得を更新 (レート推定では変えない)
+        for (int b = 0; b < 16; ++b) if (st.band_set[b]) { mem.qg[b] = st.band_qg[b]; mem.v[b] = true; }
 }
 
 void gs_reconstruct(const GsBlock& g, int l, uint64_t seed, double* xh) {
@@ -247,21 +270,24 @@ void gs_reconstruct(const GsBlock& g, int l, uint64_t seed, double* xh) {
     const int n = 1 << (2 * l);
     std::fill(xh, xh + n, 0.0);
     xh[0] = g.dc;
-    std::vector<double> last, v;
+    GsHist last;
+    std::vector<double> v;
     for (size_t i = 0; i < L.idx.size() && i < g.u.size(); ++i) {
         unit_recon(g.u[i], L.rho[i], unit_seed(seed, i), last, v);
         for (size_t k = 0; k < v.size(); ++k) xh[L.idx[i][k]] = v[k];
     }
 }
 
-void gs_encode(const double* x, int l, double lam, CMModel& m, uint32_t pc, uint64_t seed, GsBlock& out) {
+void gs_encode(const double* x, int l, double lam, CMModel& m, uint32_t pc, uint64_t seed, const GsMem& mem, GsBlock& out) {
     const GsLayout& L = gs_layout(l);
     const int nu = static_cast<int>(L.idx.size());
     out.u.assign(nu, GsUnit{});
     out.dc = static_cast<int32_t>(std::abs(x[0]) + 0.5);
     if (x[0] < 0) out.dc = -out.dc;
     GsState st;
-    std::vector<double> last, v, xu;
+    st.mem = &mem;
+    GsHist last;
+    std::vector<double> v, xu;
     auto rate = [&](GsUnit& u, int i, GsState s2) {
         double c = 0;
         SymIO io;
@@ -278,10 +304,10 @@ void gs_encode(const double* x, int l, double lam, CMModel& m, uint32_t pc, uint
         const uint64_t us = unit_seed(seed, static_cast<size_t>(i));
         GsUnit best;
         double bj = ex + lam * rate(best, i, st);
-        std::vector<double> best_last = last;
+        GsHist best_last = last;
         auto consider = [&](GsUnit u) {
             if (u.mode == 5) rate(u, i, st);  // 包絡補間の利得は構文側で導出される
-            std::vector<double> lt = last;
+            GsHist lt = last;
             unit_recon(u, L.rho[i], us, lt, v);
             double d = 0;
             for (int k = 0; k < lp; ++k) { const double e = xu[k] - v[k]; d += e * e; }
@@ -292,7 +318,7 @@ void gs_encode(const double* x, int l, double lam, CMModel& m, uint32_t pc, uint
         // 利得: 形状 ŝ に対する MSE 最適 ĝ = <x, ŝ/‖ŝ‖> を対数量子化
         auto with_gain = [&](GsUnit u) {
             if (u.mode == 1) { GsUnit z = u; z.gon = 0; consider(z); }
-            std::vector<double> lt = last;
+            GsHist lt = last;
             u.qg = 0;
             unit_recon(u, L.rho[i], us, lt, v);  // 利得 1 の形状
             double ip = 0;
@@ -343,8 +369,12 @@ void gs_encode(const double* x, int l, double lam, CMModel& m, uint32_t pc, uint
                 for (int k = 0; k < lp; ++k) u.sym[k] = xu[k] < 0;
                 with_gain(u);
             }
-            if (st.has_vec && !last.empty())  // 係数コピー + 並び替え (§5.6-2, §7.6-3)
-                for (int pm = 0; pm < 4; ++pm) { GsUnit u; u.mode = 4; u.perm = static_cast<uint8_t>(pm); with_gain(u); }
+            if (st.has_vec && !last.empty())  // 係数コピー (コピー元 4 候補 = 周波数領域コピー) + 並び替え (§5.6-2, §7.6-3/4)
+                for (int sc = 0; sc < std::min<int>(4, static_cast<int>(last.size())); ++sc)
+                    for (int pm = 0; pm < 4; ++pm) {
+                        GsUnit u; u.mode = 4; u.perm = static_cast<uint8_t>(pm); u.src = static_cast<uint8_t>(sc);
+                        with_gain(u);
+                    }
         }
         if (ex > 0) {  // ノイズ置換 (利得は RMS) と包絡補間 (§5.6-1, -3)
             GsUnit u; u.mode = 2; u.qg = qg_of(std::sqrt(ex) * 0.5);
