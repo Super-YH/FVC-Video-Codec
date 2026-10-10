@@ -466,8 +466,12 @@ int BlockCoder::merge_list(int x0, int y0, int w, int h, MotionInfo* out) const 
     if (x0 > tx0_ && y0 > ty0_) push(inter_.mf->at(x0 - 1, y0 - 1));
     MotionInfo g;
     g.dir = 1;
-    g.mvx[0] = static_cast<int16_t>(inter_.gmv_x);
-    g.mvy[0] = static_cast<int16_t>(inter_.gmv_y);
+    {
+        int gx, gy;
+        inter_.gmv_at(x0 + w / 2, y0 + h / 2, gx, gy);
+        g.mvx[0] = static_cast<int16_t>(gx);
+        g.mvy[0] = static_cast<int16_t>(gy);
+    }
     push(g);
     MotionInfo z;
     z.dir = 1;
@@ -484,8 +488,8 @@ void BlockCoder::mv_pred(int x0, int y0, int list, int ref, int& px, int& py) co
     if (y0 > ty0_ && try_mi(inter_.mf->at(x0, y0 - 1))) return;
     MotionInfo t;
     if (ref == 0 && temporal_cand(x0, y0, t) && try_mi(t)) return;
-    px = list == 0 ? inter_.gmv_x : 0;
-    py = list == 0 ? inter_.gmv_y : 0;
+    if (list == 0) inter_.gmv_at(x0, y0, px, py);
+    else px = py = 0;
 }
 
 int64_t BlockCoder::me_cost(int x0, int y0, int w, int h, const MotionInfo& mi) const {
@@ -548,7 +552,11 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
             };
             test_int((px + 2) >> 2, (py + 2) >> 2);
             test_int(0, 0);
-            test_int((inter_.gmv_x + 2) >> 2, (inter_.gmv_y + 2) >> 2);
+            {
+                int gx, gy;
+                inter_.gmv_at(x0 + w / 2, y0 + h / 2, gx, gy);
+                test_int((gx + 2) >> 2, (gy + 2) >> 2);
+            }
             for (int i = 0; i < nm; ++i)
                 if ((ml[i].dir >> list) & 1) test_int((ml[i].mvx[list] + 2) >> 2, (ml[i].mvy[list] + 2) >> 2);
             const int R = search_.me_range;

@@ -120,7 +120,9 @@ struct InterCtx {
     RefPlane l0[4], l1[4];
     MotionField* mf = nullptr;  // 輝度が書き、色差は読み取り専用
     int chroma_shift = 0;       // 色差プレーンの縮小 (420: 1)
-    int gmv_x = 0, gmv_y = 0;   // グローバル動き (1/4 輝度画素)
+    int gmv_x = 0, gmv_y = 0;   // グローバル動き (1/4 輝度画素, 画面中心での値)
+    GlobalModel gm;             // グローバル動きモデル (§7.2)。位置ごとの MV は gm.mv_at
+    void gmv_at(int x, int y, int& mx, int& my) const { gm.mv_at(x, y, mx, my); }
     // 時間方向候補: 同位置ピクチャ (L1[0] があればそれ、なければ L0[0]) の動きベクトル場
     const MotionField* col = nullptr;
     int col_poc = 0, cur_poc = 0;

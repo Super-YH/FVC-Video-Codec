@@ -504,6 +504,7 @@ struct FrameParams {
     // 符号器: グローバルパラメータのキャッシュ (COPY 判定と本符号化で共有)
     mutable bool gm_valid = false;
     mutable int gm_x = 0, gm_y = 0, gm_gain[3] = {64, 64, 64}, gm_off[3] = {0, 0, 0};
+    mutable GlobalModel gm_model;
     std::vector<int> ref_poc[2];
     Search search;             // 符号器のみ
     bool psy = false;          // 符号器のみ
@@ -617,6 +618,151 @@ void estimate_global_motion(const Plane& cur, const Plane& ref, int& gx, int& gy
     gx = fx * 4; gy = fy * 4;
 }
 
+// 小さな最小二乗 (正規方程式 + ガウス消去)。A: rows x n
+bool solve_ls(const std::vector<std::vector<double>>& A, const std::vector<double>& b, int n, std::vector<double>& x) {
+    std::vector<double> M(static_cast<size_t>(n) * (n + 1), 0.0);
+    for (size_t r = 0; r < A.size(); ++r)
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < n; ++j) M[i * (n + 1) + j] += A[r][i] * A[r][j];
+            M[i * (n + 1) + n] += A[r][i] * b[r];
+        }
+    for (int i = 0; i < n; ++i) M[i * (n + 1) + i] += 1e-9;
+    for (int c = 0; c < n; ++c) {
+        int piv = c;
+        for (int r = c + 1; r < n; ++r) if (std::abs(M[r * (n + 1) + c]) > std::abs(M[piv * (n + 1) + c])) piv = r;
+        if (std::abs(M[piv * (n + 1) + c]) < 1e-12) return false;
+        for (int k = 0; k <= n; ++k) std::swap(M[c * (n + 1) + k], M[piv * (n + 1) + k]);
+        for (int r = 0; r < n; ++r) {
+            if (r == c) continue;
+            const double f = M[r * (n + 1) + c] / M[c * (n + 1) + c];
+            for (int k = c; k <= n; ++k) M[r * (n + 1) + k] -= f * M[c * (n + 1) + k];
+        }
+    }
+    x.resize(n);
+    for (int i = 0; i < n; ++i) x[i] = M[i * (n + 1) + n] / M[i * (n + 1) + i];
+    return true;
+}
+
+// グローバル動きモデルの推定 (§7.2, informative):
+//  1/2 縮小画像の 8x8 ブロック (原寸 16x16) を並進候補の周りで探索 → 平坦ブロックを除いた動きベクトル群に
+//  相似/アフィン/射影を外れ値除去付き最小二乗で当てはめ、実際の補償 SAD (疎標本) が最小のモデルを選ぶ。
+GlobalModel estimate_global_model(const Plane& cur, const Plane& ref, int gx, int gy) {
+    GlobalModel tr;
+    tr.cx = cur.w / 2.0; tr.cy = cur.h / 2.0;
+    tr.tx = gx; tr.ty = gy;
+    auto down = [](const Plane& p) {
+        Plane o(std::max(1, p.w / 2), std::max(1, p.h / 2));
+        for (int y = 0; y < o.h; ++y)
+            for (int x = 0; x < o.w; ++x)
+                o.at(x, y) = (p.at(std::min(2 * x, p.w - 1), std::min(2 * y, p.h - 1)) + p.at(std::min(2 * x + 1, p.w - 1), std::min(2 * y, p.h - 1)) +
+                              p.at(std::min(2 * x, p.w - 1), std::min(2 * y + 1, p.h - 1)) + p.at(std::min(2 * x + 1, p.w - 1), std::min(2 * y + 1, p.h - 1)) + 2) >> 2;
+        return o;
+    };
+    const Plane c = down(cur), r = down(ref);
+    struct Pt { double u, v, dx, dy; };
+    std::vector<Pt> pts;
+    const int B = 8, R = 6;
+    for (int by = B; by + 2 * B <= c.h; by += B)
+        for (int bx = B; bx + 2 * B <= c.w; bx += B) {
+            double m = 0, var = 0;
+            for (int y = 0; y < B; ++y) for (int x = 0; x < B; ++x) m += c.at(bx + x, by + y);
+            m /= B * B;
+            for (int y = 0; y < B; ++y) for (int x = 0; x < B; ++x) { const double d = c.at(bx + x, by + y) - m; var += d * d; }
+            if (var / (B * B) < 25.0 * (1 << (2 * std::max(0, 0)))) continue;  // 平坦部は動きが不定
+            const double gcx = 2.0 * (bx + B / 2) - tr.cx, gcy = 2.0 * (by + B / 2) - tr.cy;
+            int mx, my;
+            tr.mv_at(gcx + tr.cx, gcy + tr.cy, mx, my);
+            const int px = static_cast<int>(std::lround(mx / 8.0)), py = static_cast<int>(std::lround(my / 8.0));
+            int64_t best = INT64_MAX, second = INT64_MAX;
+            int bdx = 0, bdy = 0;
+            for (int dy = py - R; dy <= py + R; ++dy)
+                for (int dx = px - R; dx <= px + R; ++dx) {
+                    if (bx + dx < 0 || by + dy < 0 || bx + dx + B > r.w || by + dy + B > r.h) continue;
+                    int64_t sad = 0;
+                    for (int y = 0; y < B; ++y)
+                        for (int x = 0; x < B; ++x) sad += std::abs(c.at(bx + x, by + y) - r.at(bx + dx + x, by + dy + y));
+                    if (sad < best) { second = best; best = sad; bdx = dx; bdy = dy; }
+                    else if (sad < second) second = sad;
+                }
+            if (best == INT64_MAX || second < best * 1.1) continue;  // 曖昧な一致 (繰り返し模様など) は捨てる
+            pts.push_back({gcx, gcy, 2.0 * bdx, 2.0 * bdy});
+        }
+    std::vector<GlobalModel> cands = {tr};
+    if (pts.size() >= 12) {
+        for (int type = 1; type <= 3; ++type) {
+            std::vector<char> use(pts.size(), 1);
+            std::vector<double> p;
+            bool ok = false;
+            for (int it = 0; it < 3; ++it) {
+                std::vector<std::vector<double>> A;
+                std::vector<double> b;
+                for (size_t i = 0; i < pts.size(); ++i) {
+                    if (!use[i]) continue;
+                    const Pt& q = pts[i];
+                    const double xp = q.u + q.dx, yp = q.v + q.dy;
+                    if (type == 1) {  // [A, B, Tx, Ty]
+                        A.push_back({q.u, q.v, 1, 0}); b.push_back(q.dx);
+                        A.push_back({q.v, -q.u, 0, 1}); b.push_back(q.dy);
+                    } else if (type == 2) {  // [A, B, Tx, C, D, Ty]
+                        A.push_back({q.u, q.v, 1, 0, 0, 0}); b.push_back(q.dx);
+                        A.push_back({0, 0, 0, q.u, q.v, 1}); b.push_back(q.dy);
+                    } else {  // [A, B, Tx, C, D, Ty, h31, h32]  (1+A)u + Bv + Tx - x'(h31 u + h32 v) = x'
+                        A.push_back({q.u, q.v, 1, 0, 0, 0, -xp * q.u, -xp * q.v}); b.push_back(xp - q.u);
+                        A.push_back({0, 0, 0, q.u, q.v, 1, -yp * q.u, -yp * q.v}); b.push_back(yp - q.v);
+                    }
+                }
+                const int n = type == 1 ? 4 : type == 2 ? 6 : 8;
+                if (static_cast<int>(A.size()) < 2 * n) break;
+                ok = solve_ls(A, b, n, p);
+                if (!ok) break;
+                GlobalModel g = tr;
+                g.type = type;
+                if (type == 1) { g.a = g.d = static_cast<int>(std::lround(p[0] * 65536)); g.b = static_cast<int>(std::lround(p[1] * 65536)); g.c = -g.b;
+                                 g.tx = static_cast<int>(std::lround(p[2] * 4)); g.ty = static_cast<int>(std::lround(p[3] * 4)); }
+                else { g.a = static_cast<int>(std::lround(p[0] * 65536)); g.b = static_cast<int>(std::lround(p[1] * 65536)); g.tx = static_cast<int>(std::lround(p[2] * 4));
+                       g.c = static_cast<int>(std::lround(p[3] * 65536)); g.d = static_cast<int>(std::lround(p[4] * 65536)); g.ty = static_cast<int>(std::lround(p[5] * 4));
+                       if (type == 3) { g.h31 = static_cast<int>(std::lround(p[6] * 16777216.0)); g.h32 = static_cast<int>(std::lround(p[7] * 16777216.0)); } }
+                for (int* v : {&g.a, &g.b, &g.c, &g.d, &g.h31, &g.h32}) *v = std::clamp(*v, -32767, 32767);
+                // 残差で外れ値を除外して再推定
+                std::vector<double> res;
+                for (size_t i = 0; i < pts.size(); ++i) {
+                    int mx, my;
+                    g.mv_at(pts[i].u + g.cx, pts[i].v + g.cy, mx, my);
+                    res.push_back(std::hypot(mx / 4.0 - pts[i].dx, my / 4.0 - pts[i].dy));
+                }
+                std::vector<double> sr;
+                for (size_t i = 0; i < res.size(); ++i) if (use[i]) sr.push_back(res[i]);
+                std::nth_element(sr.begin(), sr.begin() + sr.size() / 2, sr.end());
+                const double th = std::max(1.5, 2.5 * sr[sr.size() / 2]);
+                for (size_t i = 0; i < res.size(); ++i) use[i] = res[i] <= th;
+                if (it == 2) cands.push_back(g);
+            }
+        }
+    }
+    // 疎標本の補償 SAD で選択 (パラメータ数に応じた小さな罰則)
+    double best = 1e300;
+    GlobalModel bestg = tr;
+    for (const GlobalModel& g : cands) {
+        double sad = 0;
+        int64_t n = 0;
+        for (int by = 0; by + 8 <= cur.h; by += 16)
+            for (int bx = 0; bx + 8 <= cur.w; bx += 16) {
+                int mx, my;
+                g.mv_at(bx + 4, by + 4, mx, my);
+                const int ix = (mx + 2) >> 2, iy = (my + 2) >> 2;
+                for (int y = 0; y < 8; ++y)
+                    for (int x = 0; x < 8; ++x) {
+                        const int rx = std::clamp(bx + x + ix, 0, ref.w - 1), ry = std::clamp(by + y + iy, 0, ref.h - 1);
+                        sad += std::abs(cur.at(bx + x, by + y) - ref.at(rx, ry));
+                        ++n;
+                    }
+            }
+        sad = sad / std::max<int64_t>(1, n) * (1.0 + 0.004 * g.type);
+        if (sad < best) { best = sad; bestg = g; }
+    }
+    return bestg;
+}
+
 // フレームのペイロード (rANS) を符号化/復号。org==nullptr なら復号。
 void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const Frame* org, Frame& rec, CodecState& st,
                 TileStreams& ts, BlockUsage* usage = nullptr) {
@@ -634,12 +780,17 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             refs[l].push_back(f);
         }
     int gmv_x = 0, gmv_y = 0, gain_q[3] = {64, 64, 64}, offs[3] = {0, 0, 0};
+    GlobalModel gm;
+    gm.cx = info.width / 2.0; gm.cy = info.height / 2.0;
     if (inter) {
         if (io.w && fp.gm_valid) {
             gmv_x = fp.gm_x; gmv_y = fp.gm_y;
+            gm = fp.gm_model;
             for (int pi = 0; pi < 3; ++pi) { gain_q[pi] = fp.gm_gain[pi]; offs[pi] = fp.gm_off[pi]; }
         } else if (io.w) {
             estimate_global_motion(org->p[0], refs[0][0]->p[0], gmv_x, gmv_y);
+            gm = estimate_global_model(org->p[0], refs[0][0]->p[0], gmv_x, gmv_y);
+            gmv_x = gm.tx; gmv_y = gm.ty;
             for (int pi = 0; pi < 3; ++pi) {
                 // MC(ref0, gmv) と原画の線形回帰でゲイン/オフセット
                 const Plane& o = org->p[pi];
@@ -661,10 +812,33 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             }
             fp.gm_valid = true;
             fp.gm_x = gmv_x; fp.gm_y = gmv_y;
+            fp.gm_model = gm;
             for (int pi = 0; pi < 3; ++pi) { fp.gm_gain[pi] = gain_q[pi]; fp.gm_off[pi] = offs[pi]; }
         }
+        // ゲイン推定は並進で行う (上の回帰)。モデルの種類とパラメータを伝送
+        gm.type = static_cast<int>(io.uint(md.global, 4, 0, static_cast<uint32_t>(gm.type)));
+        if (gm.type > 3) throw std::runtime_error("corrupt stream: global model");
+        if (gm.type >= 1) {
+            gm.a = io.sint(md.global, 5, 0, gm.a);
+            gm.b = io.sint(md.global, 6, 0, gm.b);
+            if (gm.type == 1) { gm.d = gm.a; gm.c = -gm.b; }
+        }
+        if (gm.type >= 2) {
+            gm.c = io.sint(md.global, 7, 0, gm.c);
+            gm.d = io.sint(md.global, 8, 0, gm.d);
+        }
+        if (gm.type == 3) {
+            gm.h31 = io.sint(md.global, 9, 0, gm.h31);
+            gm.h32 = io.sint(md.global, 10, 0, gm.h32);
+        } else {
+            gm.h31 = gm.h32 = 0;
+        }
+        if (gm.type < 2 && gm.type == 0) gm.a = gm.b = gm.c = gm.d = 0;
+        for (int v : {gm.a, gm.b, gm.c, gm.d, gm.h31, gm.h32})
+            if (std::abs(v) > 32767) throw std::runtime_error("corrupt stream: global model params");
         gmv_x = io.sint(md.global, 0, 0, gmv_x);
         gmv_y = io.sint(md.global, 1, 0, gmv_y);
+        gm.tx = gmv_x; gm.ty = gmv_y;
         for (int pi = 0; pi < 3; ++pi) {
             gain_q[pi] = 64 + io.sint(md.global, 2, static_cast<uint32_t>(pi), gain_q[pi] - 64);
             offs[pi] = io.sint(md.global, 3, static_cast<uint32_t>(pi), offs[pi]);
@@ -695,6 +869,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             ic.mf = &mf;
             ic.chroma_shift = pi ? cs : 0;
             ic.gmv_x = gmv_x; ic.gmv_y = gmv_y;
+            ic.gm = gm;
             ic.cur_poc = fp.poc;
             for (int l = 0; l < 2; ++l)
                 for (size_t r = 0; r < fp.ref_poc[l].size() && r < 4; ++r) ic.ref_poc[l][r] = fp.ref_poc[l][r];
@@ -709,9 +884,24 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         }
         Plane out(w, h);
         if (fp.type == FrameType::Copy) {
-            // COPY: グローバル予測そのもの (§7.7)
-            MotionInfo mi; mi.dir = 1; mi.mvx[0] = static_cast<int16_t>(gmv_x); mi.mvy[0] = static_cast<int16_t>(gmv_y);
-            inter_predict(mi, ic.l0, nullptr, 0, 0, w, h, pi ? cs : 0, lo, hi, out.v.data());
+            // COPY: グローバル予測そのもの (§7.7)。並進以外は 8x8 輝度ブロックごとにモデルの動きで補償
+            if (gm.type == 0) {
+                MotionInfo mi; mi.dir = 1; mi.mvx[0] = static_cast<int16_t>(gmv_x); mi.mvy[0] = static_cast<int16_t>(gmv_y);
+                inter_predict(mi, ic.l0, nullptr, 0, 0, w, h, pi ? cs : 0, lo, hi, out.v.data());
+            } else {
+                const int sh = pi ? cs : 0, bsz = 8 >> sh;
+                std::vector<int32_t> blk(static_cast<size_t>(bsz) * bsz);
+                for (int by = 0; by < h; by += bsz)
+                    for (int bx = 0; bx < w; bx += bsz) {
+                        const int bw = std::min(bsz, w - bx), bh = std::min(bsz, h - by);
+                        int mx, my;
+                        gm.mv_at((bx << sh) + 4, (by << sh) + 4, mx, my);
+                        MotionInfo mi; mi.dir = 1; mi.mvx[0] = static_cast<int16_t>(mx); mi.mvy[0] = static_cast<int16_t>(my);
+                        inter_predict(mi, ic.l0, nullptr, bx, by, bw, bh, sh, lo, hi, blk.data());
+                        for (int y = 0; y < bh; ++y)
+                            for (int x = 0; x < bw; ++x) out.at(bx + x, by + y) = blk[y * bw + x];
+                    }
+            }
             rec.p[pi] = std::move(out);
             continue;
         }
@@ -924,10 +1114,14 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             *smf = mf;
         } else {
             smf->init(W, H);
-            if (fp.type == FrameType::Copy) {
-                MotionInfo g; g.dir = 1; g.mvx[0] = static_cast<int16_t>(gmv_x); g.mvy[0] = static_cast<int16_t>(gmv_y);
-                smf->fill(0, 0, W, H, g);
-            }
+            if (fp.type == FrameType::Copy)
+                for (int y = 0; y < H; y += 4)
+                    for (int x = 0; x < W; x += 4) {
+                        int mx, my;
+                        gm.mv_at(x + 2, y + 2, mx, my);
+                        MotionInfo g; g.dir = 1; g.mvx[0] = static_cast<int16_t>(mx); g.mvy[0] = static_cast<int16_t>(my);
+                        smf->fill(x, y, 4, 4, g);
+                    }
         }
         st.last_mf = smf;
         st.last_ref_poc[0] = fp.ref_poc[0];
@@ -1252,6 +1446,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         ++trials;
         fp.gm_valid = cp.gm_valid;
         fp.gm_x = cp.gm_x; fp.gm_y = cp.gm_y;
+        fp.gm_model = cp.gm_model;
         for (int pi = 0; pi < 3; ++pi) { fp.gm_gain[pi] = cp.gm_gain[pi]; fp.gm_off[pi] = cp.gm_off[pi]; }
         const double step = qp_step(fp.qp, info_.bit_depth);
         double se = 0;

@@ -1,5 +1,7 @@
 // FVC 内部: インター予測 (仕様 §7) — 動き補償、低次元 FIR、動きベクトル場
 #pragma once
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -37,6 +39,30 @@ struct MotionField {
     void fill(int x0, int y0, int w, int h, const MotionInfo& m) {
         for (int y = y0 / 4; y < (y0 + h) / 4; ++y)
             for (int x = x0 / 4; x < (x0 + w) / 4; ++x) mi[static_cast<size_t>(y) * w4 + x] = m;
+    }
+};
+
+// グローバル動きモデル (§7.2)。座標は画面中心 (cx, cy) 基準 u = x - cx, v = y - cy:
+//   x' = cx + ((1 + a) u + b v + t_x) / D,  y' = cy + (c u + (1 + d) v + t_y) / D,  D = 1 + h31 u + h32 v
+//   type 0: 並進 (パン), 1: 相似 (d = a, c = -b), 2: アフィン, 3: 射影
+//   t は 1/4 画素、a..d は Q16、h31/h32 は Q24 の整数で伝送する。
+struct GlobalModel {
+    int type = 0;
+    int tx = 0, ty = 0;
+    int a = 0, b = 0, c = 0, d = 0;
+    int h31 = 0, h32 = 0;
+    double cx = 0, cy = 0;
+    // 輝度位置 (x, y) の動きベクトル (1/4 画素)
+    void mv_at(double x, double y, int& mx, int& my) const {
+        const double u = x - cx, v = y - cy;
+        if (type == 0) { mx = tx; my = ty; return; }
+        const double A = a / 65536.0, B = b / 65536.0, C = c / 65536.0, Dd = d / 65536.0;
+        const double den = type == 3 ? 1.0 + h31 / 16777216.0 * u + h32 / 16777216.0 * v : 1.0;
+        const double xp = ((1 + A) * u + B * v + tx / 4.0) / den, yp = (C * u + (1 + Dd) * v + ty / 4.0) / den;
+        mx = static_cast<int>(std::lround(4.0 * (xp - u)));
+        my = static_cast<int>(std::lround(4.0 * (yp - v)));
+        mx = std::clamp(mx, -32000, 32000);
+        my = std::clamp(my, -32000, 32000);
     }
 };
 
