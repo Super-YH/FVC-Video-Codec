@@ -1024,7 +1024,7 @@ FrameParams params_from(const EncoderConfig& c) {
     t.inter_ns = !c.tune_psnr;
     fp.cdef = c.cdef >= 0 ? c.cdef != 0 : c.preset >= Preset::Medium;
     if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
-    t.gs = c.gs >= 0 ? c.gs != 0 : c.preset >= Preset::Slow;
+    t.gs = c.gs >= 0 ? c.gs != 0 : c.preset == Preset::Placebo;  // 実測: RD 混在で -0.03 dB (slow では時間だけ増える)
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
     // 実測: 2x2 は 1x1 より 4-7% 効率が落ちるため、medium 以上は 1x1 (速度より効率)
     const int dt = c.preset >= Preset::Medium ? 1 : 2;
