@@ -118,7 +118,7 @@ static void test_transform() {
                 inverse_2d(th, TxType::DCT2, c.data(), w, h, b.data());
                 double e = 0;
                 for (int i = 0; i < w * h; ++i) e = std::max(e, std::abs(a[i] - b[i]));
-                CHECK(e < 1e-8);
+                CHECK(e < 0.1);  // 逆変換は Q8 係数・Q14 基底の整数演算 (§13.3)。画素の丸め (0.5) より十分小さい
             }
         }
     // TNS 往復

@@ -30,7 +30,13 @@ const std::vector<int>& diag_scan(int log2s) {
     return cache[log2s];
 }
 
-double qp_step(int qp, int bit_depth) { return std::pow(2.0, (qp - 4) / 6.0) * (1 << (bit_depth - 8)); }
+// 量子化ステップ 2^((qp-4)/6) を libm に依らず決める (§13.3): 6 段の定数 x 2 の冪 (ldexp は厳密)
+double qp_step(int qp, int bit_depth) {
+    static constexpr double kPow6[6] = {1.0, 1.122462048309373, 1.2599210498948732, 1.4142135623730951, 1.5874010519681994, 1.7817974362806785};
+    const int e = qp - 4;
+    const int q = e >= 0 ? e / 6 : -((-e + 5) / 6), r = e - 6 * q;
+    return std::ldexp(kPow6[r], q) * (1 << (bit_depth - 8));
+}
 
 int32_t quant_dz(double c, double step, double rnd) {
     const int32_t q = static_cast<int32_t>(std::abs(c) / step + rnd);
