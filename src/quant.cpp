@@ -181,6 +181,7 @@ double pre_forward(PreNonlin t, double x, double a) {
     case PreNonlin::Power: return std::copysign(std::pow(std::abs(x), a), x);
     case PreNonlin::Asinh: return std::asinh(x / a);
     case PreNonlin::SignedLog: return std::copysign(std::log1p(std::abs(x) / a), x);
+    case PreNonlin::Pwl: return pwl_forward(kPwlDefault, x);
     }
     return x;
 }
@@ -191,8 +192,28 @@ double pre_inverse(PreNonlin t, double y, double a) {
     case PreNonlin::Power: return std::copysign(std::pow(std::abs(y), 1.0 / a), y);
     case PreNonlin::Asinh: return a * std::sinh(y);
     case PreNonlin::SignedLog: return std::copysign(a * std::expm1(std::abs(y)), y);
+    case PreNonlin::Pwl: return pwl_inverse(kPwlDefault, y);
     }
     return y;
+}
+
+// 規範既定 PWL: 小振幅は等倍、大振幅ほど圧縮 (傾き 1, 1/2, 1/4, 1/8)
+const PwlKnots kPwlDefault = {5, {0.0, 2.0, 6.0, 14.0, 30.0}, {0.0, 2.0, 4.0, 6.0, 8.0}};
+
+double pwl_forward(const PwlKnots& k, double x) {
+    const double a = std::abs(x);
+    int i = 1;
+    while (i < k.n - 1 && a > k.x[i]) ++i;
+    const double sl = (k.y[i] - k.y[i - 1]) / (k.x[i] - k.x[i - 1]);
+    return std::copysign(k.y[i - 1] + (a - k.x[i - 1]) * sl, x);
+}
+
+double pwl_inverse(const PwlKnots& k, double y) {
+    const double a = std::abs(y);
+    int i = 1;
+    while (i < k.n - 1 && a > k.y[i]) ++i;
+    const double sl = (k.x[i] - k.x[i - 1]) / (k.y[i] - k.y[i - 1]);
+    return std::copysign(k.x[i - 1] + (a - k.y[i - 1]) * sl, y);
 }
 
 }  // namespace fvc

@@ -750,6 +750,17 @@ void BlockCoder::quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) 
     }
     lf.last = -1;
     lf.nf = 0;
+    if (lf.qmode == 2) {
+        // 利得形状分離 + バンド/パーティション + パラメトリック補完 (§5.3–5.7)
+        lf.q.clear();
+        lf.tns_on = false;
+        std::vector<double> xs(n);
+        for (int i = 0; i < n; ++i) xs[i] = e[i] / step_;
+        CMModel& gm = md_->gs;
+        gs_encode(xs.data(), l, lambda_ / (step_ * step_), gm, plane_ ? 1u : 0u, gs_seed(x0, y0), lf.gs);
+        lf.last = gs_nonzero(lf.gs) ? 0 : -1;
+        return;
+    }
     if (lf.qmode == 0) {
         lf.q.assign(n, 0);
         for (int i = 0; i < n; ++i) {
@@ -792,7 +803,10 @@ void BlockCoder::reconstruct(const Leaf& lf, int x0, int y0, int l, const int32_
     std::vector<double> r(n, 0.0);
     if (lf.last >= 0 || lf.nf) {
         std::vector<double> e(n, 0.0), c(n);
-        if (lf.qmode == 0) {
+        if (lf.qmode == 2) {
+            gs_reconstruct(lf.gs, l, gs_seed(x0, y0), e.data());
+            for (int i = 0; i < n; ++i) e[i] *= step_;
+        } else if (lf.qmode == 0) {
             for (int i = 0; i <= lf.last; ++i) e[i] = lf.q[scan[i]] * step_;
             if (lf.nf) {
                 SplitMix64 rng(static_cast<uint64_t>(x0) * 0x10001ull + static_cast<uint64_t>(y0) * 0x9E37ull + plane_);
@@ -1109,8 +1123,10 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         std::copy(preds[ci].begin(), preds[ci].end(), pred.begin());
         const int nmts = (tools_.mts && search_.try_mts && is_luma() && s <= 32) ? (s <= 16 ? 9 : 5) : 1;
         for (int mt = 0; mt < nmts; ++mt)
-        for (int qm = 0; qm <= (tools_.e8 && search_.try_e8 ? 1 : 0); ++qm)
-            for (int tn = 0; tn <= (tools_.tns && search_.try_tns && s >= 8 ? 1 : 0); ++tn) {
+        for (int qm = 0; qm <= 2; ++qm)
+            for (int tn = 0; tn <= (tools_.tns && search_.try_tns && s >= 8 && qm == 0 ? 1 : 0); ++tn) {
+                if (qm == 1 && !(tools_.e8 && search_.try_e8)) continue;
+                if (qm == 2 && !(tools_.gs && md_ && !tools_.pred_only)) continue;
                 Leaf lf = base;
                 lf.qmode = qm;
                 lf.mts = mt;
@@ -1301,9 +1317,15 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         } else {
             lf.mts = 0;
         }
-        if (tools_.e8) lf.qmode = io.bit(md.e8, 0, L, pc, lf.qmode);
-        else lf.qmode = 0;
-        if (tools_.tns && s >= 8) {
+        if (tools_.e8 || tools_.gs) {
+            const int nzq = io.bit(md.e8, 0, L, pc, lf.qmode != 0);
+            if (!nzq) lf.qmode = 0;
+            else if (tools_.e8 && tools_.gs) lf.qmode = 1 + io.bit(md.e8, 12, L, pc, lf.qmode == 2);
+            else lf.qmode = tools_.e8 ? 1 : 2;
+        } else {
+            lf.qmode = 0;
+        }
+        if (tools_.tns && s >= 8 && lf.qmode != 2) {
             lf.tns_on = io.bit(md.tns, 0, L, pc, lf.tns_on);
             if (lf.tns_on) {
                 lf.tns.qbits = 4;
@@ -1319,7 +1341,12 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
             lf.tns_on = false;
         }
         const auto& scan = diag_scan(l);
-        if (lf.qmode == 0) {
+        if (lf.qmode == 2) {
+            if (lf.tns_on) throw std::runtime_error("corrupt stream: gs with tns");
+            gs_syntax(io, md.gs, lf.gs, l, pc);
+            lf.last = 0;
+            lf.nf = 0;
+        } else if (lf.qmode == 0) {
             lf.last = static_cast<int>(io.uintc(md.last, L, pc, static_cast<uint32_t>(lf.last)));
             if (lf.last >= n) throw std::runtime_error("corrupt stream: last");
             if (!io.enc) lf.q.assign(n, 0);
@@ -1478,6 +1505,7 @@ void BlockCoder::code_leaf(SymIO& io, Models& md, Leaf& lf, int x0, int y0, int 
             else usage_.intra += a;
             if (lf.tns_on) usage_.tns += a;
             if (lf.qmode == 1 && lf.last >= 0) usage_.e8 += a;
+            if (lf.qmode == 2 && lf.last >= 0) usage_.gs += a;
         } else if (lf.pt == 0 && lf.mode == kModeCfl) {
             usage_.cfl += a;
         }

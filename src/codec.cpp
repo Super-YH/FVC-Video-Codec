@@ -833,12 +833,12 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 if (io.enc) for (int t = 0; t < nt; ++t) ts.out.push_back(tw[t]->finish());
                 if (io.w && std::getenv("FVC_BITS")) {
                     Models sum;
-                    const char* names[] = {"split", "mode", "cbf", "last", "coef_y", "coef_c", "ibc", "cfl", "tns", "e8", "nf", "inter", "mvd", "dict", "aqp"};
+                    const char* names[] = {"split", "mode", "cbf", "last", "coef_y", "coef_c", "ibc", "cfl", "tns", "e8", "nf", "inter", "mvd", "dict", "aqp", "gs"};
                     for (int t = 0; t < nt; ++t) {
                         const CMModel* src[] = {&tmd[t]->split, &tmd[t]->mode, &tmd[t]->cbf, &tmd[t]->last, &tmd[t]->coef_y, &tmd[t]->coef_c,
                                                 &tmd[t]->ibc, &tmd[t]->cfl, &tmd[t]->tns, &tmd[t]->e8, &tmd[t]->nf, &tmd[t]->inter,
-                                                &tmd[t]->mvd, &tmd[t]->dict, &tmd[t]->aqp};
-                        for (int i = 0; i < 15; ++i)
+                                                &tmd[t]->mvd, &tmd[t]->dict, &tmd[t]->aqp, &tmd[t]->gs};
+                        for (int i = 0; i < 16; ++i)
                             std::fprintf(stderr, "[bits] plane=%d %-7s n0=%9.0f n1=%9.0f rest=%9.0f\n", pi, names[i], src[i]->stat_bits[0],
                                          src[i]->stat_bits[1], src[i]->stat_bits[2]);
                     }
@@ -1024,6 +1024,7 @@ FrameParams params_from(const EncoderConfig& c) {
     t.inter_ns = !c.tune_psnr;
     fp.cdef = c.cdef >= 0 ? c.cdef != 0 : c.preset >= Preset::Medium;
     if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
+    t.gs = c.gs >= 0 ? c.gs != 0 : c.preset >= Preset::Slow;
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
     // 実測: 2x2 は 1x1 より 4-7% 効率が落ちるため、medium 以上は 1x1 (速度より効率)
     const int dt = c.preset >= Preset::Medium ? 1 : 2;
@@ -1045,7 +1046,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>((fp.tile_cols - 1) | ((fp.tile_rows - 1) << 4)));
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
     put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u) |
-                  (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u));
+                  (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_uv(p, static_cast<uint32_t>(poc));
@@ -1080,6 +1081,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.band_ns = (f3 >> 3) & 1;
     fp.tools.inter_ns = (f3 >> 4) & 1;
     fp.cdef = (f3 >> 5) & 1;
+    fp.tools.gs = (f3 >> 6) & 1;
     if (fp.cqp_off < -12 || fp.cqp_off > 12) return false;
     for (int l = 0; l < 2; ++l) {
         const uint32_t n = br.u8();

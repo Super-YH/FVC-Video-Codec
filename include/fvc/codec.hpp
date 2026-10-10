@@ -20,7 +20,7 @@ struct EncoderConfig {
     Preset preset = Preset::Medium;
     bool psy = false;         // ノイズ補完/帯域ノイズ置換 (PSNR は下がるが質感保持)
     int ibc = -1;             // -1: プリセット依存, 0/1: 強制
-    int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1, rect = -1, tmvp = -1, alf = -1, mts = -1, cdef = -1;
+    int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1, rect = -1, tmvp = -1, alf = -1, mts = -1, cdef = -1, gs = -1;
     int keyint = 0;           // I フレーム間隔 (0: 先頭のみ)
     int bframes = -1;         // アンカー間の B 枚数 (階層 B, 0..15)。-1: プリセット依存
     int refs = -1;            // P の参照枚数 (1..4), -1: プリセット依存
@@ -46,12 +46,12 @@ struct BlockUsage {
     uint64_t intra = 0, inter = 0, ibc = 0, dict = 0;  // 予測種別
     uint64_t merge = 0, skip = 0, rect = 0, bi = 0;    // インターの内訳 (skip = マージかつ残差なし)
     uint64_t size[7] = {0, 0, 0, 0, 0, 0, 0};          // 4x4 .. 256x256 (log2 2..8)
-    uint64_t tns = 0, e8 = 0, cfl = 0, leaves = 0;
+    uint64_t tns = 0, e8 = 0, cfl = 0, leaves = 0, gs = 0;
     void add(const BlockUsage& o) {
         intra += o.intra; inter += o.inter; ibc += o.ibc; dict += o.dict;
         merge += o.merge; skip += o.skip; rect += o.rect; bi += o.bi;
         for (int i = 0; i < 7; ++i) size[i] += o.size[i];
-        tns += o.tns; e8 += o.e8; cfl += o.cfl; leaves += o.leaves;
+        tns += o.tns; e8 += o.e8; cfl += o.cfl; leaves += o.leaves; gs += o.gs;
     }
 };
 

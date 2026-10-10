@@ -52,7 +52,13 @@ private:
 };
 
 // 量子化前の非線形変換 (仕様 §4.5)。すべて単調・可逆。
-enum class PreNonlin : uint8_t { Identity = 0, Power = 1, Asinh = 2, SignedLog = 3 };
+enum class PreNonlin : uint8_t { Identity = 0, Power = 1, Asinh = 2, SignedLog = 3, Pwl = 4 };
+// 区分線形 (PWL, §5.7 type 4): 節点 (x_k, y_k), k=0..n-1 (x_0 = y_0 = 0、単調増加、n<=8)。最終区間の傾きで外挿。
+// pre_forward/pre_inverse の Pwl は規範既定節点 kPwlDefault を使う (a は無視)。
+struct PwlKnots { int n = 0; double x[8] = {}, y[8] = {}; };
+extern const PwlKnots kPwlDefault;
+double pwl_forward(const PwlKnots& k, double x);
+double pwl_inverse(const PwlKnots& k, double y);
 double pre_forward(PreNonlin t, double x, double a);
 double pre_inverse(PreNonlin t, double y, double a);
 

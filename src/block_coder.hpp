@@ -9,6 +9,7 @@
 #include "fvc/frame.hpp"
 #include "fvc/transform.hpp"
 #include "inter.hpp"
+#include "gs_coder.hpp"
 #include "fvc/codec.hpp"
 
 namespace fvc { class Dictionary; }
@@ -84,7 +85,7 @@ struct SymIO {
 
 struct Models {
     CMModel split, mode, cbf, last, coef_y, coef_c, band_ll, band_hi, lossless, l2, ibc, cfl, tns, e8, nf;
-    CMModel inter, mvd, dict, shape, global, band_mode, lf, aqp;
+    CMModel inter, mvd, dict, shape, global, band_mode, lf, aqp, gs;
 };
 
 const std::vector<int>& diag_scan(int log2s);
@@ -108,6 +109,7 @@ struct Tools {
     bool pred_only = false;   // 予測のみ (残差は別経路: 動画 PQMF)
     bool band_ns = false;     // 帯域の時間差分ノイズ置換 (心理視覚)
     bool inter_ns = false;    // インター残差なしブロックの高域ノイズ置換 (心理視覚)
+    bool gs = false;          // 利得形状分離・バンド/パーティション符号化 (§5.3–5.7)
 };
 
 // インター予測の文脈 (プレーン単位)
@@ -182,7 +184,8 @@ private:
         int xsrc = 0;
         int ns = 0;          // pt==4 時間方向・残差なし: ノイズ置換レベル 0..7 (包絡は参照帯域の振幅)        // pt==4: 0 = 帯域間 (ゲイン ±1..4 /4), 1 = 時間方向 (ゲイン 1..5 /4)       // pt==4: 帯域間予測ゲイン (±1..4)/4  // pt==3: サイズ別リスト内の位置, ゲイン (1/16)
         int mode = kModePlanar, alpha = 0, bvx = 0, bvy = 0;
-        int qmode = 0;  // 0: デッドゾーンスカラ, 1: E8 格子 VQ
+        int qmode = 0;  // 0: デッドゾーンスカラ, 1: E8 格子 VQ, 2: 利得形状 (GsBlock)
+        GsBlock gs;
         int mts = 0;    // 変換の組 (輝度, 4..32)
         bool tns_on = false;
         TnsFilter tns;
@@ -253,6 +256,9 @@ private:
     const Plane* tband_ = nullptr;
     const Plane* cband_ = nullptr;
     uint64_t noise_seed_ = 0;
+    uint64_t gs_seed(int x0, int y0) const {
+        return (noise_seed_ + 0x632BE59BD9B4E019ull) ^ (static_cast<uint64_t>(x0) << 32 | static_cast<uint64_t>(y0) << 4 | static_cast<uint64_t>(plane_));
+    }
     uint32_t cb_ctx(int x0, int y0, int s) const;
     bool ns_allowed(const Leaf& lf) const {
         return (tools_.band_ns && lf.pt == 4 && lf.xsrc == 1) || (tools_.inter_ns && lf.pt == 2 && plane_ == 0);
