@@ -282,12 +282,42 @@ void BlockCoder::intra_cfl(int x0, int y0, int s, int alpha, int32_t* pred) cons
         }
 }
 
+// OBMC (§7.3): 上・左の (符号化済み) インター近傍の動きで予測した値を、境界から離れるほど重みが 0 になる
+// 余弦窓で重ね合わせる。動きの異なるブロック境界の段差 (ブロック状の継ぎ目) を予測段階で消す。
+void BlockCoder::obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const {
+    if (!inter_.mf || s < 8) return;
+    const int ov = std::min(s / 2, 16);
+    int w[16];
+    for (int i = 0; i < ov; ++i) w[i] = static_cast<int>(std::lround(16.0 * (1.0 + std::cos(3.14159265358979 * (i + 0.5) / ov))));
+    std::vector<int32_t> nb(static_cast<size_t>(16) * 16);
+    const int W4 = inter_.mf->w4 * 4, H4 = inter_.mf->h4 * 4;
+    for (int side = 0; side < 2; ++side) {  // 0: 上, 1: 左
+        if (side == 0 ? (y0 <= ty0_ || y0 - 1 >= H4) : (x0 <= tx0_ || x0 - 1 >= W4)) continue;
+        for (int t = 0; t < s; t += 4) {
+            const int nx = side == 0 ? x0 + t : x0 - 1, ny = side == 0 ? y0 - 1 : y0 + t;
+            if (nx >= W4 || ny >= H4) continue;
+            const MotionInfo& m = inter_.mf->at(nx, ny);
+            if (m.dir == 0 || m == cur) continue;
+            const int bw = side == 0 ? 4 : ov, bh = side == 0 ? ov : 4;
+            const int bx = side == 0 ? x0 + t : x0, by = side == 0 ? y0 : y0 + t;
+            inter_predict(m, inter_.l0, inter_.l1, bx, by, bw, bh, 0, lo_, hi_, nb.data());
+            for (int y = 0; y < bh; ++y)
+                for (int x = 0; x < bw; ++x) {
+                    const int wi = w[side == 0 ? y : x];
+                    int32_t& p = pred[(by - y0 + y) * s + (bx - x0 + x)];
+                    p = (p * (64 - wi) + nb[y * bw + x] * wi + 32) >> 6;
+                }
+        }
+    }
+}
+
 void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) const {
     const int s = 1 << l;
     if (lf.pt == 2) {
         if (is_luma()) {
             if (lf.part == 0) {
                 inter_predict(lf.mi, inter_.l0, inter_.l1, x0, y0, s, s, 0, lo_, hi_, pred);
+                obmc(lf.mi, x0, y0, s, pred);
             } else {
                 // 長方形予測分割 (1: 上下 2NxN, 2: 左右 Nx2N)。変換は正方形のまま
                 const int pw = lf.part == 2 ? s / 2 : s, ph = lf.part == 1 ? s / 2 : s;
@@ -931,18 +961,34 @@ double BlockCoder::sse(int x0, int y0, int s) const {
     //   D = ||e_lp||² + w_hf ||e_hf||²,  w_hf = 1 / (1 + psy · σ²_org / Δ²)
     // 低域誤差 (ブロック化・構造の崩れ) は常に評価し、高域誤差はテクスチャ部でマスキングする。
     // 平坦部では w_hf ≈ 1 なのでモスキートノイズを抑え、テクスチャ部のノイズ再符号化 (ちらつき) を避ける。
+    // マスキングは局所的に: 4x4 セルごとの原画分散の「自身と上下左右セルの最小値」を使う。
+    // ブロック全体の分散だと、平坦部上の物体 (エッジ) までテクスチャと見なして構造の誤りを見逃す。
+    // 最小値をとるとエッジ (片側が平坦) はマスクされず、全方向に分散が大きい真のテクスチャだけがマスクされる。
     std::vector<double> err(static_cast<size_t>(s) * s);
-    double m = 0, v = 0;
     for (int y = 0; y < s; ++y)
-        for (int x = 0; x < s; ++x) {
-            err[y * s + x] = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y);
-            m += org_->at(x0 + x, y0 + y);
+        for (int x = 0; x < s; ++x) err[y * s + x] = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y);
+    const int c4 = std::max(1, s / 4);
+    std::vector<double> cv(static_cast<size_t>(c4) * c4, 0.0), wc(cv.size(), 1.0);
+    for (int cy = 0; cy < c4; ++cy)
+        for (int cx = 0; cx < c4; ++cx) {
+            const int n = std::min(4, s);
+            double m = 0, v = 0;
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x) m += org_->at(x0 + cx * 4 + x, y0 + cy * 4 + y);
+            m /= n * n;
+            for (int y = 0; y < n; ++y)
+                for (int x = 0; x < n; ++x) { const double d = org_->at(x0 + cx * 4 + x, y0 + cy * 4 + y) - m; v += d * d; }
+            cv[cy * c4 + cx] = v / (n * n);
         }
-    m /= s * s;
-    for (int y = 0; y < s; ++y)
-        for (int x = 0; x < s; ++x) { const double d = org_->at(x0 + x, y0 + y) - m; v += d * d; }
-    v /= s * s;
-    const double whf = 1.0 / (1.0 + search_.psy * v / (step_ * step_));
+    for (int cy = 0; cy < c4; ++cy)
+        for (int cx = 0; cx < c4; ++cx) {
+            double v = cv[cy * c4 + cx];
+            if (cx > 0) v = std::min(v, cv[cy * c4 + cx - 1]);
+            if (cx + 1 < c4) v = std::min(v, cv[cy * c4 + cx + 1]);
+            if (cy > 0) v = std::min(v, cv[(cy - 1) * c4 + cx]);
+            if (cy + 1 < c4) v = std::min(v, cv[(cy + 1) * c4 + cx]);
+            wc[cy * c4 + cx] = 1.0 / (1.0 + search_.psy * v / (step_ * step_));
+        }
     double lp = 0, hf = 0;
     auto at = [&](int x, int y) { return err[std::clamp(y, 0, s - 1) * s + std::clamp(x, 0, s - 1)]; };
     for (int y = 0; y < s; ++y)
@@ -951,10 +997,10 @@ double BlockCoder::sse(int x0, int y0, int s) const {
                               at(x - 1, y - 1) + at(x + 1, y - 1) + at(x - 1, y + 1) + at(x + 1, y + 1)) / 16.0;
             const double h = at(x, y) - l;
             lp += l * l;
-            hf += h * h;
+            hf += wc[std::min(y / 4, c4 - 1) * c4 + std::min(x / 4, c4 - 1)] * h * h;
         }
     (void)e;
-    return (lp + whf * hf) * cw;
+    return (lp + hf) * cw;
 }
 
 void BlockCoder::save(int x0, int y0, int s, std::vector<int32_t>& b) const {

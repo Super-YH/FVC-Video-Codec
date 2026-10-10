@@ -232,6 +232,7 @@ private:
     void mpm6(int x0, int y0, int* out) const;  // 6 候補 MPM (全角度モード時)
     void set_modes4(int x0, int y0, int s, int mode);
     void predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) const;
+    void obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const;
     void intra_angular(int x0, int y0, int s, int mode, int32_t* pred) const;
     bool coded_before(int px, int py, int x0, int y0) const;
     void intra_cfl(int x0, int y0, int s, int alpha, int32_t* pred) const;

@@ -15,13 +15,20 @@ constexpr int kBeta[52] = {0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0
 constexpr int kTc[54] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,  1,  1,  1,  1,  1,  1,  1, 1,
                          2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 6, 6, 7, 8, 9, 10, 11, 13, 14, 16, 18, 20, 22, 24};
 
+// QP > 51 (B 階層の高 QP) でもステップに比例して閾値を伸ばす (HEVC 表の外挿)
+int beta_of(int q) { q = std::clamp(q, 0, 75); return q <= 51 ? kBeta[q] : 64 + 2 * (q - 51); }
+int tc_of(int q) {
+    q = std::clamp(q, 0, 77);
+    return q <= 53 ? kTc[q] : static_cast<int>(std::lround(24.0 * std::exp2((q - 53) / 6.0)));
+}
+
 int bs_of(const EdgeInfo& e, const MotionField* mf, bool chroma, int chroma_shift, int ax, int ay, int bx, int by) {
     const size_t ia = static_cast<size_t>(ay / 4) * e.w4 + ax / 4, ib = static_cast<size_t>(by / 4) * e.w4 + bx / 4;
     if (e.leaf[ia] == e.leaf[ib]) return 0;
     const uint8_t fa = e.flags[ia], fb = e.flags[ib];
     if ((fa | fb) & 1) return 2;
-    if (chroma) return 0;  // 色差: イントラ境界のみ
-    if ((fa | fb) & 2) return 1;
+    if ((fa | fb) & 2) return 1;  // 残差のある境界 (色差も)
+    if (chroma) return 0;
     if (!mf) return 0;
     const int lax = std::min(ax << chroma_shift, mf->w4 * 4 - 1), lay = std::min(ay << chroma_shift, mf->h4 * 4 - 1);
     const int lbx = std::min(bx << chroma_shift, mf->w4 * 4 - 1), lby = std::min(by << chroma_shift, mf->h4 * 4 - 1);
@@ -36,9 +43,40 @@ int bs_of(const EdgeInfo& e, const MotionField* mf, bool chroma, int chroma_shif
 
 // 1 本の 4 画素エッジ区間 (P 側 p[-1..-4], Q 側 q[0..3])。get/set は区間内の行 k (0..3) と境界からのオフセット i で指す
 template <class Px>
-void filter_luma_segment(Px px, int beta, int tc, int32_t lo, int32_t hi) {
+void filter_luma_segment(Px px, int beta, int tc, int32_t lo, int32_t hi, int nlong) {
     auto P = [&](int k, int i) -> int32_t& { return px(k, -1 - i); };
     auto Q = [&](int k, int i) -> int32_t& { return px(k, i); };
+    // 長タップ (VVC 型): 両側が 16 画素以上の平坦なブロックなら境界から n 画素を線形ランプで滑らかにする
+    if (nlong >= 5) {
+        const int n = nlong;
+        auto flat = [&](int k) {
+            const int dp = std::abs(P(k, 2) - 2 * P(k, 1) + P(k, 0)), dq = std::abs(Q(k, 2) - 2 * Q(k, 1) + Q(k, 0));
+            const int sp = std::abs(P(k, 0) - P(k, 3)) + std::abs(P(k, 3) - P(k, n)), sq = std::abs(Q(k, 0) - Q(k, 3)) + std::abs(Q(k, 3) - Q(k, n));
+            return 2 * (dp + dq) < (beta >> 4) && sp + sq < ((3 * beta) >> 5) && std::abs(P(k, 0) - Q(k, 0)) < ((5 * tc + 1) >> 1);
+        };
+        if (flat(0) && flat(3)) {
+            // 重み f_i = 64 (2(n-i)-1) / 2n (n=7 で VVC の {59,...,5} と一致)、修正量上限 tt_i·tc/2
+            int f[15], tt[15];
+            for (int i = 0; i < n; ++i) {
+                f[i] = (64 * (2 * (n - i) - 1) + n) / (2 * n);
+                tt[i] = std::max(1, (6 * (n - i) + n / 2) / n);
+            }
+            for (int k = 0; k < 4; ++k) {
+                int32_t pv[16], qv[16];
+                for (int i = 0; i <= n; ++i) { pv[i] = P(k, i); qv[i] = Q(k, i); }
+                const int refP = (pv[n] + pv[n - 1] + 1) >> 1, refQ = (qv[n] + qv[n - 1] + 1) >> 1;
+                int sm = 0;
+                for (int i = 0; i < n; ++i) sm += pv[i] + qv[i];
+                const int refM = (sm + n) / (2 * n);
+                for (int i = 0; i < n; ++i) {
+                    const int lim = (tt[i] * tc) >> 1;
+                    P(k, i) = std::clamp(std::clamp((f[i] * refM + (64 - f[i]) * refP + 32) >> 6, pv[i] - lim, pv[i] + lim), lo, hi);
+                    Q(k, i) = std::clamp(std::clamp((f[i] * refM + (64 - f[i]) * refQ + 32) >> 6, qv[i] - lim, qv[i] + lim), lo, hi);
+                }
+            }
+            return;
+        }
+    }
     const int dp0 = std::abs(P(0, 2) - 2 * P(0, 1) + P(0, 0)), dq0 = std::abs(Q(0, 2) - 2 * Q(0, 1) + Q(0, 0));
     const int dp3 = std::abs(P(3, 2) - 2 * P(3, 1) + P(3, 0)), dq3 = std::abs(Q(3, 2) - 2 * Q(3, 1) + Q(3, 0));
     const int d = dp0 + dq0 + dp3 + dq3;
@@ -84,8 +122,8 @@ void deblock_plane(Plane& p, const EdgeInfo& e, const MotionField* mf, bool chro
                 if (dir == 1 && (ey == 0 || (ey & 7))) continue;
                 const int bs = dir == 0 ? bs_of(e, mf, chroma, chroma_shift, ex - 4, ey, ex, ey) : bs_of(e, mf, chroma, chroma_shift, ex, ey - 4, ex, ey);
                 if (bs == 0) continue;
-                const int beta = kBeta[std::clamp(qp + beta_off, 0, 51)] << bdsh;
-                const int tc = kTc[std::clamp(qp + 2 * (bs - 1) + tc_off, 0, 53)] << bdsh;
+                const int beta = beta_of(qp + beta_off) << bdsh;
+                const int tc = tc_of(qp + 2 * (bs - 1) + tc_off) << bdsh;
                 if (tc == 0) continue;
                 if (chroma) {
                     // 色差 (BS=2 のみ): p0, q0 のみ修正
@@ -100,10 +138,23 @@ void deblock_plane(Plane& p, const EdgeInfo& e, const MotionField* mf, bool chro
                     }
                     continue;
                 }
+                // 境界に垂直な方向のブロック長 (4x4 セル単位で同一葉が続く長さ)
+                auto run = [&](int cx, int cy, int dx, int dy) {
+                    const int32_t id = e.leaf[static_cast<size_t>(cy) * e.w4 + cx];
+                    int len = 0;
+                    while (len < 16 && cx >= 0 && cy >= 0 && cx < e.w4 && cy < e.h4 && e.leaf[static_cast<size_t>(cy) * e.w4 + cx] == id) {
+                        ++len; cx += dx; cy += dy;
+                    }
+                    return len * 4;
+                };
+                const int lp = dir == 0 ? run(ex / 4 - 1, ey / 4, -1, 0) : run(ex / 4, ey / 4 - 1, 0, -1);
+                const int lq = dir == 0 ? run(ex / 4, ey / 4, 1, 0) : run(ex / 4, ey / 4, 0, 1);
+                const int ml = std::min(lp, lq);
+                const int nlong = ml >= 64 ? 15 : ml >= 32 ? 7 : ml >= 16 ? 5 : 0;
                 if (dir == 0)
-                    filter_luma_segment([&](int k, int i) -> int32_t& { return p.at(ex + i, ey + k); }, beta, tc, lo, hi);
+                    filter_luma_segment([&](int k, int i) -> int32_t& { return p.at(ex + i, ey + k); }, beta, tc, lo, hi, nlong);
                 else
-                    filter_luma_segment([&](int k, int i) -> int32_t& { return p.at(ex + k, ey + i); }, beta, tc, lo, hi);
+                    filter_luma_segment([&](int k, int i) -> int32_t& { return p.at(ex + k, ey + i); }, beta, tc, lo, hi, nlong);
             }
     }
 }
@@ -148,16 +199,26 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
     LoopFilterParams lp;
     const Plane pre = R;
     Plane D = R;
-    // 9.1 デブロック (常時、オフセットは 0 を伝送)
-    lp.beta_off = io.sint(m, 0, 0, 0);
-    lp.tc_off = io.sint(m, 1, 0, 0);
-    if (std::abs(lp.beta_off) > 12 || std::abs(lp.tc_off) > 12) throw std::runtime_error("corrupt stream: deblock offsets");
-    deblock_plane(D, e, mf, chroma, chroma_shift, qp, bit_depth, lp.beta_off, lp.tc_off, lo, hi);
     auto sse = [&](const Plane& a) {
         double s = 0;
         for (size_t i = 0; i < a.v.size(); ++i) { const double d = a.v[i] - org->v[i]; s += d * d; }
         return s;
     };
+    // 9.1 デブロック: 符号器は強さオフセット (β, tc) を候補から最小 SSE で選ぶ
+    if (io.enc && org) {
+        double best = 1e300;
+        for (int bo : {0, 2, 4, 6})
+            for (int to : {-2, 0, 2, 4, 6}) {
+                Plane t = R;
+                deblock_plane(t, e, mf, chroma, chroma_shift, qp, bit_depth, bo, to, lo, hi);
+                const double s = sse(t);
+                if (s < best) { best = s; lp.beta_off = bo; lp.tc_off = to; D = std::move(t); }
+            }
+    }
+    lp.beta_off = io.sint(m, 0, 0, lp.beta_off);
+    lp.tc_off = io.sint(m, 1, 0, lp.tc_off);
+    if (std::abs(lp.beta_off) > 12 || std::abs(lp.tc_off) > 12) throw std::runtime_error("corrupt stream: deblock offsets");
+    if (!(io.enc && org)) deblock_plane(D, e, mf, chroma, chroma_shift, qp, bit_depth, lp.beta_off, lp.tc_off, lo, hi);
     // 9.2 周波数ゲイン: 符号器は μ 候補から最小 SSE を選ぶ
     Plane F;
     if (allow_freq) {
