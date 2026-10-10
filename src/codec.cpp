@@ -515,6 +515,7 @@ struct FrameParams {
     mutable bool gm_valid = false;
     mutable int gm_x = 0, gm_y = 0, gm_gain[3] = {64, 64, 64}, gm_off[3] = {0, 0, 0};
     mutable GlobalModel gm_model;
+    mutable int gm_hg[3] = {64, 64, 64};
     std::vector<int> ref_poc[2];
     Search search;             // 符号器のみ
     bool psy = false;          // 符号器のみ
@@ -834,14 +835,24 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             if (!f) throw std::runtime_error("missing reference picture");
             refs[l].push_back(f);
         }
-    int gmv_x = 0, gmv_y = 0, gain_q[3] = {64, 64, 64}, offs[3] = {0, 0, 0};
+    int gmv_x = 0, gmv_y = 0, gain_q[3] = {64, 64, 64}, offs[3] = {0, 0, 0}, hgain[3] = {64, 64, 64};
+    // 帯域別ゲイン (§7.2 band_gain): 参照の高域を hg/64 倍 (フォーカス変化・ぼけ/鮮鋭化の全面的な変化)
+    auto lowpass = [](const Plane& p) {
+        Plane o(p.w, p.h);
+        auto at = [&](int x, int y) { return p.at(std::clamp(x, 0, p.w - 1), std::clamp(y, 0, p.h - 1)); };
+        for (int y = 0; y < p.h; ++y)
+            for (int x = 0; x < p.w; ++x)
+                o.at(x, y) = (4 * at(x, y) + 2 * (at(x - 1, y) + at(x + 1, y) + at(x, y - 1) + at(x, y + 1)) + at(x - 1, y - 1) +
+                              at(x + 1, y - 1) + at(x - 1, y + 1) + at(x + 1, y + 1) + 8) >> 4;
+        return o;
+    };
     GlobalModel gm;
     gm.cx = info.width / 2.0; gm.cy = info.height / 2.0;
     if (inter) {
         if (io.w && fp.gm_valid) {
             gmv_x = fp.gm_x; gmv_y = fp.gm_y;
             gm = fp.gm_model;
-            for (int pi = 0; pi < 3; ++pi) { gain_q[pi] = fp.gm_gain[pi]; offs[pi] = fp.gm_off[pi]; }
+            for (int pi = 0; pi < 3; ++pi) { gain_q[pi] = fp.gm_gain[pi]; offs[pi] = fp.gm_off[pi]; hgain[pi] = fp.gm_hg[pi]; }
         } else if (io.w) {
             estimate_global_motion(org->p[0], refs[0][0]->p[0], gmv_x, gmv_y);
             gm = estimate_global_model(org->p[0], refs[0][0]->p[0], gmv_x, gmv_y);
@@ -864,11 +875,24 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 const int of = static_cast<int>(std::lround(mo - gq / 64.0 * mp));
                 gain_q[pi] = gq;
                 offs[pi] = std::abs(of) >= 1 ? of : 0;
+                // 高域ゲイン: 原画の高域を予測の高域へ回帰
+                {
+                    Plane pp(o.w, o.h);
+                    pp.v.assign(pr.begin(), pr.end());
+                    const Plane pl = lowpass(pp), ol = lowpass(o);
+                    double num = 0, den = 0;
+                    for (size_t i = 0; i < pr.size(); ++i) {
+                        const double hp = pr[i] - pl.v[i], ho = o.v[i] - ol.v[i];
+                        num += hp * ho; den += hp * hp;
+                    }
+                    const int hq = den > 0 ? std::clamp(static_cast<int>(std::lround(num / den * 64.0)), 0, 128) : 64;
+                    hgain[pi] = std::abs(hq - 64) > 4 ? hq : 64;
+                }
             }
             fp.gm_valid = true;
             fp.gm_x = gmv_x; fp.gm_y = gmv_y;
             fp.gm_model = gm;
-            for (int pi = 0; pi < 3; ++pi) { fp.gm_gain[pi] = gain_q[pi]; fp.gm_off[pi] = offs[pi]; }
+            for (int pi = 0; pi < 3; ++pi) { fp.gm_gain[pi] = gain_q[pi]; fp.gm_off[pi] = offs[pi]; fp.gm_hg[pi] = hgain[pi]; }
         }
         // ゲイン推定は並進で行う (上の回帰)。モデルの種類とパラメータを伝送
         gm.type = static_cast<int>(io.uint(md.global, 4, 0, static_cast<uint32_t>(gm.type)));
@@ -897,12 +921,15 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         for (int pi = 0; pi < 3; ++pi) {
             gain_q[pi] = 64 + io.sint(md.global, 2, static_cast<uint32_t>(pi), gain_q[pi] - 64);
             offs[pi] = io.sint(md.global, 3, static_cast<uint32_t>(pi), offs[pi]);
+            hgain[pi] = 64 + io.sint(md.global, 11, static_cast<uint32_t>(pi), hgain[pi] - 64);
+            if (hgain[pi] < 0 || hgain[pi] > 128) throw std::runtime_error("corrupt stream: band gain");
             if (gain_q[pi] < 0 || gain_q[pi] > 256 || std::abs(gmv_x) > 32000 || std::abs(gmv_y) > 32000)
                 throw std::runtime_error("corrupt stream: global params");
         }
     }
     MotionField mf;
     Plane luma_rec;
+    Plane fref;  // 帯域別ゲインを適用した参照 (プレーンごとに作り直す)
     for (int pi = 0; pi < 3; ++pi) {
         const int w = pi ? info.chroma_w() : info.width, h = pi ? info.chroma_h() : info.height;
         int32_t lo, hi;
@@ -917,6 +944,15 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 ic.nref[l] = static_cast<int>(refs[l].size());
                 RefPlane* arr = l ? ic.l1 : ic.l0;
                 for (size_t r = 0; r < refs[l].size() && r < 4; ++r) arr[r].p = &refs[l][r]->p[pi];
+            }
+            if (hgain[pi] != 64) {
+                // L0 先頭参照を帯域別ゲインで変形したもの (低域そのまま + 高域 hg/64 倍)
+                const Plane& rp = refs[0][0]->p[pi];
+                const Plane lp = lowpass(rp);
+                fref = rp;
+                for (size_t i = 0; i < fref.v.size(); ++i)
+                    fref.v[i] = std::clamp(lp.v[i] + static_cast<int32_t>((static_cast<int64_t>(hgain[pi]) * (rp.v[i] - lp.v[i]) + 32) >> 6), lo, hi);
+                ic.l0[0].p = &fref;
             }
             ic.l0[0].gain_q = gain_q[pi];
             ic.l0[0].off = offs[pi];
@@ -1512,6 +1548,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         fp.gm_valid = cp.gm_valid;
         fp.gm_x = cp.gm_x; fp.gm_y = cp.gm_y;
         fp.gm_model = cp.gm_model;
+        for (int pi = 0; pi < 3; ++pi) fp.gm_hg[pi] = cp.gm_hg[pi];
         for (int pi = 0; pi < 3; ++pi) { fp.gm_gain[pi] = cp.gm_gain[pi]; fp.gm_off[pi] = cp.gm_off[pi]; }
         const double step = qp_step(fp.qp, info_.bit_depth);
         double se = 0;
