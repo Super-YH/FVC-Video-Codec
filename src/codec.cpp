@@ -177,6 +177,143 @@ void code_bands(SymIO& io, Models& md, int pqmf_log2, const Plane* org, Plane& r
     for (size_t i = 0; i < y.size(); ++i) rec.v[i] = std::clamp(static_cast<int32_t>(std::lround(y[i])) + off, lo, hi);
 }
 
+// ---------------- 動画の帯域符号化 (§3, §7.5) ----------------
+// 予測画像 P の帯域 P_k を時間方向予測として、帯域ブロック (8x8 帯域標本) ごとに
+//   pred = g_t · P_k + g_c · T_s(R_j - P_j)     (R_j: 現フレームで符号化済みの隣接帯域 j の再構成)
+// を探索する。g_t ∈ {0, .5, .75, 1, 1.25}, g_c ∈ {-4..4}/4, T_s は鏡像 + シフト (±1 帯域標本, 9 通り)。
+// 残差は RD でスキップ (係数なし) または帯域間文脈つきで符号化する。
+void code_bands_video(SymIO& io, Models& md, int pqmf_log2, const Plane* org, const Plane& P, Plane& rec, double step,
+                      double lambda, int32_t lo, int32_t hi) {
+    const int M = 1 << pqmf_log2, W = rec.w, H = rec.h, bw = W / M, bh = H / M;
+    Pqmf2D fb(M, M);
+    const int32_t off = (lo + hi + 1) / 2;
+    std::vector<std::vector<double>> pb, xb;
+    {
+        std::vector<double> t(static_cast<size_t>(W) * H);
+        for (size_t i = 0; i < t.size(); ++i) t[i] = P.v[i] - off;
+        fb.analyze(t, W, H, pb);
+        if (io.enc) {
+            for (size_t i = 0; i < t.size(); ++i) t[i] = org->v[i] - off;
+            fb.analyze(t, W, H, xb);
+        }
+    }
+    std::vector<std::vector<double>> rb(M * M, std::vector<double>(static_cast<size_t>(bw) * bh, 0.0));
+    std::vector<std::vector<int32_t>> qs(M * M, std::vector<int32_t>(static_cast<size_t>(bw) * bh, 0));
+    constexpr int kB = 8;
+    constexpr double kGt[5] = {0.0, 0.5, 0.75, 1.0, 1.25};
+    const int nbx = (bw + kB - 1) / kB, nby = (bh + kB - 1) / kB;
+    for (int ky = 0; ky < M; ++ky)
+        for (int kx = 0; kx < M; ++kx) {
+            const int k = ky * M + kx;
+            const double nrm = fb.band_norm(kx, ky);
+            const double st = step / nrm * (1.0 + 0.08 * (kx + ky));
+            const double lam = lambda / (nrm * nrm);  // 帯域領域の SSE と画素領域の SSE の換算
+            const int rk = kx > 0 ? k - 1 : (ky > 0 ? k - M : -1);
+            const bool horiz = kx > 0;
+            // 参照帯域の再構成残差 (鏡像補正つき)、シフト s ∈ [0,9)
+            auto cref = [&](int x, int y, int sh) {
+                const int xx = std::clamp(x + (sh % 3) - 1, 0, bw - 1), yy = std::clamp(y + (sh / 3) - 1, 0, bh - 1);
+                const size_t i = static_cast<size_t>(yy) * bw + xx;
+                const double v = rb[rk][i] - pb[rk][i];
+                return ((horiz ? xx : yy) & 1) ? -v : v;
+            };
+            const double rnd = std::max(0.18, 1.0 / 3.0 - 0.02 * (kx + ky));
+            int prev_gt = 3, prev_gc = 0;
+            for (int by = 0; by < nby; ++by)
+                for (int bx = 0; bx < nbx; ++bx) {
+                    const int x0 = bx * kB, y0 = by * kB, x1 = std::min(bw, x0 + kB), y1 = std::min(bh, y0 + kB);
+                    int gt = 3, gc = 0, sh = 4;
+                    std::vector<double> pr(static_cast<size_t>(kB) * kB, 0.0);
+                    auto build = [&](int g1, int g2, int s2) {
+                        for (int y = y0; y < y1; ++y)
+                            for (int x = x0; x < x1; ++x) {
+                                double v = kGt[g1] * pb[k][static_cast<size_t>(y) * bw + x];
+                                if (g2 && rk >= 0) v += g2 / 4.0 * cref(x, y, s2);
+                                pr[(y - y0) * kB + (x - x0)] = v;
+                            }
+                    };
+                    if (io.enc) {
+                        // 予測パラメータの探索 (残差エネルギー + λ·副情報)
+                        double best = 1e300;
+                        for (int g1 = 0; g1 < 5; ++g1)
+                            for (int s2 = 0; s2 < (rk >= 0 ? 9 : 1); ++s2)
+                                for (int g2 = (rk >= 0 ? -4 : 0); g2 <= (rk >= 0 ? 4 : 0); ++g2) {
+                                    if (g2 == 0 && s2 != 4) continue;
+                                    build(g1, g2, s2);
+                                    double e = 0;
+                                    for (int y = y0; y < y1; ++y)
+                                        for (int x = x0; x < x1; ++x) {
+                                            const double d = xb[k][static_cast<size_t>(y) * bw + x] - pr[(y - y0) * kB + (x - x0)];
+                                            e += d * d;
+                                        }
+                                    const double side = (g1 == prev_gt ? 1.0 : 3.0) + (g2 == prev_gc ? 1.0 : 4.0) + (g2 ? 3.0 : 0.0);
+                                    const double j = e + lam * side;
+                                    if (j < best) { best = j; gt = g1; gc = g2; sh = s2; }
+                                }
+                    }
+                    const uint32_t bc = static_cast<uint32_t>(std::min(kx + ky, 15));
+                    gt = static_cast<int>(io.uint(md.band_mode, 4, bc | (static_cast<uint32_t>(prev_gt) << 4), static_cast<uint32_t>(gt)));
+                    if (gt > 4) throw std::runtime_error("corrupt stream: band gt");
+                    if (rk >= 0) {
+                        gc = prev_gc + io.sint(md.band_mode, 5, bc, gc - prev_gc);
+                        if (gc < -4 || gc > 4) throw std::runtime_error("corrupt stream: band gc");
+                        if (gc) {
+                            sh = static_cast<int>(io.uint(md.band_mode, 6, bc, static_cast<uint32_t>(sh)));
+                            if (sh > 8) throw std::runtime_error("corrupt stream: band shift");
+                        } else {
+                            sh = 4;
+                        }
+                    } else {
+                        gc = 0;
+                    }
+                    prev_gt = gt; prev_gc = gc;
+                    build(gt, gc, sh);
+                    // 残差の量子化 (符号器) とスキップ判定
+                    std::vector<int32_t> q(static_cast<size_t>(kB) * kB, 0);
+                    int skip = 1;
+                    if (io.enc) {
+                        double e_skip = 0, e_code = 0, bits = 2.0;
+                        for (int y = y0; y < y1; ++y)
+                            for (int x = x0; x < x1; ++x) {
+                                const int li = (y - y0) * kB + (x - x0);
+                                const double t = xb[k][static_cast<size_t>(y) * bw + x] - pr[li];
+                                q[li] = quant_dz(t, st, rnd);
+                                const double d = t - q[li] * st;
+                                e_skip += t * t;
+                                e_code += d * d;
+                                bits += q[li] ? 2.0 + 2.0 * std::log2(1.0 + std::abs(q[li])) : 0.4;
+                            }
+                        bool any = false;
+                        for (int32_t v : q) any |= v != 0;
+                        skip = !any || e_skip <= e_code + lam * bits;
+                    }
+                    skip = io.bit(md.band_mode, 7, bc, static_cast<uint32_t>(gt), skip);
+                    for (int y = y0; y < y1; ++y)
+                        for (int x = x0; x < x1; ++x) {
+                            const size_t i = static_cast<size_t>(y) * bw + x;
+                            const int li = (y - y0) * kB + (x - x0);
+                            int32_t v = 0;
+                            if (!skip) {
+                                const auto& qk = qs[k];
+                                const int32_t qw = x ? qk[i - 1] : 0, qn = y ? qk[i - bw] : 0, qnw = (x && y) ? qk[i - bw - 1] : 0;
+                                const int32_t qne = (y && x + 1 < bw) ? qk[i - bw + 1] : 0;
+                                int cross = 0;
+                                if (kx > 0) cross += std::abs(qs[k - 1][i]);
+                                if (ky > 0) cross += std::abs(qs[k - M][i]);
+                                const uint32_t a = static_cast<uint32_t>(std::min(std::abs(qw) + std::abs(qn) + std::abs(qnw) + std::abs(qne), 15)) |
+                                                   (static_cast<uint32_t>(std::min(cross, 7)) << 4);
+                                v = io.sint(md.band_hi, a, bc | 64u, io.enc ? q[li] : 0);
+                            }
+                            qs[k][i] = v;
+                            rb[k][i] = pr[li] + v * st;
+                        }
+                }
+        }
+    std::vector<double> y;
+    fb.synthesize(rb, W, H, y);
+    for (size_t i = 0; i < y.size(); ++i) rec.v[i] = std::clamp(static_cast<int32_t>(std::lround(y[i])) + off, lo, hi);
+}
+
 // ---------------- ロスレス層 ----------------
 // lossy=false: 原画を MED 予測で直接符号化。lossy=true: e = X - R (L2 残差) を符号化。
 void code_lossless(SymIO& io, Models& md, int plane, int w, int h, const Plane* org, Plane& rec, bool lossy, int32_t mid) {
@@ -591,13 +728,10 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 if (use_shapes)
                     for (size_t i = 0; i < R.v.size(); ++i) R.v[i] = std::clamp(R.v[i] + S.v[i], lo, hi);
                 if (btools.pred_only) {
-                    // 予測残差 E = X - P を PQMF 帯域分解し、帯域間相関つき帯域符号化で符号化
-                    const int32_t range = hi - lo;
-                    Plane E, Eh(W, H, 0);
-                    if (org) { E = Plane(W, H); for (size_t i = 0; i < E.v.size(); ++i) E.v[i] = opad.v[i] - R.v[i]; }
-                    code_bands(io, md, fp.pqmf_log2, org ? &E : nullptr, Eh, step, 1.0 / 3.0, -range, range, fp.band_tools,
-                               fp.psy, static_cast<uint64_t>(fp.poc) * 3 + pi);
-                    for (size_t i = 0; i < R.v.size(); ++i) R.v[i] = std::clamp(R.v[i] + Eh.v[i], lo, hi);
+                    // 帯域領域の予測符号化: P (動き補償予測) の帯域を時間方向予測とし、
+                    // 帯域ブロックごとにゲイン・帯域間予測・スキップを探索して符号化
+                    const Plane P = R;
+                    code_bands_video(io, md, fp.pqmf_log2, org ? &opad : nullptr, P, R, step, lambda, lo, hi);
                 }
                 if (fp.lf) {
                     code_loop_filter(io, md.lf, R, org ? &opad : nullptr, einfo, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, pqp,
