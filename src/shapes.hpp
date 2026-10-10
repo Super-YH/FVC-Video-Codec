@@ -21,7 +21,8 @@ struct Shape {
 // 図形を加算描画 (S += Σ m_s v_s)
 void render_shapes(const std::vector<Shape>& shapes, Plane& S);
 // 図形リストの構文: 個数 + 直前図形からの差分 (§4.3)
-void code_shapes(SymIO& io, CMModel& m, std::vector<Shape>& shapes);
+// tref (前フレームの図形リスト) があれば、i 番目の図形を tref[i] からの差分 (動き + パラメータ変化) で送れる (§7.4)
+void code_shapes(SymIO& io, CMModel& m, std::vector<Shape>& shapes, const std::vector<Shape>* tref = nullptr);
 // 符号器: 原画 (平均除去) にガウス図形を貪欲に当てはめる
 std::vector<Shape> fit_shapes(const Plane& org, int max_shapes);
 double shapes_bits_estimate(const std::vector<Shape>& shapes);

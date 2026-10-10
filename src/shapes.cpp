@@ -40,7 +40,7 @@ void render_shapes(const std::vector<Shape>& shapes, Plane& S) {
     }
 }
 
-void code_shapes(SymIO& io, CMModel& m, std::vector<Shape>& shapes) {
+void code_shapes(SymIO& io, CMModel& m, std::vector<Shape>& shapes, const std::vector<Shape>* tref) {
     const uint32_t n = io.uint(m, 0, 0, static_cast<uint32_t>(shapes.size()));
     if (n > 4096) throw std::runtime_error("corrupt stream: shape count");
     if (!io.w) shapes.assign(n, Shape{});
@@ -48,6 +48,21 @@ void code_shapes(SymIO& io, CMModel& m, std::vector<Shape>& shapes) {
     prev.cx = prev.cy = 0;
     for (uint32_t i = 0; i < n; ++i) {
         Shape& s = shapes[i];
+        // 時間方向: 前フレームの同番号図形からの差分 (図形の動き §7.4)
+        if (tref && i < tref->size()) {
+            const Shape& t = (*tref)[i];
+            const int temporal = io.bit(m, 12, 0, 0, s.type == t.type && s.l1 == t.l1 && s.l2 == t.l2 && s.theta == t.theta && s.soft == t.soft);
+            if (temporal) {
+                s.type = t.type; s.l1 = t.l1; s.l2 = t.l2; s.theta = t.theta; s.soft = t.soft;
+                s.cx = t.cx + io.sint(m, 13, 0, s.cx - t.cx);
+                s.cy = t.cy + io.sint(m, 14, 0, s.cy - t.cy);
+                s.amp = t.amp + io.sint(m, 15, 0, s.amp - t.amp);
+                s.gx = t.gx + io.sint(m, 16, 0, s.gx - t.gx);
+                s.gy = t.gy + io.sint(m, 17, 0, s.gy - t.gy);
+                prev = s;
+                continue;
+            }
+        }
         // ref = 直前図形 (§4.3)。copy_flags: bit0 型+スケール+角度+ソフトネスが同一
         const int same = io.bit(m, 1, 0, 0, s.type == prev.type && s.l1 == prev.l1 && s.l2 == prev.l2 && s.theta == prev.theta && s.soft == prev.soft);
         if (same) {

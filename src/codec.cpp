@@ -565,6 +565,7 @@ struct CodecState {
     // 直前に符号化/復号したフレームの動き (code_frame が設定)
     std::shared_ptr<MotionField> last_mf;
     std::vector<int> last_ref_poc[2];
+    std::vector<Shape> last_shapes;  // 直前フレームの図形 (時間方向の図形予測 §7.4)
     void push(int poc, const Frame& f, bool anchor) {
         Picture pic;
         pic.poc = poc; pic.f = f; pic.anchor = anchor;
@@ -825,6 +826,10 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
     Models md;
     rec.p.resize(3);
     if (fp.dict_reset) st.dict.reset_dynamic();
+    // 時間方向の図形予測の参照は関数の入口で固定し、更新は最後に 1 回だけ (内部の試行符号化で状態がずれないように)
+    const std::vector<Shape> shapes_ref = st.last_shapes;
+    std::vector<Shape> shapes_new;
+    bool shapes_coded = false;
     const bool inter = fp.type != FrameType::I;
     const int cs = info.chroma == ChromaFormat::C420 ? 1 : 0;
     // 参照とグローバルパラメータ (§7.2)
@@ -1026,23 +1031,53 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 std::vector<Shape> shapes;
                 Plane S(W, H, 0);
                 bool use_shapes = false;
-                if (fp.shapes && pi == 0 && !inter) {
+                if (fp.shapes && pi == 0) {
                     if (io.w) {
-                        shapes = fit_shapes(opad, 32);
+                        // インターでは大域予測からの差分に当てはめる (動き補償で表せない局所的な明暗・形の変化)
+                        Plane fitsrc = opad;
+                        if (inter) {
+                            std::vector<int32_t> gp(static_cast<size_t>(W) * H);
+                            MotionInfo gmi; gmi.dir = 1; gmi.mvx[0] = static_cast<int16_t>(gmv_x); gmi.mvy[0] = static_cast<int16_t>(gmv_y);
+                            inter_predict(gmi, ic.l0, nullptr, 0, 0, W, H, 0, lo, hi, gp.data());
+                            for (size_t i = 0; i < fitsrc.v.size(); ++i) fitsrc.v[i] -= gp[i];
+                        }
+                        shapes = fit_shapes(fitsrc, inter ? 16 : 32);
+                        // 図形の追跡: 前フレームの図形と近いものは同じ番号に並べ替える (時間差分が小さくなる)
+                        if (inter && !shapes_ref.empty()) {
+                            std::vector<Shape> ord;
+                            std::vector<char> used(shapes.size(), 0);
+                            for (const Shape& t : shapes_ref) {
+                                int bi = -1; long long bd = 1LL << 40;
+                                for (size_t k = 0; k < shapes.size(); ++k) {
+                                    if (used[k]) continue;
+                                    const long long d = 1LL * (shapes[k].cx - t.cx) * (shapes[k].cx - t.cx) + 1LL * (shapes[k].cy - t.cy) * (shapes[k].cy - t.cy);
+                                    if (d < bd) { bd = d; bi = static_cast<int>(k); }
+                                }
+                                if (bi < 0) break;
+                                used[bi] = 1;
+                                ord.push_back(shapes[bi]);
+                            }
+                            for (size_t k = 0; k < shapes.size(); ++k) if (!used[k]) ord.push_back(shapes[k]);
+                            shapes.swap(ord);
+                        }
                         if (!shapes.empty()) {
                             render_shapes(shapes, S);
                             Plane d = opad;
                             for (size_t i = 0; i < d.v.size(); ++i) d.v[i] -= S.v[i];
                             Plane r1(W, H, 0), r2(W, H, 0);
-                            BlockCoder b1(&r1, &opad, nullptr, pi, lo, hi, step, lambda, fp.min_log2, fp.max_log2, fp.tools, fp.search);
-                            BlockCoder b2(&r2, &d, nullptr, pi, lo - hi, hi * 2, step, lambda, fp.min_log2, fp.max_log2, fp.tools, fp.search);
+                            BlockCoder b1(&r1, &opad, nullptr, pi, lo, hi, step, lambda, fp.min_log2, fp.max_log2, fp.tools, fp.search,
+                                          inter ? &ic : nullptr);
+                            BlockCoder b2(&r2, &d, nullptr, pi, lo - hi, hi * 2, step, lambda, fp.min_log2, fp.max_log2, fp.tools, fp.search,
+                                          inter ? &ic : nullptr);
                             double j1 = 0, j2 = lambda * shapes_bits_estimate(shapes);
                             for (int cy = 0; cy < H; cy += kCtu)
                                 for (int cx = 0; cx < W; cx += kCtu) { j1 += b1.rd_ctu(cx, cy, kCtu); j2 += b2.rd_ctu(cx, cy, kCtu); }
                             if (j2 >= j1) shapes.clear();
                         }
                     }
-                    code_shapes(io, md.shape, shapes);
+                    code_shapes(io, md.shape, shapes, inter ? &shapes_ref : nullptr);
+                    shapes_new = shapes;
+                    shapes_coded = true;
                     use_shapes = !shapes.empty();
                     S = Plane(W, H, 0);
                     if (use_shapes) render_shapes(shapes, S);
@@ -1223,6 +1258,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         st.last_ref_poc[0] = fp.ref_poc[0];
         st.last_ref_poc[1] = fp.ref_poc[1];
     }
+    if (shapes_coded) st.last_shapes = shapes_new;
     // 辞書更新 (ADD_FROM_RECON, §10.2): 符号器は輝度再構成の高テクスチャブロックを選ぶ
     if (fp.tools.dict && fp.type != FrameType::Copy) {
         std::vector<std::array<int, 3>> adds;  // x/8, y/8, size
@@ -1568,12 +1604,14 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         // 目標 SSIM: 種別ごとに前回 QP から探索し、条件を満たす最大 QP を選ぶ。
         // 試行ごとに辞書・動き情報の状態を戻し、採用した試行の状態を復元する。
         const Dictionary dict0 = st_->dict;
-        struct Trial { int qp; double ssim; std::vector<uint8_t> payload; Frame rec; Dictionary dict; std::shared_ptr<MotionField> mf;
+        const std::vector<Shape> sh0 = st_->last_shapes;
+        struct Trial { int qp; double ssim; std::vector<uint8_t> payload; Frame rec; Dictionary dict; std::vector<Shape> sh; std::shared_ptr<MotionField> mf;
                        std::vector<int> rp[2]; BlockUsage usage; };
         std::vector<Trial> tr;
         auto attempt = [&](int q) -> const Trial& {
             for (const Trial& t : tr) if (t.qp == q) return t;
             st_->dict = dict0;
+            st_->last_shapes = sh0;
             FrameParams par = fp;
             par.qp = q;
             apply_aqp(par);
@@ -1583,6 +1621,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
             ++trials;
             t.ssim = plane_ssim(f.p[0], t.rec.p[0], info_.bit_depth);
             t.dict = st_->dict;
+            t.sh = st_->last_shapes;
             t.mf = st_->last_mf;
             t.rp[0] = st_->last_ref_poc[0]; t.rp[1] = st_->last_ref_poc[1];
             t.usage = usage;
@@ -1616,6 +1655,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         payload = best->payload;
         rec = best->rec;
         st_->dict = best->dict;
+        st_->last_shapes = best->sh;
         st_->last_mf = best->mf;
         st_->last_ref_poc[0] = best->rp[0]; st_->last_ref_poc[1] = best->rp[1];
         usage = best->usage;
@@ -1626,6 +1666,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         // フレーム単位の道具 RD 試行 (I のみ): 稀にしか選ばれない道具はフラグの符号量で損をするため、
         // TNS/IBC/辞書/MTS を外した符号化と D + λR を比べ、小さい方を採る
         const Dictionary dict0 = st_->dict;
+        const std::vector<Shape> sh0 = st_->last_shapes;
         auto mf0 = st_->last_mf;
         const std::vector<int> rp0[2] = {st_->last_ref_poc[0], st_->last_ref_poc[1]};
         const double lam = 0.57 * std::pow(2.0, (fp.qp - 12) / 3.0) * std::pow(4.0, info_.bit_depth - 8);
@@ -1639,10 +1680,11 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         ++trials;
         const double j0 = jcost(payload, rec);
         const Dictionary dict1 = st_->dict;
+        const std::vector<Shape> sh1 = st_->last_shapes;
         auto mf1 = st_->last_mf;
         const std::vector<int> rp1[2] = {st_->last_ref_poc[0], st_->last_ref_poc[1]};
         const BlockUsage u1 = usage;
-        st_->dict = dict0; st_->last_mf = mf0; st_->last_ref_poc[0] = rp0[0]; st_->last_ref_poc[1] = rp0[1];
+        st_->dict = dict0; st_->last_shapes = sh0; st_->last_mf = mf0; st_->last_ref_poc[0] = rp0[0]; st_->last_ref_poc[1] = rp0[1];
         FrameParams lite = fp;
         lite.tools.tns = lite.tools.ibc = lite.tools.dict = lite.tools.mts = false;
         lite.search.try_tns = lite.search.try_mts = false;
@@ -1652,7 +1694,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         if (jcost(pl2, rec2) < j0) {
             payload = std::move(pl2); rec = std::move(rec2); fp = lite;
         } else {
-            st_->dict = dict1; st_->last_mf = mf1; st_->last_ref_poc[0] = rp1[0]; st_->last_ref_poc[1] = rp1[1];
+            st_->dict = dict1; st_->last_shapes = sh1; st_->last_mf = mf1; st_->last_ref_poc[0] = rp1[0]; st_->last_ref_poc[1] = rp1[1];
             usage = u1;
         }
         done = true;
