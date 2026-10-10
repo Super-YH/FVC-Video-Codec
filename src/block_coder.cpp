@@ -287,8 +287,11 @@ void BlockCoder::intra_cfl(int x0, int y0, int s, int alpha, int32_t* pred) cons
 void BlockCoder::obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const {
     if (!inter_.mf || s < 8) return;
     const int ov = std::min(s / 2, 16);
-    int w[16];
-    for (int i = 0; i < ov; ++i) w[i] = static_cast<int>(std::lround(16.0 * (1.0 + std::cos(3.14159265358979 * (i + 0.5) / ov))));
+    // 規範の整数重み: round(16 (1 + cos(π (i + 0.5) / ov))) を表で持つ (libm の差で復号が変わらないように)
+    static constexpr int kW4[4] = {31, 22, 10, 1};
+    static constexpr int kW8[8] = {32, 29, 25, 19, 13, 7, 3, 0};
+    static constexpr int kW16[16] = {32, 31, 30, 28, 26, 24, 21, 18, 14, 11, 8, 6, 4, 2, 1, 0};
+    const int* w = ov == 4 ? kW4 : ov == 8 ? kW8 : kW16;
     std::vector<int32_t> nb(static_cast<size_t>(16) * 16);
     const int W4 = inter_.mf->w4 * 4, H4 = inter_.mf->h4 * 4;
     for (int side = 0; side < 2; ++side) {  // 0: 上, 1: 左

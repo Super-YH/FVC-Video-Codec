@@ -7,6 +7,8 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
+  # 復号の決定性 (§13.3): 浮動小数点の縮約 (FMA 融合) と高速数学を禁止し、IEEE 倍精度の演算順を固定する
+  add_compile_options(-ffp-contract=off -fno-fast-math)
 endif()
 
 add_library(fvc src/color.cpp src/pqmf.cpp src/quant.cpp src/transform.cpp src/entropy.cpp
