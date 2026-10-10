@@ -880,13 +880,18 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     Plane pp(o.w, o.h);
                     pp.v.assign(pr.begin(), pr.end());
                     const Plane pl = lowpass(pp), ol = lowpass(o);
-                    double num = 0, den = 0;
+                    double num = 0, den = 0, e0 = 0;
                     for (size_t i = 0; i < pr.size(); ++i) {
                         const double hp = pr[i] - pl.v[i], ho = o.v[i] - ol.v[i];
                         num += hp * ho; den += hp * hp;
+                        const double e = o.v[i] - pr[i];
+                        e0 += e * e;
                     }
                     const int hq = den > 0 ? std::clamp(static_cast<int>(std::lround(num / den * 64.0)), 0, 128) : 64;
-                    hgain[pi] = std::abs(hq - 64) > 4 ? hq : 64;
+                    // 高域を (g-1) 倍足したときの SSE 減少 ≈ 2(g-1)Σhp·(o-p)_hf - (g-1)²Σhp²。全体の 2% 以上で採用
+                    const double g1 = hq / 64.0 - 1.0;
+                    const double gain = 2.0 * g1 * (num - den) - g1 * g1 * den;
+                    hgain[pi] = (std::abs(hq - 64) > 4 && gain > 0.02 * e0) ? hq : 64;
                 }
             }
             fp.gm_valid = true;
