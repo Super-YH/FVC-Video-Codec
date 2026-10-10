@@ -83,6 +83,7 @@ struct Tools {
     bool rect = false;        // 長方形予測分割 (2NxN / Nx2N)
     bool tmvp = false;        // 時間方向動きベクトル候補
     bool mts = false;         // 複数変換選択 (DCT2/DST7/DCT8)
+    bool pred_only = false;   // 予測のみ (残差は別経路: 動画 PQMF)
 };
 
 // インター予測の文脈 (プレーン単位)
@@ -197,6 +198,7 @@ private:
     bool ibc_valid(int rx, int ry, int s) const;
     void ibc_search(int x0, int y0, int s, int& bx, int& by) const;
     bool is_luma() const { return plane_ == 0; }
+    bool luma_motion_uniform(int x0, int y0, int s) const;
     static constexpr int kMaxMerge = 5;
     int merge_list(int x0, int y0, int w, int h, MotionInfo* out) const;
     bool temporal_cand(int x, int y, MotionInfo& out) const;

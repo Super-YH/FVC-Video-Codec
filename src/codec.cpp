@@ -518,6 +518,9 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     const int ly = std::min(((cy << a.shift) / kCtu), static_cast<int>(a.fp->aqp_map.size()) / a.fp->aqp_w - 1);
                     return a.fp->aqp_map[static_cast<size_t>(ly) * a.fp->aqp_w + lx];
                 };
+                // 動画での PQMF (§3, §7.5): P/B では予測のみをブロックで作り、残差を帯域符号化する
+                Tools btools = fp.tools;
+                btools.pred_only = inter && fp.pqmf_log2 > 0;
                 // タイル分割と並列符号化/復号
                 const int ncx = W / kCtu, ncy = H / kCtu;
                 const int tcn = std::clamp(fp.tile_cols, 1, ncx), trn = std::clamp(fp.tile_rows, 1, ncy);
@@ -536,7 +539,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                         rect[t] = {x0, y0, x1, y1};
                         coders[t] = std::make_unique<BlockCoder>(
                             &R, org ? (use_shapes ? &target : &opad) : nullptr, (pi > 0 && fp.tools.cfl) ? &lds : nullptr, pi, blo,
-                            bhi, step, lambda, fp.min_log2, fp.max_log2, fp.tools, fp.search, inter ? &ic : nullptr, &st.dict, x0,
+                            bhi, step, lambda, fp.min_log2, fp.max_log2, btools, fp.search, inter ? &ic : nullptr, &st.dict, x0,
                             y0, x1 - x0, y1 - y0, t << 24);
                         tmd[t] = std::make_unique<Models>();
                         if (fp.aqp) coders[t]->enable_aqp(pqp, info.bit_depth, aqp_lookup, &actx);
@@ -587,6 +590,15 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                         }
                 if (use_shapes)
                     for (size_t i = 0; i < R.v.size(); ++i) R.v[i] = std::clamp(R.v[i] + S.v[i], lo, hi);
+                if (btools.pred_only) {
+                    // 予測残差 E = X - P を PQMF 帯域分解し、帯域間相関つき帯域符号化で符号化
+                    const int32_t range = hi - lo;
+                    Plane E, Eh(W, H, 0);
+                    if (org) { E = Plane(W, H); for (size_t i = 0; i < E.v.size(); ++i) E.v[i] = opad.v[i] - R.v[i]; }
+                    code_bands(io, md, fp.pqmf_log2, org ? &E : nullptr, Eh, step, 1.0 / 3.0, -range, range, fp.band_tools,
+                               fp.psy, static_cast<uint64_t>(fp.poc) * 3 + pi);
+                    for (size_t i = 0; i < R.v.size(); ++i) R.v[i] = std::clamp(R.v[i] + Eh.v[i], lo, hi);
+                }
                 if (fp.lf) {
                     code_loop_filter(io, md.lf, R, org ? &opad : nullptr, einfo, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, pqp,
                                      info.bit_depth, step, lambda, fp.lf_freq, fp.lf_map, lo, hi);
@@ -827,6 +839,36 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
     auto apply_aqp = [&](FrameParams& fp) {
     fp.aqp = false;
     fp.aqp_map.clear();
+    // B フレーム: 参照との差が大きい (動きがある) CTU は QP を下げ、動物体の崩れを防ぐ
+    if (aqp_on && cfg_.lossy_layer && fp.type == FrameType::B && fp.pqmf_log2 == 0 && look.empty()) {
+        const Frame* r0 = st_->find(fp.ref_poc[0][0]);
+        const Frame* r1 = fp.ref_poc[1].empty() ? nullptr : st_->find(fp.ref_poc[1][0]);
+        const Plane& A = f.p[0];
+        const int aw = (A.w + kCtu - 1) / kCtu, ah = (A.h + kCtu - 1) / kCtu;
+        const double step = qp_step(fp.qp, info_.bit_depth);
+        fp.aqp_w = aw;
+        fp.aqp_map.assign(static_cast<size_t>(aw) * ah, 0);
+        bool any = false;
+        for (int cy = 0; cy < ah; ++cy)
+            for (int cx = 0; cx < aw; ++cx) {
+                // 双方向の同位置差分の小さい方 (動きのない側) を動きの指標とする
+                double d0 = 0, d1 = 0;
+                int64_t cnt = 0;
+                for (int y = cy * kCtu; y < std::min(A.h, (cy + 1) * kCtu); y += 2)
+                    for (int x = cx * kCtu; x < std::min(A.w, (cx + 1) * kCtu); x += 2) {
+                        d0 += std::abs(A.at(x, y) - r0->p[0].at(x, y));
+                        if (r1) d1 += std::abs(A.at(x, y) - r1->p[0].at(x, y));
+                        ++cnt;
+                    }
+                const double d = (r1 ? std::min(d0, d1) : d0) / std::max<int64_t>(1, cnt);
+                const int dq = d > 2.0 * step ? -3 : d > 1.0 * step ? -2 : d > 0.5 * step ? -1 : 0;
+                fp.aqp_map[static_cast<size_t>(cy) * aw + cx] = static_cast<int8_t>(dq);
+                any |= dq != 0;
+            }
+        fp.aqp = any;
+        if (!any) fp.aqp_map.clear();
+        return;
+    }
     if (aqp_on && cfg_.lossy_layer && !look.empty() && fp.pqmf_log2 == 0) {
         const Plane& A = f.p[0];
         const int aw = (A.w + kCtu - 1) / kCtu, ah = (A.h + kCtu - 1) / kCtu;

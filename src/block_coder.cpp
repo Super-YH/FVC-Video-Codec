@@ -628,6 +628,10 @@ void BlockCoder::rdoq(Leaf& lf, int l, const std::vector<double>& e) const {
 // ---------------- 量子化 / 再構成 ----------------
 void BlockCoder::quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) const {
     const int s = 1 << l, n = s * s;
+    if (tools_.pred_only) {
+        lf.q.assign(n, 0); lf.last = -1; lf.nf = 0; lf.tns_on = false; lf.mts = 0; lf.qmode = 0;
+        return;
+    }
     const auto& scan = diag_scan(l);
     std::vector<double> r(n), c(n), e(n);
     for (int y = 0; y < s; ++y)
@@ -800,8 +804,34 @@ void BlockCoder::restore(int x0, int y0, int s, const std::vector<int32_t>& b) {
 }
 
 // ---------------- RD 探索 (符号器) ----------------
+// 色差ブロックに対応する輝度領域の動きが一様か (複数の動き/イントラ混在なら false)
+bool BlockCoder::luma_motion_uniform(int x0, int y0, int s) const {
+    if (!inter_.enabled || is_luma() || !inter_.mf) return true;
+    const int cs = inter_.chroma_shift;
+    const int W4 = inter_.mf->w4 * 4, H4 = inter_.mf->h4 * 4;
+    const MotionInfo& m0 = inter_.mf->at(std::min(x0 << cs, W4 - 1), std::min(y0 << cs, H4 - 1));
+    for (int y = 0; y < (s << cs); y += 4)
+        for (int x = 0; x < (s << cs); x += 4) {
+            const int lx = std::min((x0 << cs) + x, W4 - 1), ly = std::min((y0 << cs) + y, H4 - 1);
+            if (!(inter_.mf->at(lx, ly) == m0)) return false;
+        }
+    return true;
+}
+
 double BlockCoder::rd_node(int x0, int y0, int l) {
     const int s = 1 << l, n = s * s;
+    // 色差: 対応する輝度の動きが一様でなければ、この大きさの葉は作らず分割する
+    // (動物体の周辺で色差だけ大ブロックになり、色の残像・褪色が出るのを防ぐ)
+    if (l > min_log2_ && !luma_motion_uniform(x0, y0, s)) {
+        split_at(x0, y0, l) = 1;
+        const int h = s / 2;
+        double js = lambda_ * split_rate(x0, y0, l, 1);
+        js += rd_node(x0, y0, l - 1);
+        js += rd_node(x0 + h, y0, l - 1);
+        js += rd_node(x0, y0 + h, l - 1);
+        js += rd_node(x0 + h, y0 + h, l - 1);
+        return js;
+    }
     std::vector<int32_t> before, best_rec, pred(n);
     save(x0, y0, s, before);
 
@@ -1011,7 +1041,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
     }
     }
 
-    const int cbf = io.bit(md.cbf, 0, L, pc * 64 + static_cast<uint32_t>(lf.pt ? 60 + lf.pt : lf.mode), lf.last >= 0);
+    const int cbf = tools_.pred_only ? 0 : io.bit(md.cbf, 0, L, pc * 64 + static_cast<uint32_t>(lf.pt ? 60 + lf.pt : lf.mode), lf.last >= 0);
     if (!cbf) {
         lf.last = -1;
         lf.q.assign(lf.qmode == 0 ? n : 0, 0);

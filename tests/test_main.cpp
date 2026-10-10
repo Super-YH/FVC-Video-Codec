@@ -204,6 +204,8 @@ static void test_codec() {
         {"medium-B3", true, false, 0, 32, Preset::Medium, 9, 3, 0, false},
         {"fast-B7-key", true, false, 0, 30, Preset::Fast, 13, 7, 6, false},
         {"ssim-target", true, false, 0, 30, Preset::Fast, 6, 3, 0, false},
+        {"pqmf-video", true, false, 2, 30, Preset::Fast, 6, 3, 0, false},
+        {"pqmf-video-l2", true, true, 1, 30, Preset::Medium, 4, 1, 0, false},
     };
     for (const Case& c : cases) {
         EncoderConfig cfg;
