@@ -311,12 +311,79 @@ void BlockCoder::obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pre
     }
 }
 
+// FIR 動き基底 (§7.3): P' = P + (ψ0 ∂x P + ψ1 ∂y P + ψ2 ∂xx P + ψ3 ∂yy P) / 16
+//  ∂x, ∂y は局所変位 (動き成分摘出)、∂xx, ∂yy は異方性のぼけ/鮮鋭化。差分はブロック内で端を複製
+namespace {
+void fir_basis(const int32_t* p, int s, int k, std::vector<double>& out) {
+    out.resize(static_cast<size_t>(s) * s);
+    auto at = [&](int x, int y) { return static_cast<double>(p[std::clamp(y, 0, s - 1) * s + std::clamp(x, 0, s - 1)]); };
+    for (int y = 0; y < s; ++y)
+        for (int x = 0; x < s; ++x) {
+            double v = 0;
+            switch (k) {
+            case 0: v = (at(x + 1, y) - at(x - 1, y)) * 0.5; break;
+            case 1: v = (at(x, y + 1) - at(x, y - 1)) * 0.5; break;
+            case 2: v = at(x + 1, y) - 2 * at(x, y) + at(x - 1, y); break;
+            default: v = at(x, y + 1) - 2 * at(x, y) + at(x, y - 1); break;
+            }
+            out[y * s + x] = v;
+        }
+}
+}  // namespace
+
+void BlockCoder::fir_apply(const int* psi, int s, int32_t* pred) const {
+    if (!psi[0] && !psi[1] && !psi[2] && !psi[3]) return;
+    std::vector<double> acc(static_cast<size_t>(s) * s, 0.0), b;
+    for (int k = 0; k < 4; ++k) {
+        if (!psi[k]) continue;
+        fir_basis(pred, s, k, b);
+        for (size_t i = 0; i < acc.size(); ++i) acc[i] += psi[k] * b[i];
+    }
+    for (size_t i = 0; i < acc.size(); ++i)
+        pred[i] = std::clamp(pred[i] + static_cast<int32_t>(std::lround(acc[i] / 16.0)), lo_, hi_);
+}
+
+bool BlockCoder::fir_fit(const Leaf& lf, int x0, int y0, int s, int* psi) const {
+    const int n = s * s;
+    std::vector<int32_t> p(n);
+    inter_predict(lf.mi, inter_.l0, inter_.l1, x0, y0, s, s, 0, lo_, hi_, p.data());
+    std::vector<double> B[4];
+    for (int k = 0; k < 4; ++k) fir_basis(p.data(), s, k, B[k]);
+    double M[4][5] = {};
+    for (int i = 0; i < n; ++i) {
+        const double r = org_->at(x0 + i % s, y0 + i / s) - p[i];
+        for (int a = 0; a < 4; ++a) {
+            for (int c = 0; c < 4; ++c) M[a][c] += B[a][i] * B[c][i];
+            M[a][4] += B[a][i] * r;
+        }
+    }
+    for (int a = 0; a < 4; ++a) M[a][a] += 1e-3 * n;
+    for (int c = 0; c < 4; ++c) {
+        int pv = c;
+        for (int r = c + 1; r < 4; ++r) if (std::abs(M[r][c]) > std::abs(M[pv][c])) pv = r;
+        if (std::abs(M[pv][c]) < 1e-9) return false;
+        for (int k = 0; k < 5; ++k) std::swap(M[c][k], M[pv][k]);
+        for (int r = 0; r < 4; ++r) {
+            if (r == c) continue;
+            const double f = M[r][c] / M[c][c];
+            for (int k = c; k < 5; ++k) M[r][k] -= f * M[c][k];
+        }
+    }
+    bool any = false;
+    for (int k = 0; k < 4; ++k) {
+        psi[k] = std::clamp(static_cast<int>(std::lround(16.0 * M[k][4] / M[k][k])), -16, 16);
+        any |= psi[k] != 0;
+    }
+    return any;
+}
+
 void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) const {
     const int s = 1 << l;
     if (lf.pt == 2) {
         if (is_luma()) {
             if (lf.part == 0) {
                 inter_predict(lf.mi, inter_.l0, inter_.l1, x0, y0, s, s, 0, lo_, hi_, pred);
+                fir_apply(lf.fir, s, pred);
                 obmc(lf.mi, x0, y0, s, pred);
             } else {
                 // 長方形予測分割 (1: 上下 2NxN, 2: 左右 Nx2N)。変換は正方形のまま
@@ -1080,7 +1147,17 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         if (tools_.cfl) { Leaf lf; lf.mode = kModeCfl; lf.alpha = fit_cfl_alpha(x0, y0, s); cands.push_back(lf); }
         if (inter_.enabled) {
             if (is_luma()) {
+                const size_t c0 = cands.size();
                 motion_search(x0, y0, s, s, cands);
+                // FIR 動き基底: 各インター候補 (2Nx2N) に最小二乗の ψ を付けた変種を追加
+                if (tools_.firb && s >= 16) {
+                    const size_t c1 = cands.size();
+                    for (size_t i = c0; i < c1; ++i) {
+                        if (cands[i].pt != 2 || cands[i].part != 0) continue;
+                        Leaf t = cands[i];
+                        if (fir_fit(t, x0, y0, s, t.fir)) cands.push_back(t);
+                    }
+                }
                 if (tools_.rect && s >= 8) rect_search(x0, y0, s, cands);
             }
             else { Leaf lf; lf.pt = 2; cands.push_back(lf); }
@@ -1251,6 +1328,15 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
             lf.part = part;
             if (part == 0) {
                 code_motion(io, md, L, x0, y0, s, s, lf.mi, lf.merge);
+                if (tools_.firb && s >= 16) {
+                    const int on = io.bit(md.inter, 40, L, 0, lf.fir[0] || lf.fir[1] || lf.fir[2] || lf.fir[3]);
+                    for (int k = 0; k < 4; ++k) {
+                        lf.fir[k] = on ? io.sint(md.inter, 41 + static_cast<uint32_t>(k), L, lf.fir[k]) : 0;
+                        if (std::abs(lf.fir[k]) > 16) throw std::runtime_error("corrupt stream: fir psi");
+                    }
+                } else {
+                    for (int& v : lf.fir) v = 0;
+                }
             } else {
                 const int pw = part == 2 ? s / 2 : s, ph = part == 1 ? s / 2 : s;
                 code_motion(io, md, L, x0, y0, pw, ph, lf.mi, lf.merge);

@@ -109,6 +109,7 @@ struct Tools {
     bool pred_only = false;   // 予測のみ (残差は別経路: 動画 PQMF)
     bool band_ns = false;     // 帯域の時間差分ノイズ置換 (心理視覚)
     bool inter_ns = false;    // インター残差なしブロックの高域ノイズ置換 (心理視覚)
+    bool firb = false;        // FIR 動き基底 ψ1..4 (§7.3)
     bool gs = false;          // 利得形状分離・バンド/パーティション符号化 (§5.3–5.7)
 };
 
@@ -181,6 +182,7 @@ private:
         int part = 0;        // pt==2 (輝度): 0 = 2Nx2N, 1 = 2NxN (上下), 2 = Nx2N (左右)
         MotionInfo mi2;      // 第 2 区画の動き
         int merge2 = -1;
+        int fir[4] = {0, 0, 0, 0};  // pt==2 輝度: FIR 動き基底係数 ψ (∂x, ∂y, ∂xx, ∂yy)/16 (§7.3)
         int dict_idx = 0, dict_gain = 0;
         int xgain = 0;
         int xsrc = 0;
@@ -235,6 +237,8 @@ private:
     void set_modes4(int x0, int y0, int s, int mode);
     void predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) const;
     void obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const;
+    void fir_apply(const int* psi, int s, int32_t* pred) const;
+    bool fir_fit(const Leaf& lf, int x0, int y0, int s, int* psi) const;
     void intra_angular(int x0, int y0, int s, int mode, int32_t* pred) const;
     bool coded_before(int px, int py, int x0, int y0) const;
     void intra_cfl(int x0, int y0, int s, int alpha, int32_t* pred) const;

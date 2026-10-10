@@ -1218,6 +1218,7 @@ FrameParams params_from(const EncoderConfig& c) {
     t.inter_ns = !c.tune_psnr;
     fp.cdef = c.cdef >= 0 ? c.cdef != 0 : c.preset >= Preset::Medium;
     if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
+    t.firb = c.firb >= 0 ? c.firb != 0 : c.preset == Preset::Placebo;  // 9 フレーム試験では効果が雑音 (±0.1 dB) 以下
     t.gs = c.gs >= 0 ? c.gs != 0 : c.preset == Preset::Placebo;  // 実測: RD 混在で -0.03 dB (slow では時間だけ増える)
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
     // 実測: 2x2 は 1x1 より 4-7% 効率が落ちるため、medium 以上は 1x1 (速度より効率)
@@ -1240,7 +1241,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>((fp.tile_cols - 1) | ((fp.tile_rows - 1) << 4)));
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
     put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u) |
-                  (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u));
+                  (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u) | (fp.tools.firb ? 128u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_uv(p, static_cast<uint32_t>(poc));
@@ -1276,6 +1277,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.tools.inter_ns = (f3 >> 4) & 1;
     fp.cdef = (f3 >> 5) & 1;
     fp.tools.gs = (f3 >> 6) & 1;
+    fp.tools.firb = (f3 >> 7) & 1;
     if (fp.cqp_off < -12 || fp.cqp_off > 12) return false;
     for (int l = 0; l < 2; ++l) {
         const uint32_t n = br.u8();
