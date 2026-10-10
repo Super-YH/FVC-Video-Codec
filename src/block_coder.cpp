@@ -152,6 +152,7 @@ void BlockCoder::set_modes4(int x0, int y0, int s, int mode) {
 // RD の状態に依存しない幾何学的規則なので符号器/復号器で一致する。
 bool BlockCoder::coded_before(int px, int py, int x0, int y0) const {
     if (px < tx0_ || py < ty0_ || px >= tx1_ || py >= ty1_) return false;
+    if (px >= vw_ || py >= vh_) return false;  // 有効領域の外は符号化されない
     const int cx = px / ctu_ * ctu_, cy = py / ctu_ * ctu_;
     if (cy != cy_) return cy < cy_;
     if (cx != cx_) return cx < cx_;
@@ -1076,6 +1077,13 @@ double BlockCoder::leaf_bits(const Leaf& lf, int x0, int y0, int l) const {
 }
 
 double BlockCoder::sse(int x0, int y0, int s) const {
+    if (x0 + s > vw_ || y0 + s > vh_) {
+        // 有効領域をはみ出すブロック: 領域内の画素だけで歪みを測る (はみ出し部は表示されない)
+        double e = 0;
+        for (int y = 0; y < std::min(s, vh_ - y0); ++y)
+            for (int x = 0; x < std::min(s, vw_ - x0); ++x) { const double d = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y); e += d * d; }
+        return e * (plane_ ? search_.chroma_weight : 1.0);
+    }
     double e = 0;
     for (int y = 0; y < s; ++y)
         for (int x = 0; x < s; ++x) { const double d = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y); e += d * d; }
@@ -1154,6 +1162,8 @@ bool BlockCoder::luma_motion_uniform(int x0, int y0, int s) const {
 
 double BlockCoder::rd_node(int x0, int y0, int l) {
     const int s = 1 << l, n = s * s;
+    // 画面外 (有効領域の外) のブロックは符号化しない。境界をまたぐブロックは暗黙に分割 (分割フラグなし)
+    if (x0 >= vw_ || y0 >= vh_) { clear_outside_mf(x0, y0, s); return 0.0; }
     // 色差: 対応する輝度の動きが一様でなければ、この大きさの葉は作らず分割する
     // (動物体の周辺で色差だけ大ブロックになり、色の残像・褪色が出るのを防ぐ)
     if (l > min_log2_ && !luma_motion_uniform(x0, y0, s)) {
@@ -1734,6 +1744,7 @@ double BlockCoder::split_rate(int x0, int y0, int l, int split) {
 }
 
 void BlockCoder::code_node(SymIO& io, Models& md, int x0, int y0, int l) {
+    if (x0 >= vw_ || y0 >= vh_) { clear_outside_mf(x0, y0, 1 << l); return; }
     int split = 0;
     if (l > min_log2_) split = io.bit(md.split, 0, static_cast<uint32_t>(l), static_cast<uint32_t>(plane_), io.enc ? split_at(x0, y0, l) : 0);
     if (split) {

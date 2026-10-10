@@ -967,6 +967,8 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         plane_range(info, pi, lo, hi);
         const int32_t mid = (lo + hi + 1) / 2;
         const int W = (w + kCtu - 1) / kCtu * kCtu, H = (h + kCtu - 1) / kCtu * kCtu;
+        // 有効領域 = 画面。完全に外側のブロックは符号化せず、はみ出すブロックは画面内だけで歪みを測る (§5.1)
+        const int vw = w, vh = h;
         InterCtx ic;
         if (inter) {
             ic.enabled = true;
@@ -1091,6 +1093,8 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                                           inter ? &ic : nullptr);
                             BlockCoder b2(&r2, &d, nullptr, pi, lo - hi, hi * 2, step, lambda, fp.min_log2, fp.max_log2, fp.tools, fp.search,
                                           inter ? &ic : nullptr);
+                            b1.set_valid(vw, vh);
+                            b2.set_valid(vw, vh);
                             double j1 = 0, j2 = lambda * shapes_bits_estimate(shapes);
                             for (int cy = 0; cy < H; cy += kCtu)
                                 for (int cx = 0; cx < W; cx += kCtu) { j1 += b1.rd_ctu(cx, cy, kCtu); j2 += b2.rd_ctu(cx, cy, kCtu); }
@@ -1142,6 +1146,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                         tmd[t] = std::make_unique<Models>();
                         if (fp.aqp) coders[t]->enable_aqp(pqp, info.bit_depth, aqp_lookup, &actx);
                         coders[t]->set_noise_seed(static_cast<uint64_t>(fp.poc) * 7919u + static_cast<uint64_t>(pi) * 104729u + static_cast<uint64_t>(t));
+                        coders[t]->set_valid(vw, vh);
                         if (io.enc) {
                             tw[t] = std::make_unique<EntropyWriter>();
                             tio[t].w = tw[t].get();
@@ -1199,6 +1204,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                             einfo.leaf[i] = coders[t]->leaf_ids()[i];
                             einfo.flags[i] = coders[t]->leaf_flags()[i];
                         }
+                BlockCoder::fill_outside(R, vw, vh);
                 if (use_shapes)
                     for (size_t i = 0; i < R.v.size(); ++i) R.v[i] = std::clamp(R.v[i] + S.v[i], lo, hi);
                 if (btools.pred_only) {

@@ -266,6 +266,24 @@ private:
     const Plane* tband_ = nullptr;
     const Plane* cband_ = nullptr;
     uint64_t noise_seed_ = 0;
+    int vw_ = 1 << 30, vh_ = 1 << 30;  // 有効領域 (これより外のブロックは符号化しない)
+public:
+    void set_valid(int vw, int vh) { vw_ = vw; vh_ = vh; }
+    // 符号化しない (画面外の) ブロックの動き情報は既定値 (イントラ扱い) に戻す。符号器の試行符号化の残りが
+    // 色差の動き導出や時間方向候補に漏れて復号器とずれないように、符号器・復号器で同じく行う
+    void clear_outside_mf(int x0, int y0, int s) {
+        if (!inter_.enabled || !is_luma() || !inter_.mf) return;
+        MotionField& mf = *inter_.mf;
+        for (int y = y0 / 4; y < std::min((y0 + s) / 4, mf.h4); ++y)
+            for (int x = x0 / 4; x < std::min((x0 + s) / 4, mf.w4); ++x) mf.mi[static_cast<size_t>(y) * mf.w4 + x] = MotionInfo{};
+    }
+    // 有効領域の外を端の画素の複製で埋める (ループフィルタ等が参照する前に、符号器・復号器で同じく行う)
+    static void fill_outside(Plane& R, int vw, int vh) {
+        for (int y = 0; y < R.h; ++y)
+            for (int x = 0; x < R.w; ++x)
+                if (x >= vw || y >= vh) R.at(x, y) = R.at(std::min(x, vw - 1), std::min(y, vh - 1));
+    }
+private:
     GsMem gs_mem_;  // 利得形状ブロック間の利得予測 (§5.3 連結)
     uint64_t gs_seed(int x0, int y0) const {
         return (noise_seed_ + 0x632BE59BD9B4E019ull) ^ (static_cast<uint64_t>(x0) << 32 | static_cast<uint64_t>(y0) << 4 | static_cast<uint64_t>(plane_));
