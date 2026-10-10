@@ -320,7 +320,7 @@ void code_bands_video(SymIO& io, Models& md, int pqmf_log2, const Plane* org, co
 // 帯域ごとの残差 X_k - P_k を符号化する。帯域ごとに量子化ステップを高域ほど粗くする。
 void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, const Plane* P, Plane& rec, double step,
                        double lambda, int32_t lo, int32_t hi, int plane, const Tools& tools, const Search& search,
-                       int min_log2, int max_log2) {
+                       int min_log2, int max_log2, bool band_ns, uint64_t seed) {
     const int M = 1 << pqmf_log2, W = rec.w, H = rec.h, bw = W / M, bh = H / M;
     const int BW = (bw + kCtu - 1) / kCtu * kCtu, BH = (bh + kCtu - 1) / kCtu * kCtu;
     Pqmf2D fb(M, M);
@@ -343,6 +343,7 @@ void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, c
     Search bs = search;
     const int32_t range = 8 * (hi - lo + 1) * M;  // 帯域値の取りうる範囲 (正規化後) に十分な余裕
     std::vector<Plane> rk_plane(M * M);           // 各帯域の再構成 (正規化整数, パディング込み)
+    Plane tp0, chg;                               // LL 帯域の時間方向予測と変化マスク
     for (int ky = 0; ky < M; ++ky)
         for (int kx = 0; kx < M; ++kx) {
             const int k = ky * M + kx;
@@ -359,6 +360,7 @@ void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, c
                         target.at(x, y) = static_cast<int32_t>(std::lround(v * nrm));
                     }
             }
+            bt.band_ns = band_ns && P && (kx + ky) >= 2;
             BlockCoder bc(&R, io.enc ? &target : nullptr, nullptr, plane, -range, range, bstep, lambda,
                           std::min(min_log2, 3), max_log2, bt, bs);
             // 帯域間相関: 左 (なければ上) の符号化済み帯域を鏡像補正して文脈・予測に使う
@@ -379,7 +381,9 @@ void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, c
                     for (int x = 0; x < BW; ++x)
                         tp.at(x, y) = static_cast<int32_t>(std::lround(pb[k][static_cast<size_t>(std::min(y, bh - 1)) * bw + std::min(x, bw - 1)] * nrm));
                 bc.set_tband(&tp);
+                if (k > 0 && chg.w) bc.set_cband(&chg);
             }
+            bc.set_noise_seed(seed * 1315423911ull + static_cast<uint64_t>(k));
             for (int cy = 0; cy < BH; cy += kCtu)
                 for (int cx = 0; cx < BW; cx += kCtu) bc.code_ctu(io, md, cx, cy, kCtu);
             for (int y = 0; y < bh; ++y)
@@ -387,6 +391,11 @@ void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, c
                     const size_t i = static_cast<size_t>(y) * bw + x;
                     rb[k][i] = R.at(x, y) / nrm;
                 }
+            if (k == 0 && P) {
+                // 変化マスク: |LL 再構成 - LL 時間方向予測| (動いた場所は全帯域で共通)
+                chg = Plane(BW, BH);
+                for (size_t i = 0; i < chg.v.size(); ++i) chg.v[i] = std::abs(R.v[i] - tp.v[i]);
+            }
             rk_plane[k] = std::move(R);
         }
     std::vector<double> y;
@@ -468,6 +477,7 @@ struct FrameParams {
     bool aqp = false;                                  // CTU 単位の適応 QP
     bool alf = false;                                  // 適応ウィーナーフィルタ (§9.4)
     bool band_blocks = true;                           // 帯域画像をブロック符号化 (false: 標本単位)
+    bool band_ns = false;                              // 帯域の時間差分ノイズ置換 (心理視覚)
     // 符号器: 輝度 64x64 CTU ごとの dQP (先読みによる静止度から決定)
     std::vector<int8_t> aqp_map;
     int aqp_w = 0;
@@ -697,7 +707,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             if (bands && !inter && fp.band_blocks) {
                 const double lam = 0.57 * std::pow(2.0, (pqp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
                 code_bands_blocks(io, md, fp.pqmf_log2, org ? &opad : nullptr, nullptr, R, step, lam, lo, hi, pi, fp.tools,
-                                  fp.search, fp.min_log2, fp.max_log2);
+                                  fp.search, fp.min_log2, fp.max_log2, false, 0);
                 if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lam, lo, hi);
             } else if (bands && !inter) {
                 code_bands(io, md, fp.pqmf_log2, org ? &opad : nullptr, R, step, 1.0 / 3.0, lo, hi, fp.band_tools, fp.psy,
@@ -821,7 +831,8 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     const Plane P = R;
                     if (fp.band_blocks)
                         code_bands_blocks(io, md, fp.pqmf_log2, org ? &opad : nullptr, &P, R, step, lambda, lo, hi, pi, fp.tools,
-                                          fp.search, fp.min_log2, fp.max_log2);
+                                          fp.search, fp.min_log2, fp.max_log2, fp.band_ns,
+                                          static_cast<uint64_t>(fp.poc) * 3 + static_cast<uint64_t>(pi));
                     else
                         code_bands_video(io, md, fp.pqmf_log2, org ? &opad : nullptr, P, R, step, lambda, lo, hi);
                 }
@@ -973,6 +984,7 @@ FrameParams params_from(const EncoderConfig& c) {
     if (c.mts >= 0) t.mts = s.try_mts = c.mts != 0;
     if (c.alf >= 0) fp.alf = c.alf != 0;
     fp.band_blocks = !c.band_samples;
+    fp.band_ns = !c.tune_psnr;
     if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
     // 実測: 2x2 は 1x1 より 4-7% 効率が落ちるため、medium 以上は 1x1 (速度より効率)
@@ -994,7 +1006,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
                   (fp.lf_freq ? 16u : 0u) | (fp.lf_map ? 32u : 0u) | (fp.tools.rect ? 64u : 0u) | (fp.tools.tmvp ? 128u : 0u));
     put_u8(p, static_cast<uint32_t>((fp.tile_cols - 1) | ((fp.tile_rows - 1) << 4)));
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
-    put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u));
+    put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_u32(p, static_cast<uint32_t>(poc));
@@ -1026,6 +1038,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.alf = f3 & 1;
     fp.tools.mts = (f3 >> 1) & 1;
     fp.band_blocks = (f3 >> 2) & 1;
+    fp.band_ns = (f3 >> 3) & 1;
     if (fp.cqp_off < -12 || fp.cqp_off > 12) return false;
     for (int l = 0; l < 2; ++l) {
         const uint32_t n = br.u8();

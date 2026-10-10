@@ -84,6 +84,7 @@ struct Tools {
     bool tmvp = false;        // 時間方向動きベクトル候補
     bool mts = false;         // 複数変換選択 (DCT2/DST7/DCT8)
     bool pred_only = false;   // 予測のみ (残差は別経路: 動画 PQMF)
+    bool band_ns = false;     // 帯域の時間差分ノイズ置換 (心理視覚)
 };
 
 // インター予測の文脈 (プレーン単位)
@@ -140,6 +141,9 @@ public:
     void set_xband(const Plane* p) { xband_ = p; }
     // 帯域符号化 (P/B): 動き補償予測の同帯域 (正規化済み) を時間方向パラメトリック予測に使う
     void set_tband(const Plane* p) { tband_ = p; }
+    // 変化マスク (LL 帯域の |再構成 - 時間方向予測|, 正規化済み) を cbf/係数の文脈に使う
+    void set_cband(const Plane* p) { cband_ = p; }
+    void set_noise_seed(uint64_t s) { noise_seed_ = s; }
     const std::vector<uint8_t>& leaf_flags() const { return flags4_; }
 
 private:
@@ -152,7 +156,8 @@ private:
         int merge2 = -1;
         int dict_idx = 0, dict_gain = 0;
         int xgain = 0;
-        int xsrc = 0;        // pt==4: 0 = 帯域間 (ゲイン ±1..4 /4), 1 = 時間方向 (ゲイン 1..5 /4)       // pt==4: 帯域間予測ゲイン (±1..4)/4  // pt==3: サイズ別リスト内の位置, ゲイン (1/16)
+        int xsrc = 0;
+        int ns = 0;          // pt==4 時間方向・残差なし: ノイズ置換レベル 0..7 (包絡は参照帯域の振幅)        // pt==4: 0 = 帯域間 (ゲイン ±1..4 /4), 1 = 時間方向 (ゲイン 1..5 /4)       // pt==4: 帯域間予測ゲイン (±1..4)/4  // pt==3: サイズ別リスト内の位置, ゲイン (1/16)
         int mode = kModePlanar, alpha = 0, bvx = 0, bvy = 0;
         int qmode = 0;  // 0: デッドゾーンスカラ, 1: E8 格子 VQ
         int mts = 0;    // 変換の組 (輝度, 4..32)
@@ -215,10 +220,13 @@ private:
     int64_t me_cost(int x0, int y0, int w, int h, const MotionInfo& mi) const;
     void motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& cands) const;
     void dict_search(int x0, int y0, int s, std::vector<Leaf>& cands) const;
-    void rdoq(Leaf& lf, int l, const std::vector<double>& e, uint32_t xb) const;
+    void rdoq(Leaf& lf, int l, const std::vector<double>& e, uint32_t xb, uint32_t cb) const;
     uint32_t xb_ctx(int x0, int y0, int s) const;
     const Plane* xband_ = nullptr;
     const Plane* tband_ = nullptr;
+    const Plane* cband_ = nullptr;
+    uint64_t noise_seed_ = 0;
+    uint32_t cb_ctx(int x0, int y0, int s) const;
     void quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) const;
     void reconstruct(const Leaf& lf, int x0, int y0, int l, const int32_t* pred);
     double leaf_bits(const Leaf& lf, int x0, int y0, int l) const;
