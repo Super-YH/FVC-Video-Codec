@@ -67,12 +67,12 @@ void put_unit(std::vector<uint8_t>& out, UnitType t, const std::vector<uint8_t>&
 }
 
 // PQMF の構成 (§3.2): 帯域数 2^lx x 2^ly とプロトタイプフィルタ (遅延 m, Kaiser β) の選択
-struct PqmfCfg { int lx = 0, ly = 0, filter = 0; };
+struct PqmfCfg { int lx = 0, ly = 0, filter = 0; bool ll_split = false; };  // ll_split: LL 帯域をさらに 2x2 分解 (§3.2 部分木)
 struct PqmfFilter { int m; double beta; };
 constexpr PqmfFilter kPqmfFilters[4] = {{6, 9.0}, {4, 7.0}, {8, 10.0}, {3, 5.0}};
 
 struct FrameParams;
-PqmfCfg pqmf_cfg(const FrameParams& fp);
+PqmfCfg pqmf_cfg(const FrameParams& fp, bool ll_split = false);
 
 // ---------------- PQMF 帯域符号化 (§3, 帯域間差分 §3.3, ノイズ置換 §5.6) ----------------
 // band_mode: 0 = 通常 (量子化値を符号化), 1 = 帯域間差分 (左/上の隣接帯域を鏡像参照, ゲイン a/64), 2 = ノイズ置換 (RMS のみ)
@@ -409,8 +409,28 @@ void code_bands_blocks(SymIO& io, Models& md, const PqmfCfg& pq, const Plane* or
                 if (k > 0 && chg.w) bc.set_cband(&chg);
             }
             bc.set_noise_seed(seed * 1315423911ull + static_cast<uint64_t>(k));
-            for (int cy = 0; cy < BH; cy += kCtu)
-                for (int cx = 0; cx < BW; cx += kCtu) bc.code_ctu(io, md, cx, cy, kCtu);
+            if (k == 0 && pq.ll_split && bw % 2 == 0 && bh % 2 == 0) {
+                // 部分木分解 (§3.2 band_split): LL 帯域を同じ方式で 2x2 帯域に再分解して符号化する
+                Plane llo, llp, llr(bw, bh, 0);
+                if (io.enc) {
+                    llo = Plane(bw, bh);
+                    for (int y = 0; y < bh; ++y) for (int x = 0; x < bw; ++x) llo.at(x, y) = target.at(x, y);
+                }
+                if (P) {
+                    llp = Plane(bw, bh);
+                    for (int y = 0; y < bh; ++y) for (int x = 0; x < bw; ++x) llp.at(x, y) = tp.at(x, y);
+                }
+                PqmfCfg sub;
+                sub.lx = sub.ly = 1;
+                sub.filter = pq.filter;
+                code_bands_blocks(io, md, sub, io.enc ? &llo : nullptr, P ? &llp : nullptr, llr, bstep, lambda, -range, range, plane,
+                                  tools, search, min_log2, max_log2, false, seed * 31 + 7);
+                for (int y = 0; y < BH; ++y)
+                    for (int x = 0; x < BW; ++x) R.at(x, y) = llr.at(std::min(x, bw - 1), std::min(y, bh - 1));
+            } else {
+                for (int cy = 0; cy < BH; cy += kCtu)
+                    for (int cx = 0; cx < BW; cx += kCtu) bc.code_ctu(io, md, cx, cy, kCtu);
+            }
             for (int y = 0; y < bh; ++y)
                 for (int x = 0; x < bw; ++x) {
                     const size_t i = static_cast<size_t>(y) * bw + x;
@@ -631,8 +651,9 @@ void estimate_global_motion(const Plane& cur, const Plane& ref, int& gx, int& gy
 }
 
 // 小さな最小二乗 (正規方程式 + ガウス消去)。A: rows x n
-PqmfCfg pqmf_cfg(const FrameParams& fp) {
+PqmfCfg pqmf_cfg(const FrameParams& fp, bool ll_split) {
     PqmfCfg c;
+    c.ll_split = ll_split;
     c.lx = fp.pqmf_log2;
     c.ly = fp.pqmf_log2y ? fp.pqmf_log2y : fp.pqmf_log2;
     c.filter = fp.pqmf_filter;
@@ -1012,12 +1033,13 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         BlockUsage* cur_usage = usage;
         bool allow_ns = true;  // 方式判定の試行中はノイズ置換を止める (知覚目的の加算を SSE 判定に含めない)
         // プレーンの非可逆符号化 (bands: PQMF 帯域方式 / false: 画素領域のブロック方式)
+        bool ll_split = false;  // 帯域方式で LL を部分木分解するか (プレーンごと、§3.2)
         auto code_lossy = [&](SymIO& io, Models& md, TileStreams& ts, bool bands, Plane& R) {
             const int pqp = std::clamp(fp.qp + (pi ? fp.cqp_off : 0), 0, 63);
             const double step = qp_step(pqp, info.bit_depth);
             if (bands && !inter && fp.band_blocks) {
                 const double lam = 0.57 * std::pow(2.0, (pqp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
-                code_bands_blocks(io, md, pqmf_cfg(fp), org ? &opad : nullptr, nullptr, R, step, lam, lo, hi, pi, fp.tools,
+                code_bands_blocks(io, md, pqmf_cfg(fp, ll_split), org ? &opad : nullptr, nullptr, R, step, lam, lo, hi, pi, fp.tools,
                                   fp.search, fp.min_log2, fp.max_log2, false, 0);
                 if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lam, lo, hi);
             } else if (bands && !inter) {
@@ -1184,7 +1206,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     // 帯域ブロックごとにゲイン・帯域間予測・スキップを探索して符号化
                     const Plane P = R;
                     if (fp.band_blocks)
-                        code_bands_blocks(io, md, pqmf_cfg(fp), org ? &opad : nullptr, &P, R, step, lambda, lo, hi, pi, fp.tools,
+                        code_bands_blocks(io, md, pqmf_cfg(fp, ll_split), org ? &opad : nullptr, &P, R, step, lambda, lo, hi, pi, fp.tools,
                                           fp.search, fp.min_log2, fp.max_log2, fp.band_ns && allow_ns,
                                           static_cast<uint64_t>(fp.poc) * 3 + static_cast<uint64_t>(pi));
                     else
@@ -1206,7 +1228,10 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     const int pqp = std::clamp(fp.qp + (pi ? fp.cqp_off : 0), 0, 63);
                     const double lam = 0.57 * std::pow(2.0, (pqp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
                     double bestj = 1e300;
-                    for (int b = 0; b < 2; ++b) {
+                    bool best_ll = false;
+                    for (int b = 0; b < 3; ++b) {
+                        if (b == 2 && !fp.band_blocks) break;
+                        ll_split = b == 2;
                         Models mt = md;
                         EntropyWriter tw;
                         SymIO tio;
@@ -1224,11 +1249,13 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                         for (int y = 0; y < h; ++y)
                             for (int x = 0; x < w; ++x) { const double e = org->p[pi].at(x, y) - Rt.at(x, y); d += e * e; }
                         const double j = d + lam * 8.0 * bytes;
-                        if (j < bestj) { bestj = j; bands = b != 0; }
+                        if (j < bestj) { bestj = j; bands = b != 0; best_ll = b == 2; }
                     }
+                    ll_split = best_ll;
                     cur_usage = usage;
                 }
                 bands = io.bit(md.band_mode, 9, static_cast<uint32_t>(pi), 0, bands);
+                ll_split = bands && fp.band_blocks ? io.bit(md.band_mode, 10, static_cast<uint32_t>(pi), 0, ll_split) : false;
             }
             code_lossy(io, md, ts, bands, R);
         }
