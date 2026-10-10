@@ -182,7 +182,8 @@ private:
         int part = 0;        // pt==2 (輝度): 0 = 2Nx2N, 1 = 2NxN (上下), 2 = Nx2N (左右)
         MotionInfo mi2;      // 第 2 区画の動き
         int merge2 = -1;
-        int fir[4] = {0, 0, 0, 0};  // pt==2 輝度: FIR 動き基底係数 ψ (∂x, ∂y, ∂xx, ∂yy)/16 (§7.3)
+        int fir[4] = {0, 0, 0, 0};
+        int cg[3] = {8, 8, 8};      // pt==2 輝度: 予測係数のバンド別利得 a_b/8 (低/中/高, §7.6-2 係数コピー)  // pt==2 輝度: FIR 動き基底係数 ψ (∂x, ∂y, ∂xx, ∂yy)/16 (§7.3)
         int dict_idx = 0, dict_gain = 0;
         int xgain = 0;
         int xsrc = 0;
@@ -239,6 +240,8 @@ private:
     void obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const;
     void fir_apply(const int* psi, int s, int32_t* pred) const;
     bool fir_fit(const Leaf& lf, int x0, int y0, int s, int* psi) const;
+    void cg_apply(const int* cg, int s, int32_t* pred) const;
+    bool cg_fit(const Leaf& lf, int x0, int y0, int s, int* cg) const;
     void intra_angular(int x0, int y0, int s, int mode, int32_t* pred) const;
     bool coded_before(int px, int py, int x0, int y0) const;
     void intra_cfl(int x0, int y0, int s, int alpha, int32_t* pred) const;

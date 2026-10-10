@@ -346,6 +346,46 @@ void BlockCoder::fir_apply(const int* psi, int s, int32_t* pred) const {
         pred[i] = std::clamp(pred[i] + static_cast<int32_t>(std::lround(acc[i] / 16.0)), lo_, hi_);
 }
 
+// 係数コピー (§7.6-2): 動き補償予測の DCT 係数をバンド (u+v < s/4: 低, < s/2: 中, 他: 高) ごとに a_b/8 倍する
+namespace {
+inline int cg_band(int u, int v, int s) { return u + v < s / 4 ? 0 : u + v < s / 2 ? 1 : 2; }
+}
+void BlockCoder::cg_apply(const int* cg, int s, int32_t* pred) const {
+    if (cg[0] == 8 && cg[1] == 8 && cg[2] == 8) return;
+    const int n = s * s;
+    std::vector<double> r(n), c(n);
+    for (int i = 0; i < n; ++i) r[i] = pred[i];
+    forward_2d(TxType::DCT2, TxType::DCT2, r.data(), s, s, c.data());
+    for (int v = 0; v < s; ++v)
+        for (int u = 0; u < s; ++u) c[v * s + u] *= cg[cg_band(u, v, s)] / 8.0;
+    inverse_2d(TxType::DCT2, TxType::DCT2, c.data(), s, s, r.data());
+    for (int i = 0; i < n; ++i) pred[i] = std::clamp(static_cast<int32_t>(std::lround(r[i])), lo_, hi_);
+}
+
+bool BlockCoder::cg_fit(const Leaf& lf, int x0, int y0, int s, int* cg) const {
+    const int n = s * s;
+    std::vector<int32_t> p(n);
+    inter_predict(lf.mi, inter_.l0, inter_.l1, x0, y0, s, s, 0, lo_, hi_, p.data());
+    fir_apply(lf.fir, s, p.data());
+    std::vector<double> rp(n), ro(n), cp(n), co(n);
+    for (int i = 0; i < n; ++i) { rp[i] = p[i]; ro[i] = org_->at(x0 + i % s, y0 + i / s); }
+    forward_2d(TxType::DCT2, TxType::DCT2, rp.data(), s, s, cp.data());
+    forward_2d(TxType::DCT2, TxType::DCT2, ro.data(), s, s, co.data());
+    double num[3] = {}, den[3] = {};
+    for (int v = 0; v < s; ++v)
+        for (int u = 0; u < s; ++u) {
+            if (!u && !v) continue;  // DC は重み付けしない (明るさは別のゲインで扱う)
+            const int b = cg_band(u, v, s), i = v * s + u;
+            num[b] += cp[i] * co[i]; den[b] += cp[i] * cp[i];
+        }
+    bool any = false;
+    for (int b = 0; b < 3; ++b) {
+        cg[b] = den[b] > 0 ? std::clamp(static_cast<int>(std::lround(8.0 * num[b] / den[b])), 0, 16) : 8;
+        any |= cg[b] != 8;
+    }
+    return any;
+}
+
 bool BlockCoder::fir_fit(const Leaf& lf, int x0, int y0, int s, int* psi) const {
     const int n = s * s;
     std::vector<int32_t> p(n);
@@ -387,6 +427,7 @@ void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) c
             if (lf.part == 0) {
                 inter_predict(lf.mi, inter_.l0, inter_.l1, x0, y0, s, s, 0, lo_, hi_, pred);
                 fir_apply(lf.fir, s, pred);
+                cg_apply(lf.cg, s, pred);
                 obmc(lf.mi, x0, y0, s, pred);
             } else {
                 // 長方形予測分割 (1: 上下 2NxN, 2: 左右 Nx2N)。変換は正方形のまま
@@ -1159,6 +1200,8 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
                         if (cands[i].pt != 2 || cands[i].part != 0) continue;
                         Leaf t = cands[i];
                         if (fir_fit(t, x0, y0, s, t.fir)) cands.push_back(t);
+                        Leaf t2 = cands[i];
+                        if (s <= 32 && cg_fit(t2, x0, y0, s, t2.cg)) cands.push_back(t2);
                     }
                 }
                 if (tools_.rect && s >= 8) rect_search(x0, y0, s, cands);
@@ -1337,8 +1380,14 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
                         lf.fir[k] = on ? io.sint(md.inter, 41 + static_cast<uint32_t>(k), L, lf.fir[k]) : 0;
                         if (std::abs(lf.fir[k]) > 16) throw std::runtime_error("corrupt stream: fir psi");
                     }
+                    const int con = s <= 32 ? io.bit(md.inter, 45, L, 0, lf.cg[0] != 8 || lf.cg[1] != 8 || lf.cg[2] != 8) : 0;
+                    for (int b = 0; b < 3; ++b) {
+                        lf.cg[b] = con ? 8 + io.sint(md.inter, 46 + static_cast<uint32_t>(b), L, lf.cg[b] - 8) : 8;
+                        if (lf.cg[b] < 0 || lf.cg[b] > 16) throw std::runtime_error("corrupt stream: coef gain");
+                    }
                 } else {
                     for (int& v : lf.fir) v = 0;
+                    for (int& v : lf.cg) v = 8;
                 }
             } else {
                 const int pw = part == 2 ? s / 2 : s, ph = part == 1 ? s / 2 : s;
