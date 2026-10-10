@@ -268,7 +268,7 @@ void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) c
     } else if (lf.pt == 4) {
         for (int y = 0; y < s; ++y)
             for (int x = 0; x < s; ++x) {
-                const int64_t v = static_cast<int64_t>(lf.xgain) * xband_->at(x0 + x, y0 + y);
+                const int64_t v = static_cast<int64_t>(lf.xgain) * (lf.xsrc ? tband_ : xband_)->at(x0 + x, y0 + y);
                 pred[y * s + x] = std::clamp(static_cast<int32_t>(v >= 0 ? (v + 2) / 4 : -((-v + 2) / 4)), lo_, hi_);
             }
     } else if (lf.pt == 3) {
@@ -898,7 +898,23 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
                 }
             if (den > 0) {
                 const int g = std::clamp(static_cast<int>(std::lround(num / den * 4.0)), -4, 4);
-                if (g != 0) { Leaf lf; lf.pt = 4; lf.xgain = g; cands.push_back(lf); }
+                if (g != 0) { Leaf lf; lf.pt = 4; lf.xgain = g; lf.xsrc = 0; cands.push_back(lf); }
+            }
+        }
+        if (tband_) {
+            // 時間方向パラメトリック予測: ゲイン 1.0 と最小二乗ゲイン
+            double num = 0, den = 0;
+            for (int y = 0; y < s; ++y)
+                for (int x = 0; x < s; ++x) {
+                    const double r = tband_->at(x0 + x, y0 + y);
+                    num += r * org_->at(x0 + x, y0 + y);
+                    den += r * r;
+                }
+            Leaf lf; lf.pt = 4; lf.xsrc = 1; lf.xgain = 4;
+            cands.push_back(lf);
+            if (den > 0) {
+                const int g = std::clamp(static_cast<int>(std::lround(num / den * 4.0)), 1, 5);
+                if (g != 4) { lf.xgain = g; cands.push_back(lf); }
             }
         }
         if (tools_.ibc && s >= 8 && s <= 32) {
@@ -1041,10 +1057,17 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
                 code_motion(io, md, L, x0 + (part == 2 ? pw : 0), y0 + (part == 1 ? ph : 0), pw, ph, lf.mi2, lf.merge2);
             }
         }
-    } else if (xband_ && io.bit(md.dict, 20, L, 0, lf.pt == 4)) {
+    } else if ((xband_ || tband_) && io.bit(md.dict, 20, L, 0, lf.pt == 4)) {
         lf.pt = 4;
-        lf.xgain = io.sint(md.dict, 21, L, lf.xgain);
-        if (lf.xgain == 0 || std::abs(lf.xgain) > 4) throw std::runtime_error("corrupt stream: xband gain");
+        if (xband_ && tband_) lf.xsrc = io.bit(md.dict, 22, L, 0, lf.xsrc);
+        else lf.xsrc = tband_ ? 1 : 0;
+        if (lf.xsrc) {
+            lf.xgain = 4 + io.sint(md.dict, 23, L, lf.xgain - 4);
+            if (lf.xgain < 1 || lf.xgain > 5) throw std::runtime_error("corrupt stream: tband gain");
+        } else {
+            lf.xgain = io.sint(md.dict, 21, L, lf.xgain);
+            if (lf.xgain == 0 || std::abs(lf.xgain) > 4) throw std::runtime_error("corrupt stream: xband gain");
+        }
     } else if (tools_.dict && (s == 8 || s == 16) && io.bit(md.dict, 0, L, 0, lf.pt == 3)) {
         lf.pt = 3;
         const auto& ids = dict_->ids_for(s);

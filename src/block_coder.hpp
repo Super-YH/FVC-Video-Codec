@@ -138,6 +138,8 @@ public:
     const BlockUsage& usage() const { return usage_; }
     // 帯域符号化: 符号化済みの隣接帯域 (鏡像補正済み, 同じ座標系) を文脈・予測に使う
     void set_xband(const Plane* p) { xband_ = p; }
+    // 帯域符号化 (P/B): 動き補償予測の同帯域 (正規化済み) を時間方向パラメトリック予測に使う
+    void set_tband(const Plane* p) { tband_ = p; }
     const std::vector<uint8_t>& leaf_flags() const { return flags4_; }
 
 private:
@@ -149,7 +151,8 @@ private:
         MotionInfo mi2;      // 第 2 区画の動き
         int merge2 = -1;
         int dict_idx = 0, dict_gain = 0;
-        int xgain = 0;       // pt==4: 帯域間予測ゲイン (±1..4)/4  // pt==3: サイズ別リスト内の位置, ゲイン (1/16)
+        int xgain = 0;
+        int xsrc = 0;        // pt==4: 0 = 帯域間 (ゲイン ±1..4 /4), 1 = 時間方向 (ゲイン 1..5 /4)       // pt==4: 帯域間予測ゲイン (±1..4)/4  // pt==3: サイズ別リスト内の位置, ゲイン (1/16)
         int mode = kModePlanar, alpha = 0, bvx = 0, bvy = 0;
         int qmode = 0;  // 0: デッドゾーンスカラ, 1: E8 格子 VQ
         int mts = 0;    // 変換の組 (輝度, 4..32)
@@ -215,6 +218,7 @@ private:
     void rdoq(Leaf& lf, int l, const std::vector<double>& e, uint32_t xb) const;
     uint32_t xb_ctx(int x0, int y0, int s) const;
     const Plane* xband_ = nullptr;
+    const Plane* tband_ = nullptr;
     void quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) const;
     void reconstruct(const Leaf& lf, int x0, int y0, int l, const int32_t* pred);
     double leaf_bits(const Leaf& lf, int x0, int y0, int l) const;

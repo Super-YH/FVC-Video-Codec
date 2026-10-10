@@ -355,7 +355,7 @@ void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, c
                 for (int y = 0; y < BH; ++y)
                     for (int x = 0; x < BW; ++x) {
                         const size_t i = static_cast<size_t>(std::min(y, bh - 1)) * bw + std::min(x, bw - 1);
-                        const double v = xb[k][i] - (P ? pb[k][i] : 0.0);
+                        const double v = xb[k][i];  // P/B でも入力帯域そのもの (時間方向予測はモードで選ぶ)
                         target.at(x, y) = static_cast<int32_t>(std::lround(v * nrm));
                     }
             }
@@ -372,12 +372,20 @@ void code_bands_blocks(SymIO& io, Models& md, int pqmf_log2, const Plane* org, c
                         if ((horiz ? x : y) & 1) xp.at(x, y) = -xp.at(x, y);
                 bc.set_xband(&xp);
             }
+            Plane tp;
+            if (P) {
+                tp = Plane(BW, BH);
+                for (int y = 0; y < BH; ++y)
+                    for (int x = 0; x < BW; ++x)
+                        tp.at(x, y) = static_cast<int32_t>(std::lround(pb[k][static_cast<size_t>(std::min(y, bh - 1)) * bw + std::min(x, bw - 1)] * nrm));
+                bc.set_tband(&tp);
+            }
             for (int cy = 0; cy < BH; cy += kCtu)
                 for (int cx = 0; cx < BW; cx += kCtu) bc.code_ctu(io, md, cx, cy, kCtu);
             for (int y = 0; y < bh; ++y)
                 for (int x = 0; x < bw; ++x) {
                     const size_t i = static_cast<size_t>(y) * bw + x;
-                    rb[k][i] = R.at(x, y) / nrm + (P ? pb[k][i] : 0.0);
+                    rb[k][i] = R.at(x, y) / nrm;
                 }
             rk_plane[k] = std::move(R);
         }
@@ -681,15 +689,17 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         Plane opad;
         if (org) opad = pad_plane(org->p[pi], W, H);
         Plane R(W, H, 0);
-        if (fp.lossy) {
+        BlockUsage* cur_usage = usage;
+        // プレーンの非可逆符号化 (bands: PQMF 帯域方式 / false: 画素領域のブロック方式)
+        auto code_lossy = [&](SymIO& io, Models& md, TileStreams& ts, bool bands, Plane& R) {
             const int pqp = std::clamp(fp.qp + (pi ? fp.cqp_off : 0), 0, 63);
             const double step = qp_step(pqp, info.bit_depth);
-            if (fp.pqmf_log2 > 0 && !inter && fp.band_blocks) {
+            if (bands && !inter && fp.band_blocks) {
                 const double lam = 0.57 * std::pow(2.0, (pqp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
                 code_bands_blocks(io, md, fp.pqmf_log2, org ? &opad : nullptr, nullptr, R, step, lam, lo, hi, pi, fp.tools,
                                   fp.search, fp.min_log2, fp.max_log2);
                 if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lam, lo, hi);
-            } else if (fp.pqmf_log2 > 0 && !inter) {
+            } else if (bands && !inter) {
                 code_bands(io, md, fp.pqmf_log2, org ? &opad : nullptr, R, step, 1.0 / 3.0, lo, hi, fp.band_tools, fp.psy,
                            static_cast<uint64_t>(fp.poc) * 3 + pi);
             } else {
@@ -735,7 +745,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 };
                 // 動画での PQMF (§3, §7.5): P/B では予測のみをブロックで作り、残差を帯域符号化する
                 Tools btools = fp.tools;
-                btools.pred_only = inter && fp.pqmf_log2 > 0;
+                btools.pred_only = inter && bands;
                 // タイル分割と並列符号化/復号
                 const int ncx = W / kCtu, ncy = H / kCtu;
                 const int tcn = std::clamp(fp.tile_cols, 1, ncx), trn = std::clamp(fp.tile_rows, 1, ncy);
@@ -790,7 +800,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 }
                 for (const auto& e : errs) if (!e.empty()) throw std::runtime_error(e);
                 if (io.enc) for (int t = 0; t < nt; ++t) ts.out.push_back(tw[t]->finish());
-                if (usage) for (int t = 0; t < nt; ++t) usage->add(coders[t]->usage());
+                if (cur_usage) for (int t = 0; t < nt; ++t) cur_usage->add(coders[t]->usage());
                 // ループフィルタ用のブロック情報をタイルから合成
                 EdgeInfo einfo;
                 einfo.w4 = W / 4; einfo.h4 = H / 4;
@@ -821,6 +831,38 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 }
                 if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lambda, lo, hi);
             }
+                };
+        if (fp.lossy) {
+            bool bands = fp.pqmf_log2 > 0;
+            if (fp.pqmf_log2 > 0) {
+                // 符号器: 帯域方式と画素ブロック方式を実際に符号化して J = D + λR で選ぶ (選択は 1 ビット)
+                if (io.enc) {
+                    const int pqp = std::clamp(fp.qp + (pi ? fp.cqp_off : 0), 0, 63);
+                    const double lam = 0.57 * std::pow(2.0, (pqp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
+                    double bestj = 1e300;
+                    for (int b = 0; b < 2; ++b) {
+                        Models mt = md;
+                        EntropyWriter tw;
+                        SymIO tio;
+                        tio.w = &tw;
+                        tio.enc = true;
+                        TileStreams tts;
+                        Plane Rt(W, H, 0);
+                        cur_usage = nullptr;
+                        code_lossy(tio, mt, tts, b != 0, Rt);
+                        size_t bytes = tw.finish().size();
+                        for (const auto& t : tts.out) bytes += t.size();
+                        double d = 0;
+                        for (int y = 0; y < h; ++y)
+                            for (int x = 0; x < w; ++x) { const double e = org->p[pi].at(x, y) - Rt.at(x, y); d += e * e; }
+                        const double j = d + lam * 8.0 * bytes;
+                        if (j < bestj) { bestj = j; bands = b != 0; }
+                    }
+                    cur_usage = usage;
+                }
+                bands = io.bit(md.band_mode, 9, static_cast<uint32_t>(pi), 0, bands);
+            }
+            code_lossy(io, md, ts, bands, R);
         }
         if (pi == 0) luma_rec = R;
         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) out.at(x, y) = R.at(x, y);
