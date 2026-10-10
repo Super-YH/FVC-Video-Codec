@@ -1107,7 +1107,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     for (size_t ci = 0; ci < cands.size(); ++ci) {
         const Leaf& base = cands[ci];
         std::copy(preds[ci].begin(), preds[ci].end(), pred.begin());
-        const int nmts = (tools_.mts && search_.try_mts && is_luma() && s <= 32) ? 5 : 1;
+        const int nmts = (tools_.mts && search_.try_mts && is_luma() && s <= 32) ? (s <= 16 ? 9 : 5) : 1;
         for (int mt = 0; mt < nmts; ++mt)
         for (int qm = 0; qm <= (tools_.e8 && search_.try_e8 ? 1 : 0); ++qm)
             for (int tn = 0; tn <= (tools_.tns && search_.try_tns && s >= 8 ? 1 : 0); ++tn) {
@@ -1290,9 +1290,12 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         if (tools_.mts && is_luma() && s <= 32) {
             int m = io.bit(md.e8, 5, L, static_cast<uint32_t>(lf.pt), lf.mts != 0);
             if (m) {
-                const int hi2 = io.bit(md.e8, 6, L, 0, (lf.mts - 1) >> 1);
-                const int lo2 = io.bit(md.e8, 7, L, static_cast<uint32_t>(hi2), (lf.mts - 1) & 1);
-                m = 1 + hi2 * 2 + lo2;
+                // 1..4: DST7/DCT8 の組, 5..8 (16x16 以下): DCT2 混合と恒等変換
+                const int ext = s <= 16 ? io.bit(md.e8, 8, L, 0, lf.mts >= 5) : 0;
+                const int v = ext ? lf.mts - 5 : lf.mts - 1;
+                const int hi2 = io.bit(md.e8, 6 + 3 * ext, L, 0, v >> 1);
+                const int lo2 = io.bit(md.e8, 7 + 3 * ext, L, static_cast<uint32_t>(hi2), v & 1);
+                m = 1 + ext * 4 + hi2 * 2 + lo2;
             }
             lf.mts = m;
         } else {

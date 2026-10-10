@@ -95,10 +95,11 @@ static int cmd_enc(int argc, char** argv) {
         info = y4m.info();
     }
     cfg.keep_recon = false;
-    Encoder enc(info, cfg);
-    const char* kPreset[] = {"faster", "fast", "medium", "slow", "placebo"};
     int total = is_ppm ? 1 : y4m_frame_count(in, info);
     if (total > 0) total = std::min(total, max_frames);
+    cfg.total_frames = std::max(0, total);
+    Encoder enc(info, cfg);
+    const char* kPreset[] = {"faster", "fast", "medium", "slow", "placebo"};
     const double fps = static_cast<double>(info.fps_num) / std::max(1, info.fps_den);
     if (!quiet) {
         // 開始時の設定表示 (LAME 風)

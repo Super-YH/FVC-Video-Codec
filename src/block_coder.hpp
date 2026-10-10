@@ -1,5 +1,6 @@
 // FVC 内部: ブロック単位のイントラ符号化 (仕様 §5, §6, §2.3)
 #pragma once
+#include <cstdlib>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -216,8 +217,10 @@ private:
     TxType tx_for(int s) const { return s == 4 ? TxType::DST7 : TxType::DCT2; }
     // MTS (§5.2): 0 = 既定, 1..4 = (水平, 垂直) ∈ {DST7,DST7} {DCT8,DST7} {DST7,DCT8} {DCT8,DCT8}
     void tx_pair(int mts, int s, TxType& th, TxType& tv) const {
-        static constexpr TxType kH[5] = {TxType::DCT2, TxType::DST7, TxType::DCT8, TxType::DST7, TxType::DCT8};
-        static constexpr TxType kV[5] = {TxType::DCT2, TxType::DST7, TxType::DST7, TxType::DCT8, TxType::DCT8};
+        static constexpr TxType kH[9] = {TxType::DCT2, TxType::DST7, TxType::DCT8, TxType::DST7, TxType::DCT8,
+                                         TxType::DST7, TxType::DCT2, TxType::IDTX, TxType::DCT2};
+        static constexpr TxType kV[9] = {TxType::DCT2, TxType::DST7, TxType::DST7, TxType::DCT8, TxType::DCT8,
+                                         TxType::DCT2, TxType::DST7, TxType::IDTX, TxType::DCT8};
         if (mts == 0) { th = tv = tx_for(s); return; }
         th = kH[mts]; tv = kV[mts];
     }

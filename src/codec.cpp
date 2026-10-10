@@ -36,6 +36,11 @@ constexpr uint32_t kMagic = 0x46564331;  // 'FVC1'
 void put_u8(std::vector<uint8_t>& o, uint32_t v) { o.push_back(static_cast<uint8_t>(v)); }
 void put_u16(std::vector<uint8_t>& o, uint32_t v) { put_u8(o, v >> 8); put_u8(o, v); }
 void put_u32(std::vector<uint8_t>& o, uint32_t v) { put_u16(o, v >> 16); put_u16(o, v); }
+// 可変長整数 (LEB128: 下位 7 ビットずつ、最上位ビット = 継続)
+void put_uv(std::vector<uint8_t>& o, uint32_t v) {
+    while (v >= 0x80) { o.push_back(static_cast<uint8_t>(v | 0x80)); v >>= 7; }
+    o.push_back(static_cast<uint8_t>(v));
+}
 
 struct ByteReader {
     const uint8_t* d; size_t n, pos = 0;
@@ -43,6 +48,16 @@ struct ByteReader {
     uint32_t u8() { if (pos >= n) { fail = true; return 0; } return d[pos++]; }
     uint32_t u16() { uint32_t a = u8(); return (a << 8) | u8(); }
     uint32_t u32() { uint32_t a = u16(); return (a << 16) | u16(); }
+    uint32_t uv() {
+        uint32_t v = 0;
+        for (int sh = 0; sh < 35; sh += 7) {
+            const uint32_t b = u8();
+            v |= (b & 0x7f) << sh;
+            if (!(b & 0x80)) return v;
+        }
+        fail = true;
+        return 0;
+    }
 };
 
 void put_unit(std::vector<uint8_t>& out, UnitType t, const std::vector<uint8_t>& payload) {
@@ -473,6 +488,7 @@ struct FrameParams {
     bool shapes = false;       // 図形レイヤ (I のみ)
     bool band_tools = false;   // 帯域間差分/ノイズ置換
     bool dict_reset = false;
+    bool dict_add = true;                              // 符号器のみ: 辞書追加 (将来フレーム用) を送るか
     bool lf = true, lf_freq = false, lf_map = false;  // ループフィルタ (§9)
     int tile_cols = 1, tile_rows = 1;                  // タイル分割 (CTU 単位で均等)
     int cqp_off = 0;                                   // 色差 QP オフセット
@@ -933,7 +949,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                         cand.push_back({v / (s * s), {x / 8, y / 8, s}});
                     }
             std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-            for (size_t i = 0; i < cand.size() && i < 16; ++i) adds.push_back(cand[i].second);
+            if (fp.dict_add) for (size_t i = 0; i < cand.size() && i < 16; ++i) adds.push_back(cand[i].second);
         }
         const uint32_t n = io.uint(md.dict, 10, 0, static_cast<uint32_t>(adds.size()));
         if (n > 1024) throw std::runtime_error("corrupt stream: dict adds");
@@ -1019,7 +1035,7 @@ FrameParams params_from(const EncoderConfig& c) {
 
 void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>(fp.type));
-    put_u32(p, static_cast<uint32_t>(fp.poc));
+    put_uv(p, static_cast<uint32_t>(fp.poc));
     put_u8(p, static_cast<uint32_t>(fp.qp));
     put_u8(p, (fp.l2 ? 1u : 0u) | (fp.lossy ? 2u : 0u) | (static_cast<uint32_t>(fp.pqmf_log2) << 2));
     put_u8(p, static_cast<uint32_t>(fp.min_log2) | (static_cast<uint32_t>(fp.max_log2) << 4));
@@ -1032,7 +1048,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
                   (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
-        for (int poc : fp.ref_poc[l]) put_u32(p, static_cast<uint32_t>(poc));
+        for (int poc : fp.ref_poc[l]) put_uv(p, static_cast<uint32_t>(poc));
     }
 }
 
@@ -1040,7 +1056,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     const uint32_t t = br.u8();
     if (t > 3) return false;
     fp.type = static_cast<FrameType>(t);
-    fp.poc = static_cast<int>(br.u32());
+    fp.poc = static_cast<int>(br.uv());
     fp.qp = static_cast<int>(br.u8());
     const uint32_t f = br.u8();
     fp.l2 = f & 1; fp.lossy = (f >> 1) & 1; fp.pqmf_log2 = (f >> 2) & 7;
@@ -1069,7 +1085,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
         const uint32_t n = br.u8();
         if (n > 4) return false;
         fp.ref_poc[l].clear();
-        for (uint32_t i = 0; i < n; ++i) fp.ref_poc[l].push_back(static_cast<int>(br.u32()));
+        for (uint32_t i = 0; i < n; ++i) fp.ref_poc[l].push_back(static_cast<int>(br.uv()));
     }
     if (br.fail || fp.qp > 63 || fp.pqmf_log2 > 4 || fp.min_log2 < 2 || fp.max_log2 > kCtuLog2 || fp.min_log2 > fp.max_log2)
         return false;
@@ -1093,8 +1109,8 @@ std::vector<uint8_t> Encoder::sequence_header() const {
     put_u8(p, static_cast<uint32_t>(info_.bit_depth));
     put_u8(p, static_cast<uint32_t>(info_.chroma));
     put_u8(p, static_cast<uint32_t>(info_.ct));
-    put_u32(p, static_cast<uint32_t>(info_.fps_num));
-    put_u32(p, static_cast<uint32_t>(info_.fps_den));
+    put_uv(p, static_cast<uint32_t>(info_.fps_num));
+    put_uv(p, static_cast<uint32_t>(info_.fps_den));
     put_unit(out, UnitType::Seq, p);
     return out;
 }
@@ -1102,6 +1118,7 @@ std::vector<uint8_t> Encoder::sequence_header() const {
 std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType type, int depth,
                                              const std::vector<const Frame*>& look) {
     FrameParams fp = params_from(cfg_);
+    fp.dict_add = cfg_.total_frames != 1;
     fp.poc = poc;
     fp.type = type;
     if (type == FrameType::I) {
@@ -1209,12 +1226,12 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         std::vector<uint8_t> p;
         write_frame_header(p, par);
         auto bytes = ew.finish();
-        put_u32(p, static_cast<uint32_t>(bytes.size()));
+        put_uv(p, static_cast<uint32_t>(bytes.size()));
         p.insert(p.end(), bytes.begin(), bytes.end());
-        put_u16(p, static_cast<uint32_t>(ts.out.size()));
-        for (const auto& t : ts.out) {
-            put_u32(p, static_cast<uint32_t>(t.size()));
-            p.insert(p.end(), t.begin(), t.end());
+        put_uv(p, static_cast<uint32_t>(ts.out.size()));
+        for (size_t i = 0; i < ts.out.size(); ++i) {  // 最後のタイルの長さは残り全部 (省略)
+            if (i + 1 < ts.out.size()) put_uv(p, static_cast<uint32_t>(ts.out[i].size()));
+            p.insert(p.end(), ts.out[i].begin(), ts.out[i].end());
         }
         return p;
     };
@@ -1298,6 +1315,42 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         st_->last_mf = best->mf;
         st_->last_ref_poc[0] = best->rp[0]; st_->last_ref_poc[1] = best->rp[1];
         usage = best->usage;
+        done = true;
+    }
+    if (!done && type == FrameType::I && cfg_.preset >= Preset::Slow && cfg_.lossy_layer && !cfg_.l2_lossless &&
+        (fp.tools.tns || fp.tools.ibc || fp.tools.dict || fp.tools.mts)) {
+        // フレーム単位の道具 RD 試行 (I のみ): 稀にしか選ばれない道具はフラグの符号量で損をするため、
+        // TNS/IBC/辞書/MTS を外した符号化と D + λR を比べ、小さい方を採る
+        const Dictionary dict0 = st_->dict;
+        auto mf0 = st_->last_mf;
+        const std::vector<int> rp0[2] = {st_->last_ref_poc[0], st_->last_ref_poc[1]};
+        const double lam = 0.57 * std::pow(2.0, (fp.qp - 12) / 3.0) * std::pow(4.0, info_.bit_depth - 8);
+        auto jcost = [&](const std::vector<uint8_t>& pl, const Frame& r) {
+            double d = 0;
+            for (int pi = 0; pi < 3; ++pi)
+                for (size_t i = 0; i < f.p[pi].v.size(); ++i) { const double e = f.p[pi].v[i] - r.p[pi].v[i]; d += e * e; }
+            return d + lam * 8.0 * static_cast<double>(pl.size());
+        };
+        payload = run(fp, rec);
+        ++trials;
+        const double j0 = jcost(payload, rec);
+        const Dictionary dict1 = st_->dict;
+        auto mf1 = st_->last_mf;
+        const std::vector<int> rp1[2] = {st_->last_ref_poc[0], st_->last_ref_poc[1]};
+        const BlockUsage u1 = usage;
+        st_->dict = dict0; st_->last_mf = mf0; st_->last_ref_poc[0] = rp0[0]; st_->last_ref_poc[1] = rp0[1];
+        FrameParams lite = fp;
+        lite.tools.tns = lite.tools.ibc = lite.tools.dict = lite.tools.mts = false;
+        lite.search.try_tns = lite.search.try_mts = false;
+        Frame rec2;
+        auto pl2 = run(lite, rec2);
+        ++trials;
+        if (jcost(pl2, rec2) < j0) {
+            payload = std::move(pl2); rec = std::move(rec2); fp = lite;
+        } else {
+            st_->dict = dict1; st_->last_mf = mf1; st_->last_ref_poc[0] = rp1[0]; st_->last_ref_poc[1] = rp1[1];
+            usage = u1;
+        }
         done = true;
     }
     if (!done) { payload = run(fp, rec); ++trials; }
@@ -1414,8 +1467,8 @@ bool Decoder::parse_seq() {
     info_.bit_depth = static_cast<int>(br.u8());
     info_.chroma = static_cast<ChromaFormat>(br.u8());
     info_.ct = static_cast<ColorTransform>(br.u8());
-    info_.fps_num = static_cast<int>(br.u32());
-    info_.fps_den = static_cast<int>(br.u32());
+    info_.fps_num = static_cast<int>(br.uv());
+    info_.fps_den = static_cast<int>(br.uv());
     return !br.fail && info_.width > 0 && info_.height > 0 && info_.bit_depth >= 8 && info_.bit_depth <= 16;
 }
 
@@ -1442,14 +1495,15 @@ bool Decoder::decode_unit() {
         ByteReader hr{pl, len};
         FrameParams fp;
         if (!read_frame_header(hr, fp)) { ok_ = false; return false; }
-        const uint32_t mlen = hr.u32();
+        const uint32_t mlen = hr.uv();
         if (hr.fail || hr.pos + mlen > len) { ok_ = false; return false; }
         EntropyReader er(pl + hr.pos, mlen);
         hr.pos += mlen;
         TileStreams ts;
-        const uint32_t ntl = hr.u16();
+        const uint32_t ntl = hr.uv();
+        if (ntl > 4096) { ok_ = false; return false; }
         for (uint32_t i = 0; i < ntl && !hr.fail; ++i) {
-            const uint32_t tl = hr.u32();
+            const uint32_t tl = i + 1 < ntl ? hr.uv() : static_cast<uint32_t>(len - std::min<size_t>(len, hr.pos));
             if (hr.fail || hr.pos + tl > len) { ok_ = false; return false; }
             ts.in.push_back({pl + hr.pos, tl});
             hr.pos += tl;
