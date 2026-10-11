@@ -66,6 +66,7 @@ static int cmd_enc(int argc, char** argv) {
         else if (a.rfind("--gs=", 0) == 0) cfg.gs = std::atoi(a.c_str() + 5);
         else if (a.rfind("--firb=", 0) == 0) cfg.firb = std::atoi(a.c_str() + 7);
         else if (a == "--me=adam") cfg.adam = 1;
+        else if (a == "--dict-bias" && i + 1 < argc) cfg.dict_bias = std::atof(argv[++i]);
         else if (a == "--me=full") cfg.adam = 0;
         else if (a == "--band-coder" && i + 1 < argc) cfg.band_samples = std::string(argv[++i]) == "samples";
         else if (a == "--tune" && i + 1 < argc) cfg.tune_psnr = std::string(argv[++i]) == "psnr";

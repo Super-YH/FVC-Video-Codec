@@ -651,8 +651,14 @@ void BlockCoder::predict_base(const Leaf& lf, int x0, int y0, int l, int32_t* pr
     } else if (lf.pt == 3) {
         intra_angular(x0, y0, s, kModeDC, pred);
         const std::vector<int32_t>& d = dict_atom(lf.dict_idx, s);
-        for (int i = 0; i < s * s; ++i)
-            pred[i] = std::clamp(pred[i] + static_cast<int32_t>((static_cast<int64_t>(lf.dict_gain) * d[i] + 8) >> 4), lo_, hi_);
+        if (lf.dict_idx2 >= 0) {
+            const std::vector<int32_t>& d2 = dict_atom(lf.dict_idx2, s);
+            for (int i = 0; i < s * s; ++i)
+                pred[i] = std::clamp(pred[i] + static_cast<int32_t>((static_cast<int64_t>(lf.dict_gain) * d[i] + static_cast<int64_t>(lf.dict_gain2) * d2[i] + 8) >> 4), lo_, hi_);
+        } else {
+            for (int i = 0; i < s * s; ++i)
+                pred[i] = std::clamp(pred[i] + static_cast<int32_t>((static_cast<int64_t>(lf.dict_gain) * d[i] + 8) >> 4), lo_, hi_);
+        }
     } else if (lf.pt == 1) {
         for (int y = 0; y < s; ++y)
             for (int x = 0; x < s; ++x) pred[y * s + x] = rec_->at(x0 + lf.bvx + x, y0 + lf.bvy + y);
@@ -937,11 +943,23 @@ void BlockCoder::rect_search(int x0, int y0, int s, std::vector<Leaf>& cands) {
 }
 
 // ---------------- 辞書予測 (§10.3) ----------------
+static int l_of(int s) { int l = 0; while ((1 << l) < s) ++l; return l; }
+
 void BlockCoder::dict_search(int x0, int y0, int s, std::vector<Leaf>& cands) const {
     std::vector<int32_t> dc(static_cast<size_t>(s) * s);
     intra_angular(x0, y0, s, kModeDC, dc.data());
     int bi, bg;
-    if (dict_best_atom(x0, y0, s, dc.data(), bi, bg)) { Leaf lf; lf.pt = 3; lf.dict_idx = bi; lf.dict_gain = bg; cands.push_back(lf); }
+    if (!dict_best_atom(x0, y0, s, dc.data(), bi, bg)) return;
+    Leaf lf; lf.pt = 3; lf.dict_idx = bi; lf.dict_gain = bg;
+    cands.push_back(lf);
+    // 2 段目 (マッチング追跡): 1 個目を加えた予測の残差に最も合う原子を足した変種
+    std::vector<int32_t> p1(static_cast<size_t>(s) * s);
+    predict(lf, x0, y0, l_of(s), p1.data());
+    int bi2, bg2;
+    if (dict_best_atom(x0, y0, s, p1.data(), bi2, bg2) && bi2 != bi) {
+        Leaf l2 = lf; l2.dict_idx2 = bi2; l2.dict_gain2 = bg2;
+        cands.push_back(l2);
+    }
 }
 
 // 帯域間文脈: ブロック位置の隣接帯域の平均振幅 (量子化ステップ単位) を 4 段階 (+1, 0 = 情報なし)
@@ -1473,6 +1491,19 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         lf.qmode = qm;
         lf.mts = mt;
         lf.tns_on = tn;
+        if (lf.pt == 3 || lf.dres >= 0) {
+            // 辞書の葉: 残差なし (予測そのものが再構成)
+            if (mt || qm || tn) return 1e300;
+            lf.q.assign(static_cast<size_t>(n), 0); lf.last = -1; lf.nf = 0; lf.tns_on = false; lf.mts = 0; lf.qmode = 0;
+            reconstruct(lf, x0, y0, l, preds[ci].data());
+            const double dist = sse(x0, y0, s);
+            const double bias = search_.dict_bias;
+            const double j = dist + lambda_ * (leaf_rate(lf, x0, y0, l) + split_rate(x0, y0, l, 0) + bias);
+            lf.rd_dist = dist;
+            if (j < best) { best = j; best_leaf = lf; save(x0, y0, s, best_rec); }
+            restore(x0, y0, s, before);
+            return j;
+        }
         if (!tools_.pred_only && (ci != cache_ci || mt != cache_mt)) {
             fwd_coefs(mt, x0, y0, l, preds[ci].data(), cache_c);
             cache_ci = ci; cache_mt = mt;
@@ -1630,6 +1661,14 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         if (lf.dict_idx >= dict_count(s)) throw std::runtime_error("corrupt stream: dict index");
         lf.dict_gain = io.sint(md.dict, 2, L, lf.dict_gain);
         if (std::abs(lf.dict_gain) > 64) throw std::runtime_error("corrupt stream: dict gain");
+        if (io.bit(md.dict, 33, L, 0, lf.dict_idx2 >= 0)) {
+            lf.dict_idx2 = static_cast<int>(io.uint(md.dict, 34, L, static_cast<uint32_t>(std::max(lf.dict_idx2, 0))));
+            if (lf.dict_idx2 >= dict_count(s)) throw std::runtime_error("corrupt stream: dict index2");
+            lf.dict_gain2 = io.sint(md.dict, 35, L, lf.dict_gain2);
+            if (lf.dict_gain2 == 0 || std::abs(lf.dict_gain2) > 64) throw std::runtime_error("corrupt stream: dict gain2");
+        } else {
+            lf.dict_idx2 = -1; lf.dict_gain2 = 0;
+        }
     } else {
     if (lf.pt >= 2) lf.pt = 0;
     if (tools_.ibc) lf.pt = io.bit(md.ibc, 0, L, pc, lf.pt);
@@ -1708,7 +1747,8 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         lf.dres = -1; lf.dres_g = 0;
     }
     const uint32_t cbc = cb_ctx(x0, y0, s);
-    const int cbf = tools_.pred_only ? 0 : io.bit(md.cbf, 0, L | (cbc << 4), pc * 64 + static_cast<uint32_t>(lf.pt ? 60 + lf.pt : lf.mode), lf.last >= 0);
+    const bool dict_leaf = lf.pt == 3 || lf.dres >= 0;  // 辞書の葉はパラメトリックのみ (残差なし、cbf を送らない)
+    const int cbf = (tools_.pred_only || dict_leaf) ? 0 : io.bit(md.cbf, 0, L | (cbc << 4), pc * 64 + static_cast<uint32_t>(lf.pt ? 60 + lf.pt : lf.mode), lf.last >= 0);
     if (!cbf) {
         lf.last = -1;
         lf.q.assign(lf.qmode == 0 ? n : 0, 0);
@@ -1879,7 +1919,7 @@ void BlockCoder::code_leaf(SymIO& io, Models& md, Leaf& lf, int x0, int y0, int 
         predict(lf, x0, y0, l, pred.data());
         // RD で決めた係数をそのまま使う。再量子化すると RDOQ が更新後の確率モデルで別の係数を選び、
         // RD 時に評価した歪み・符号量と実際の符号化がずれる (実測で葉の約 2 割)
-        if (!search_.requant) {} else quantize(lf, x0, y0, l, pred.data());
+        if (search_.requant && lf.pt != 3 && lf.dres < 0) quantize(lf, x0, y0, l, pred.data());
         lf.ns = 0;
         if (ns_allowed(lf) && lf.last < 0) {
             // 失われた残差の (インターは高域成分の) エネルギーを測る
