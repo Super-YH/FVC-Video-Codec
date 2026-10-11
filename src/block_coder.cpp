@@ -650,15 +650,14 @@ void BlockCoder::predict_base(const Leaf& lf, int x0, int y0, int l, int32_t* pr
             }
     } else if (lf.pt == 3) {
         intra_angular(x0, y0, s, kModeDC, pred);
-        const std::vector<int32_t>& d = dict_atom(lf.dict_idx, s);
-        if (lf.dict_idx2 >= 0) {
-            const std::vector<int32_t>& d2 = dict_atom(lf.dict_idx2, s);
-            for (int i = 0; i < s * s; ++i)
-                pred[i] = std::clamp(pred[i] + static_cast<int32_t>((static_cast<int64_t>(lf.dict_gain) * d[i] + static_cast<int64_t>(lf.dict_gain2) * d2[i] + 8) >> 4), lo_, hi_);
-        } else {
-            for (int i = 0; i < s * s; ++i)
-                pred[i] = std::clamp(pred[i] + static_cast<int32_t>((static_cast<int64_t>(lf.dict_gain) * d[i] + 8) >> 4), lo_, hi_);
+        // 原子の重み付き和を整数で積算し、最後に 1 回だけ丸める
+        std::vector<int64_t> acc(static_cast<size_t>(s) * s, 0);
+        for (int k = 0; k < lf.nat; ++k) {
+            const std::vector<int32_t>& d = dict_atom(lf.at_idx[k], s);
+            for (int i = 0; i < s * s; ++i) acc[i] += static_cast<int64_t>(lf.at_gain[k]) * d[i];
         }
+        for (int i = 0; i < s * s; ++i)
+            pred[i] = std::clamp(pred[i] + static_cast<int32_t>((acc[i] + 8) >> 4), lo_, hi_);
     } else if (lf.pt == 1) {
         for (int y = 0; y < s; ++y)
             for (int x = 0; x < s; ++x) pred[y * s + x] = rec_->at(x0 + lf.bvx + x, y0 + lf.bvy + y);
@@ -948,17 +947,75 @@ static int l_of(int s) { int l = 0; while ((1 << l) < s) ++l; return l; }
 void BlockCoder::dict_search(int x0, int y0, int s, std::vector<Leaf>& cands) const {
     std::vector<int32_t> dc(static_cast<size_t>(s) * s);
     intra_angular(x0, y0, s, kModeDC, dc.data());
-    int bi, bg;
-    if (!dict_best_atom(x0, y0, s, dc.data(), bi, bg)) return;
-    Leaf lf; lf.pt = 3; lf.dict_idx = bi; lf.dict_gain = bg;
-    cands.push_back(lf);
-    // 2 段目 (マッチング追跡): 1 個目を加えた予測の残差に最も合う原子を足した変種
-    std::vector<int32_t> p1(static_cast<size_t>(s) * s);
-    predict(lf, x0, y0, l_of(s), p1.data());
-    int bi2, bg2;
-    if (dict_best_atom(x0, y0, s, p1.data(), bi2, bg2) && bi2 != bi) {
-        Leaf l2 = lf; l2.dict_idx2 = bi2; l2.dict_gain2 = bg2;
-        cands.push_back(l2);
+    // 直交マッチング追跡 (OMP): 残差に最も合う原子を 1 個ずつ選び、そのたびに選んだ全原子の利得を
+    // 最小二乗で解き直して量子化する。原子数 1, 2, 3, 4, 6, 8, 12, 16 の変種を RD に渡す
+    const int n = s * s, na = dict_count(s);
+    std::vector<double> tgt(n);
+    for (int y = 0; y < s; ++y)
+        for (int x = 0; x < s; ++x) tgt[y * s + x] = org_->at(x0 + x, y0 + y) - dc[y * s + x];
+    std::vector<int> sel;
+    std::vector<double> r = tgt;
+    Leaf lf; lf.pt = 3;
+    for (int k = 0; k < Leaf::kMaxAtoms; ++k) {
+        double best = 0;
+        int bi = -1;
+        for (int i = 0; i < na; ++i) {
+            if (std::find(sel.begin(), sel.end(), i) != sel.end()) continue;
+            const auto& d = dict_atom(i, s);
+            double num = 0, den = 0;
+            for (int j = 0; j < n; ++j) { num += r[j] * d[j]; den += static_cast<double>(d[j]) * d[j]; }
+            if (den > 0 && num * num / den > best) { best = num * num / den; bi = i; }
+        }
+        if (bi < 0) break;
+        sel.push_back(bi);
+        // 選んだ原子の最小二乗利得 (正規方程式)
+        const int m = static_cast<int>(sel.size());
+        std::vector<double> G(static_cast<size_t>(m) * (m + 1), 0.0);
+        for (int a = 0; a < m; ++a) {
+            const auto& da = dict_atom(sel[a], s);
+            for (int b = 0; b <= a; ++b) {
+                const auto& db = dict_atom(sel[b], s);
+                double v = 0;
+                for (int j = 0; j < n; ++j) v += static_cast<double>(da[j]) * db[j];
+                G[a * (m + 1) + b] = G[b * (m + 1) + a] = v;
+            }
+            double v = 0;
+            for (int j = 0; j < n; ++j) v += da[j] * tgt[j];
+            G[a * (m + 1) + m] = v;
+            G[a * (m + 1) + a] += 1e-6 * (1 + G[a * (m + 1) + a]);
+        }
+        for (int c = 0; c < m; ++c) {
+            int pv = c;
+            for (int rr = c + 1; rr < m; ++rr) if (std::abs(G[rr * (m + 1) + c]) > std::abs(G[pv * (m + 1) + c])) pv = rr;
+            for (int q = 0; q <= m; ++q) std::swap(G[c * (m + 1) + q], G[pv * (m + 1) + q]);
+            for (int rr = 0; rr < m; ++rr) {
+                if (rr == c || G[c * (m + 1) + c] == 0) continue;
+                const double f = G[rr * (m + 1) + c] / G[c * (m + 1) + c];
+                for (int q = c; q <= m; ++q) G[rr * (m + 1) + q] -= f * G[c * (m + 1) + q];
+            }
+        }
+        lf.nat = 0;
+        std::vector<int> keep;
+        for (int a = 0; a < m; ++a) {
+            const double g = G[a * (m + 1) + a] != 0 ? G[a * (m + 1) + m] / G[a * (m + 1) + a] : 0.0;
+            const int gq = std::clamp(static_cast<int>(std::lround(g * 16.0)), -127, 127);
+            if (!gq) continue;
+            lf.at_idx[lf.nat] = static_cast<int16_t>(sel[a]);
+            lf.at_gain[lf.nat] = static_cast<int16_t>(gq);
+            ++lf.nat;
+            keep.push_back(sel[a]);
+        }
+        sel = keep;
+        if (!lf.nat) break;
+        // 量子化利得での残差を更新
+        r = tgt;
+        for (int a = 0; a < lf.nat; ++a) {
+            const auto& d = dict_atom(lf.at_idx[a], s);
+            for (int j = 0; j < n; ++j) r[j] -= lf.at_gain[a] * d[j] / 16.0;
+        }
+        const int cnt = lf.nat;
+        if (cnt == 1 || cnt == 2 || cnt == 3 || cnt == 4 || cnt == 6 || cnt == 8 || cnt == 12 || cnt == 16) cands.push_back(lf);
+        if (static_cast<int>(sel.size()) < k + 1) break;  // 利得 0 で原子が落ちた: これ以上は進めない
     }
 }
 
@@ -1210,7 +1267,8 @@ double BlockCoder::leaf_bits(const Leaf& lf, int x0, int y0, int l) const {
     } else if (lf.pt == 4) {
         b += 1.0 + 3.0;
     } else if (lf.pt == 3) {
-        b += 1.0 + std::log2(2.0 + dict_count(1 << l)) + 2.0 + 2.0 * std::log2(1.0 + std::abs(lf.dict_gain));
+        for (int k = 0; k < lf.nat; ++k) b += std::log2(2.0 + dict_count(1 << l)) + 2.0 + 2.0 * std::log2(1.0 + std::abs(lf.at_gain[k]));
+        b += 1.0;
     } else if (lf.pt == 1) {
         b += 4.0 + 2.0 * std::log2(1.0 + std::abs(lf.bvx - bv_px_)) + 2.0 * std::log2(1.0 + std::abs(lf.bvy - bv_py_));
     } else if (lf.mode == kModeCfl) {
@@ -1657,17 +1715,16 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         }
     } else if (tools_.dict && dict_on_ && io.bit(md.dict, 0, L, 0, lf.pt == 3)) {
         lf.pt = 3;
-        lf.dict_idx = static_cast<int>(io.uint(md.dict, 1, L, static_cast<uint32_t>(lf.dict_idx)));
-        if (lf.dict_idx >= dict_count(s)) throw std::runtime_error("corrupt stream: dict index");
-        lf.dict_gain = io.sint(md.dict, 2, L, lf.dict_gain);
-        if (std::abs(lf.dict_gain) > 64) throw std::runtime_error("corrupt stream: dict gain");
-        if (io.bit(md.dict, 33, L, 0, lf.dict_idx2 >= 0)) {
-            lf.dict_idx2 = static_cast<int>(io.uint(md.dict, 34, L, static_cast<uint32_t>(std::max(lf.dict_idx2, 0))));
-            if (lf.dict_idx2 >= dict_count(s)) throw std::runtime_error("corrupt stream: dict index2");
-            lf.dict_gain2 = io.sint(md.dict, 35, L, lf.dict_gain2);
-            if (lf.dict_gain2 == 0 || std::abs(lf.dict_gain2) > 64) throw std::runtime_error("corrupt stream: dict gain2");
-        } else {
-            lf.dict_idx2 = -1; lf.dict_gain2 = 0;
+        // 原子数 (1..16)、各原子の番号と利得 (利得は 1 つ前の利得との差分)
+        lf.nat = static_cast<int>(io.uint(md.dict, 1, L, static_cast<uint32_t>(std::max(lf.nat - 1, 0)))) + 1;
+        if (lf.nat > Leaf::kMaxAtoms) throw std::runtime_error("corrupt stream: dict atom count");
+        int pg = 0;
+        for (int k = 0; k < lf.nat; ++k) {
+            lf.at_idx[k] = static_cast<int16_t>(io.uint(md.dict, 2, L | (static_cast<uint32_t>(std::min(k, 3)) << 4), static_cast<uint32_t>(lf.at_idx[k])));
+            if (lf.at_idx[k] >= dict_count(s)) throw std::runtime_error("corrupt stream: dict index");
+            lf.at_gain[k] = static_cast<int16_t>(pg + io.sint(md.dict, 3, L | (static_cast<uint32_t>(std::min(k, 3)) << 4), lf.at_gain[k] - pg));
+            if (lf.at_gain[k] == 0 || std::abs(lf.at_gain[k]) > 127) throw std::runtime_error("corrupt stream: dict gain");
+            pg = lf.at_gain[k];
         }
     } else {
     if (lf.pt >= 2) lf.pt = 0;

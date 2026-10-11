@@ -190,7 +190,10 @@ private:
         int fir[4] = {0, 0, 0, 0};
         int cg[3] = {8, 8, 8};      // pt==2 輝度: 予測係数のバンド別利得 a_b/8 (低/中/高, §7.6-2 係数コピー)  // pt==2 輝度: FIR 動き基底係数 ψ (∂x, ∂y, ∂xx, ∂yy)/16 (§7.3)
         int dict_idx = 0, dict_gain = 0;
-        int dict_idx2 = -1, dict_gain2 = 0;  // pt==3: 2 個目の原子 (-1: なし)。辞書の葉は残差を持たない (パラメトリックのみ)
+        // pt==3: 原子の重み付き和 (最大 kMaxAtoms 個)。予測 = DC + Σ gain_k/16 · 原子_k。辞書の葉は残差を持たない
+        static constexpr int kMaxAtoms = 16;
+        int nat = 0;
+        int16_t at_idx[kMaxAtoms] = {}, at_gain[kMaxAtoms] = {};
         int dres = -1, dres_g = 0;
         double rd_dist = -1;  // 符号器: RD 評価時の歪み (診断用)  // 残差の辞書原子 (任意の予測に g/16 · 原子を加える)。-1: なし
         int xgain = 0;
