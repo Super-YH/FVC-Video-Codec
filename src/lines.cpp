@@ -113,20 +113,30 @@ void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const P
 }
 
 void code_line_motion(SymIO& io, CMModel& m, std::vector<LineSeg>& lines, const GlobalModel& gm) {
-    // 文脈: 左と上のセルの線が変わったか (動物体の線はまとまって変わる)
-    int cw = 1, ch = 1;
-    for (const LineSeg& L : lines) { cw = std::max(cw, L.x / kLineCell + 1); ch = std::max(ch, L.y / kLineCell + 1); }
-    std::vector<int8_t> st(static_cast<size_t>(cw) * ch, 0);  // 0: 線なし/未変更, 1: 変更
+    // 変わった線だけを列挙して送る: 個数、続いて各線の番号の差 (直前に送った線からの間隔)、動きの差分、動く側。
+    // 列挙されない線は大域動きのまま (線ごとのフラグを送らないので、変化が少ないフレームではほぼ 0 ビット)
+    uint32_t nch = 0;
+    for (const LineSeg& L : lines) nch += L.changed ? 1u : 0u;
+    nch = io.uint(m, 10, 0, nch);
+    if (nch > lines.size()) throw std::runtime_error("corrupt stream: line count");
+    std::vector<char> chg(lines.size(), 0);
+    if (io.enc) for (size_t i = 0; i < lines.size(); ++i) chg[i] = lines[i].changed;
+    int prev = -1;
     int pdx = 0, pdy = 0;  // 直前に変わった線の差分 (差分の予測に使う: 動物体の線は同じ向きに動く)
-    for (LineSeg& L : lines) {
+    uint32_t pgap = 0;
+    for (uint32_t k = 0; k < nch; ++k) {
+        int idx = 0;
+        if (io.enc) { idx = prev + 1; while (!chg[static_cast<size_t>(idx)]) ++idx; }
+        const uint32_t gap = io.uint(m, 11, std::min<uint32_t>(pgap, 7), static_cast<uint32_t>(idx - prev - 1));
+        idx = prev + 1 + static_cast<int>(gap);
+        if (idx >= static_cast<int>(lines.size())) throw std::runtime_error("corrupt stream: line index");
+        pgap = gap;
+        prev = idx;
+        LineSeg& L = lines[static_cast<size_t>(idx)];
+        L.changed = true;
+        chg[static_cast<size_t>(idx)] = 1;
         int px, py;
         gm.mv_at(L.x, L.y, px, py);
-        const int cx = L.x / kLineCell, cy = L.y / kLineCell;
-        const uint32_t ctx = static_cast<uint32_t>((cx > 0 ? st[static_cast<size_t>(cy) * cw + cx - 1] : 0) +
-                                                   2 * (cy > 0 ? st[static_cast<size_t>(cy - 1) * cw + cx] : 0));
-        L.changed = io.bit(m, 0, ctx, 0, L.changed) != 0;
-        st[static_cast<size_t>(cy) * cw + cx] = L.changed ? 1 : 0;
-        if (!L.changed) { L.mvx = px; L.mvy = py; L.side = 2; continue; }
         const int dx = pdx + io.sint(m, 1, 0, L.mvx - px - pdx);
         const int dy = pdy + io.sint(m, 2, 0, L.mvy - py - pdy);
         if (std::abs(dx) > 4096 || std::abs(dy) > 4096) throw std::runtime_error("corrupt stream: line motion");
@@ -136,6 +146,13 @@ void code_line_motion(SymIO& io, CMModel& m, std::vector<LineSeg>& lines, const 
         const int both = io.bit(m, 3, 0, 0, L.side == 2);
         L.side = both ? 2 : io.bit(m, 4, 0, 0, L.side == 1);
     }
+    for (size_t i = 0; i < lines.size(); ++i)
+        if (!chg[i]) {
+            LineSeg& L = lines[i];
+            L.changed = false;
+            gm.mv_at(L.x, L.y, L.mvx, L.mvy);
+            L.side = 2;
+        }
 }
 
 void build_line_field(const std::vector<LineSeg>& lines, const GlobalModel& gm, int w4, int h4, std::vector<int16_t>& field) {

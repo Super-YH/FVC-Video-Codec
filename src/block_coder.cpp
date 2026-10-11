@@ -897,6 +897,13 @@ int BlockCoder::merge_list(int x0, int y0, int w, int h, MotionInfo* out) const 
 }
 
 void BlockCoder::mv_pred(int x0, int y0, int list, int ref, int& px, int& py) const {
+    // 線の動き場が大域動きと異なる位置 (変わった線の近く) では、線の動きを予測子にする
+    if (list == 0 && ref == 0 && line_ok()) {
+        const MotionInfo m = line_mi(x0, y0);
+        int gx, gy;
+        inter_.gmv_at(x0 + 2, y0 + 2, gx, gy);
+        if (m.mvx[0] != gx || m.mvy[0] != gy) { px = m.mvx[0]; py = m.mvy[0]; return; }
+    }
     auto try_mi = [&](const MotionInfo& m) {
         if (((m.dir >> list) & 1) && m.ref[list] == ref) { px = m.mvx[list]; py = m.mvy[list]; return true; }
         return false;
@@ -1983,7 +1990,20 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
                 part = is_part ? 1 + io.bit(md.inter, 13, L, 0, lf.part == 2) : 0;
             }
             lf.part = part;
-            lf.lmode = (part == 0 && line_ok()) ? io.bit(md.inter, 50, L, 0, lf.lmode) : 0;
+            if (part == 0 && line_ok()) {
+                // 文脈: ブロック内に変わった線の影響があるか (動き場が大域動きと異なる 4x4 があるか)
+                uint32_t near = 0;
+                for (int yy = 0; yy < s && !near; yy += 4)
+                    for (int xx = 0; xx < s && !near; xx += 4) {
+                        const MotionInfo m = line_mi(x0 + xx, y0 + yy);
+                        int gx, gy;
+                        inter_.gmv_at(x0 + xx + 2, y0 + yy + 2, gx, gy);
+                        near = (m.mvx[0] != gx || m.mvy[0] != gy) ? 1u : 0u;
+                    }
+                lf.lmode = io.bit(md.inter, 50, L, near, lf.lmode);
+            } else {
+                lf.lmode = 0;
+            }
             if (lf.lmode) {
                 lf.merge = -1;
                 lf.mi = line_mi(x0 + s / 2, y0 + s / 2);
