@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <vector>
+#include <unordered_map>
 
 #include "fvc/entropy.hpp"
 #include "fvc/frame.hpp"
@@ -187,6 +188,7 @@ private:
         int fir[4] = {0, 0, 0, 0};
         int cg[3] = {8, 8, 8};      // pt==2 輝度: 予測係数のバンド別利得 a_b/8 (低/中/高, §7.6-2 係数コピー)  // pt==2 輝度: FIR 動き基底係数 ψ (∂x, ∂y, ∂xx, ∂yy)/16 (§7.3)
         int dict_idx = 0, dict_gain = 0;
+        int dres = -1, dres_g = 0;  // 残差の辞書原子 (任意の予測に g/16 · 原子を加える)。-1: なし
         int xgain = 0;
         int xsrc = 0;
         int ns = 0;          // pt==4 時間方向・残差なし: ノイズ置換レベル 0..7 (包絡は参照帯域の振幅)        // pt==4: 0 = 帯域間 (ゲイン ±1..4 /4), 1 = 時間方向 (ゲイン 1..5 /4)       // pt==4: 帯域間予測ゲイン (±1..4)/4  // pt==3: サイズ別リスト内の位置, ゲイン (1/16)
@@ -239,6 +241,20 @@ private:
     void mpm6(int x0, int y0, int* out) const;  // 6 候補 MPM (全角度モード時)
     void set_modes4(int x0, int y0, int s, int mode);
     void predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) const;
+    void predict_base(const Leaf& lf, int x0, int y0, int l, int32_t* pred) const;
+    // 辞書 (§10): ブロック一辺 s 用の項目リストと、リスト内 k 番目の項目を s x s に整数双線形で再標本化したもの
+    int dict_count(int s) const;  // 大域辞書 + タイル内学習原子の数
+    const std::vector<int32_t>& dict_atom(int k, int s) const;
+    // 残差の辞書原子: 予測 pred に対する残差に最も合う原子 (リスト番号, 利得) を探す。見つからなければ false
+    bool dict_best_atom(int x0, int y0, int s, const int32_t* pred, int& k, int& g) const;
+    mutable std::unordered_map<uint64_t, std::vector<int32_t>> atom_cache_;
+    // フレーム内学習原子 (タイルごと): CTU を符号化するたびに再構成の高分散 16x16 / 8x8 を平均除去して登録する。
+    // 規則は再構成だけで決まるので構文は不要 (符号器・復号器で同一)。番号 serial は再標本化キャッシュ用
+    struct LocalAtom { int n; uint64_t serial; std::vector<int32_t> d; };
+    std::vector<LocalAtom> local_[2];  // [0]: 8x8, [1]: 16x16
+    uint64_t local_serial_ = 0;
+    static constexpr size_t kLocalCap = 256;
+    void learn_atoms(int cx, int cy, int ctu);
     void obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const;
     // Adam による動き推定: 開始点 (sx, sy) [画素] から連続 MV を最適化し、整数画素に丸めて返す
     void adam_motion(const Plane& rp, int x0, int y0, int w, int h, double sx, double sy, int& ox, int& oy) const;

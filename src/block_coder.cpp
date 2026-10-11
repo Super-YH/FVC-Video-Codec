@@ -492,7 +492,94 @@ void BlockCoder::adam_motion(const Plane& rp, int x0, int y0, int w, int h, doub
     oy = static_cast<int>(std::lround(ty));
 }
 
+// 辞書原子の再標本化 (規範): 原寸 n から一辺 s へ整数双線形。標本位置 ((2x+1)n − s)/(2s) を 1/256 精度で求める
+namespace {
+void dict_resample(const std::vector<int32_t>& d, int n, int s, std::vector<int32_t>& out) {
+    out.resize(static_cast<size_t>(s) * s);
+    if (n == s) { std::copy(d.begin(), d.end(), out.begin()); return; }
+    auto pos = [&](int x, int& i0, int& f) {
+        int p = ((2 * x + 1) * n * 128) / s - 128;  // 1/256 画素
+        if (p < 0) p = 0;
+        i0 = p >> 8;
+        f = p & 255;
+        if (i0 >= n - 1) { i0 = n - 1; f = 0; }
+    };
+    for (int y = 0; y < s; ++y) {
+        int iy, fy;
+        pos(y, iy, fy);
+        const int iy1 = std::min(iy + 1, n - 1);
+        for (int x = 0; x < s; ++x) {
+            int ix, fx;
+            pos(x, ix, fx);
+            const int ix1 = std::min(ix + 1, n - 1);
+            const int64_t a = d[iy * n + ix], b = d[iy * n + ix1], c = d[iy1 * n + ix], e = d[iy1 * n + ix1];
+            const int64_t v = (a * (256 - fx) + b * fx) * (256 - fy) + (c * (256 - fx) + e * fx) * fy;
+            out[y * s + x] = static_cast<int32_t>((v + (v >= 0 ? 32768 : -32768)) / 65536);
+        }
+    }
+}
+}  // namespace
+
+int BlockCoder::dict_count(int s) const {
+    const int c = s <= 8 ? 0 : 1;
+    return static_cast<int>(dict_->ids_for(c ? 16 : 8).size() + local_[c].size());
+}
+
+const std::vector<int32_t>& BlockCoder::dict_atom(int k, int s) const {
+    const int c = s <= 8 ? 0 : 1;
+    const auto& g = dict_->ids_for(c ? 16 : 8);
+    if (k >= static_cast<int>(g.size())) {
+        const LocalAtom& a = local_[c][k - g.size()];
+        const uint64_t key = (uint64_t(1) << 62) | (a.serial << 8) | static_cast<uint64_t>(s);
+        auto it = atom_cache_.find(key);
+        if (it != atom_cache_.end()) return it->second;
+        std::vector<int32_t> out;
+        dict_resample(a.d, a.n, s, out);
+        return atom_cache_.emplace(key, std::move(out)).first->second;
+    }
+    const int id = g[k];
+    const uint64_t key = (static_cast<uint64_t>(id) << 8) | static_cast<uint64_t>(s);
+    auto it = atom_cache_.find(key);
+    if (it != atom_cache_.end()) return it->second;
+    std::vector<int32_t> out;
+    dict_resample(dict_->data(id), dict_->size_of(id), s, out);
+    return atom_cache_.emplace(key, std::move(out)).first->second;
+}
+
+bool BlockCoder::dict_best_atom(int x0, int y0, int s, const int32_t* pred, int& k, int& g) const {
+    const int na = dict_count(s);
+    const int n = s * s;
+    std::vector<double> r(n);
+    for (int y = 0; y < s; ++y)
+        for (int x = 0; x < s; ++x) r[y * s + x] = org_->at(x0 + x, y0 + y) - pred[y * s + x];
+    double best = 0;
+    k = -1; g = 0;
+    for (int i = 0; i < na; ++i) {
+        const auto& d = dict_atom(i, s);
+        double num = 0, den = 0;
+        for (int j = 0; j < n; ++j) { num += r[j] * d[j]; den += static_cast<double>(d[j]) * d[j]; }
+        if (den <= 0) continue;
+        const double gain = num * num / den;  // SSE 減少量
+        if (gain > best) {
+            const int gq = std::clamp(static_cast<int>(std::lround(num / den * 16.0)), -64, 64);
+            if (!gq) continue;
+            best = gain; k = static_cast<int>(i); g = gq;
+        }
+    }
+    return k >= 0;
+}
+
 void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) const {
+    predict_base(lf, x0, y0, l, pred);
+    if (lf.dres >= 0 && dict_) {
+        const int s = 1 << l;
+        const auto& d = dict_atom(lf.dres, s);
+        for (int i = 0; i < s * s; ++i)
+            pred[i] = std::clamp(pred[i] + static_cast<int32_t>((static_cast<int64_t>(lf.dres_g) * d[i] + 8) >> 4), lo_, hi_);
+    }
+}
+
+void BlockCoder::predict_base(const Leaf& lf, int x0, int y0, int l, int32_t* pred) const {
     const int s = 1 << l;
     if (lf.pt == 2) {
         if (is_luma()) {
@@ -563,7 +650,7 @@ void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) c
             }
     } else if (lf.pt == 3) {
         intra_angular(x0, y0, s, kModeDC, pred);
-        const std::vector<int32_t>& d = dict_->data(dict_->ids_for(s)[lf.dict_idx]);
+        const std::vector<int32_t>& d = dict_atom(lf.dict_idx, s);
         for (int i = 0; i < s * s; ++i)
             pred[i] = std::clamp(pred[i] + static_cast<int32_t>((static_cast<int64_t>(lf.dict_gain) * d[i] + 8) >> 4), lo_, hi_);
     } else if (lf.pt == 1) {
@@ -851,27 +938,10 @@ void BlockCoder::rect_search(int x0, int y0, int s, std::vector<Leaf>& cands) {
 
 // ---------------- 辞書予測 (§10.3) ----------------
 void BlockCoder::dict_search(int x0, int y0, int s, std::vector<Leaf>& cands) const {
-    const auto& ids = dict_->ids_for(s);
     std::vector<int32_t> dc(static_cast<size_t>(s) * s);
     intra_angular(x0, y0, s, kModeDC, dc.data());
-    std::vector<double> r(static_cast<size_t>(s) * s);
-    for (int y = 0; y < s; ++y)
-        for (int x = 0; x < s; ++x) r[y * s + x] = org_->at(x0 + x, y0 + y) - dc[y * s + x];
-    double best = 0;
-    int bi = -1, bg = 0;
-    for (size_t k = 0; k < ids.size(); ++k) {
-        const auto& d = dict_->data(ids[k]);
-        double num = 0, den = 0;
-        for (size_t i = 0; i < d.size(); ++i) { num += r[i] * d[i]; den += static_cast<double>(d[i]) * d[i]; }
-        if (den <= 0) continue;
-        const double gain = num * num / den;  // SSE 減少量
-        if (gain > best) {
-            best = gain;
-            bi = static_cast<int>(k);
-            bg = std::clamp(static_cast<int>(std::lround(num / den * 16.0)), -64, 64);
-        }
-    }
-    if (bi >= 0 && bg != 0) { Leaf lf; lf.pt = 3; lf.dict_idx = bi; lf.dict_gain = bg; cands.push_back(lf); }
+    int bi, bg;
+    if (dict_best_atom(x0, y0, s, dc.data(), bi, bg)) { Leaf lf; lf.pt = 3; lf.dict_idx = bi; lf.dict_gain = bg; cands.push_back(lf); }
 }
 
 // 帯域間文脈: ブロック位置の隣接帯域の平均振幅 (量子化ステップ単位) を 4 段階 (+1, 0 = 情報なし)
@@ -1122,7 +1192,7 @@ double BlockCoder::leaf_bits(const Leaf& lf, int x0, int y0, int l) const {
     } else if (lf.pt == 4) {
         b += 1.0 + 3.0;
     } else if (lf.pt == 3) {
-        b += 1.0 + std::log2(2.0 + dict_->ids_for(1 << l).size()) + 2.0 + 2.0 * std::log2(1.0 + std::abs(lf.dict_gain));
+        b += 1.0 + std::log2(2.0 + dict_count(1 << l)) + 2.0 + 2.0 * std::log2(1.0 + std::abs(lf.dict_gain));
     } else if (lf.pt == 1) {
         b += 4.0 + 2.0 * std::log2(1.0 + std::abs(lf.bvx - bv_px_)) + 2.0 * std::log2(1.0 + std::abs(lf.bvy - bv_py_));
     } else if (lf.mode == kModeCfl) {
@@ -1305,7 +1375,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             }
             else { Leaf lf; lf.pt = 2; cands.push_back(lf); }
         }
-        if (tools_.dict && (s == 8 || s == 16)) dict_search(x0, y0, s, cands);
+        if (tools_.dict) dict_search(x0, y0, s, cands);
         if (xband_) {
             // 帯域間予測: 隣接帯域の最小二乗ゲインを量子化
             double num = 0, den = 0;
@@ -1433,6 +1503,27 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         for (int tn = 0; tn <= ntn; ++tn) jb = std::min(jb, eval(ci, 0, 0, tn));
         j1.push_back({jb, ci});
     }
+    // 残差の辞書原子: 1 段目の上位候補に、残差に最も合う原子を加えた変種を追加して評価
+    if (tools_.dict && !tools_.pred_only) {
+        std::vector<std::pair<double, size_t>> srt = j1;
+        std::sort(srt.begin(), srt.end());
+        const size_t top = std::min<size_t>(srt.size(), static_cast<size_t>(std::max(1, search_.refine_top)));
+        for (size_t t = 0; t < top; ++t) {
+            const size_t ci = srt[t].second;
+            if (cands[ci].pt == 3) continue;
+            int k, g;
+            if (!dict_best_atom(x0, y0, s, preds[ci].data(), k, g)) continue;
+            Leaf v = cands[ci];
+            v.dres = k; v.dres_g = g;
+            std::vector<int32_t> pv(static_cast<size_t>(n));
+            predict(v, x0, y0, l, pv.data());
+            cands.push_back(v);
+            preds.push_back(std::move(pv));
+            double jb = 1e300;
+            for (int tn = 0; tn <= ntn; ++tn) jb = std::min(jb, eval(cands.size() - 1, 0, 0, tn));
+            j1.push_back({jb, cands.size() - 1});
+        }
+    }
     const int nmts = (tools_.mts && search_.try_mts && is_luma() && s <= 32) ? (s <= 16 ? 9 : 5) : 1;
     const bool try_e8 = tools_.e8 && search_.try_e8, try_gs = tools_.gs && md_ && !tools_.pred_only;
     if (nmts > 1 || try_e8 || try_gs) {
@@ -1529,11 +1620,10 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
             lf.xgain = io.sint(md.dict, 21, L, lf.xgain);
             if (lf.xgain == 0 || std::abs(lf.xgain) > 4) throw std::runtime_error("corrupt stream: xband gain");
         }
-    } else if (tools_.dict && (s == 8 || s == 16) && io.bit(md.dict, 0, L, 0, lf.pt == 3)) {
+    } else if (tools_.dict && io.bit(md.dict, 0, L, 0, lf.pt == 3)) {
         lf.pt = 3;
-        const auto& ids = dict_->ids_for(s);
         lf.dict_idx = static_cast<int>(io.uint(md.dict, 1, L, static_cast<uint32_t>(lf.dict_idx)));
-        if (lf.dict_idx >= static_cast<int>(ids.size())) throw std::runtime_error("corrupt stream: dict index");
+        if (lf.dict_idx >= dict_count(s)) throw std::runtime_error("corrupt stream: dict index");
         lf.dict_gain = io.sint(md.dict, 2, L, lf.dict_gain);
         if (std::abs(lf.dict_gain) > 64) throw std::runtime_error("corrupt stream: dict gain");
     } else {
@@ -1599,6 +1689,20 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
     }
     }
 
+    // 残差の辞書原子 (pt=3 以外の任意の予測に加算)
+    if (tools_.dict && lf.pt != 3) {
+        const int on = io.bit(md.dict, 30, L, static_cast<uint32_t>(lf.pt), lf.dres >= 0);
+        if (on) {
+            lf.dres = static_cast<int>(io.uint(md.dict, 31, L, static_cast<uint32_t>(std::max(lf.dres, 0))));
+            if (lf.dres >= dict_count(s)) throw std::runtime_error("corrupt stream: dict atom");
+            lf.dres_g = io.sint(md.dict, 32, L, lf.dres_g);
+            if (lf.dres_g == 0 || std::abs(lf.dres_g) > 64) throw std::runtime_error("corrupt stream: dict atom gain");
+        } else {
+            lf.dres = -1; lf.dres_g = 0;
+        }
+    } else {
+        lf.dres = -1; lf.dres_g = 0;
+    }
     const uint32_t cbc = cb_ctx(x0, y0, s);
     const int cbf = tools_.pred_only ? 0 : io.bit(md.cbf, 0, L | (cbc << 4), pc * 64 + static_cast<uint32_t>(lf.pt ? 60 + lf.pt : lf.mode), lf.last >= 0);
     if (!cbf) {
@@ -1815,6 +1919,7 @@ void BlockCoder::code_leaf(SymIO& io, Models& md, Leaf& lf, int x0, int y0, int 
                 if (lf.mi.dir == 3) usage_.bi += a;
             } else if (lf.pt == 1) usage_.ibc += a;
             else if (lf.pt == 3) usage_.dict += a;
+            if (lf.dres >= 0) usage_.dres += a;
             else usage_.intra += a;
             if (lf.tns_on) usage_.tns += a;
             if (lf.qmode == 1 && lf.last >= 0) usage_.e8 += a;
@@ -1910,6 +2015,43 @@ void BlockCoder::code_ctu(SymIO& io, Models& md, int cx, int cy, int ctu) {
             }
             code_node(io, md, bx, by, max_log2_);
         }
+    if (tools_.dict) learn_atoms(cx, cy, ctu);
+}
+
+// フレーム内学習原子の登録 (規範): CTU 内の有効領域にある 16x16 / 8x8 セルのうち、再構成の分散が最大の 2 個
+// (同値はラスタ順で先のもの) を平均除去して登録する。分散が小さい (平坦) セルは登録しない
+void BlockCoder::learn_atoms(int cx, int cy, int ctu) {
+    for (int c = 0; c < 2; ++c) {
+        const int n = c ? 16 : 8;
+        std::vector<std::pair<int64_t, int>> cells;  // (分散 x n², ラスタ番号)
+        const int per = ctu / n;
+        for (int j = 0; j < per; ++j)
+            for (int i = 0; i < per; ++i) {
+                const int x0 = cx + i * n, y0 = cy + j * n;
+                if (x0 + n > std::min(vw_, tx1_) || y0 + n > std::min(vh_, ty1_)) continue;
+                int64_t sum = 0, sq = 0;
+                for (int y = 0; y < n; ++y)
+                    for (int x = 0; x < n; ++x) { const int64_t v = rec_->at(x0 + x, y0 + y); sum += v; sq += v * v; }
+                const int64_t var = sq * n * n - sum * sum;  // n^4 · 分散
+                cells.push_back({var, j * per + i});
+            }
+        std::stable_sort(cells.begin(), cells.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        const int64_t minvar = static_cast<int64_t>(16) * n * n * n * n * (int64_t(1) << (2 * std::max(0, bit_depth_ - 8)));
+        for (size_t k = 0; k < cells.size() && k < 2; ++k) {
+            if (cells[k].first < minvar) break;
+            const int x0 = cx + (cells[k].second % per) * n, y0 = cy + (cells[k].second / per) * n;
+            LocalAtom a;
+            a.n = n;
+            a.serial = local_serial_++;
+            a.d.resize(static_cast<size_t>(n) * n);
+            int64_t sum = 0;
+            for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) { a.d[y * n + x] = rec_->at(x0 + x, y0 + y); sum += a.d[y * n + x]; }
+            const int32_t mean = static_cast<int32_t>(sum / (n * n));
+            for (auto& v : a.d) v -= mean;
+            if (local_[c].size() >= kLocalCap) local_[c].erase(local_[c].begin());
+            local_[c].push_back(std::move(a));
+        }
+    }
 }
 
 }  // namespace fvc

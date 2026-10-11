@@ -225,7 +225,7 @@ static int cmd_enc(int argc, char** argv) {
             std::printf("    merge %6.2f%%  (skip %.2f%%)  bi-pred %.2f%%  rect %.2f%%\n", pc(u.merge), pc(u.skip), pc(u.bi), pc(u.rect));
             std::printf("  ibc     %6.2f%%  %s\n", pc(u.ibc), bar(u.ibc).c_str());
             std::printf("  dict    %6.2f%%  %s\n", pc(u.dict), bar(u.dict).c_str());
-            std::printf("  tools   TNS %.2f%%  E8-VQ %.2f%%  GainShape %.2f%%  CfL(chroma area) %llu px\n", pc(u.tns), pc(u.e8), pc(u.gs),
+            std::printf("  tools   TNS %.2f%%  E8-VQ %.2f%%  GainShape %.2f%%  DictAtom %.2f%%  CfL(chroma area) %llu px\n", pc(u.tns), pc(u.e8), pc(u.gs), pc(u.dres),
                         static_cast<unsigned long long>(u.cfl));
             std::printf("\nBlock sizes (luma area)\n");
             for (int i = 0; i < 7; ++i) {

@@ -47,12 +47,12 @@ struct BlockUsage {
     uint64_t intra = 0, inter = 0, ibc = 0, dict = 0;  // 予測種別
     uint64_t merge = 0, skip = 0, rect = 0, bi = 0;    // インターの内訳 (skip = マージかつ残差なし)
     uint64_t size[7] = {0, 0, 0, 0, 0, 0, 0};          // 4x4 .. 256x256 (log2 2..8)
-    uint64_t tns = 0, e8 = 0, cfl = 0, leaves = 0, gs = 0;
+    uint64_t tns = 0, e8 = 0, cfl = 0, leaves = 0, gs = 0, dres = 0;
     void add(const BlockUsage& o) {
         intra += o.intra; inter += o.inter; ibc += o.ibc; dict += o.dict;
         merge += o.merge; skip += o.skip; rect += o.rect; bi += o.bi;
         for (int i = 0; i < 7; ++i) size[i] += o.size[i];
-        tns += o.tns; e8 += o.e8; cfl += o.cfl; leaves += o.leaves; gs += o.gs;
+        tns += o.tns; e8 += o.e8; cfl += o.cfl; leaves += o.leaves; gs += o.gs; dres += o.dres;
     }
 };
 
