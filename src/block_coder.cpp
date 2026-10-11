@@ -445,11 +445,11 @@ void BlockCoder::adam_motion(const Plane& rp, int x0, int y0, int w, int h, doub
         return std::array<double, 3>{(a * (1 - ax) + b * ax) * (1 - ay) + (c * (1 - ax) + d * ax) * ay,
                                      ((b - a) * (1 - ay) + (d - c) * ay), ((c - a) * (1 - ax) + (d - b) * ax)};
     };
-    // 標本は最大 16x16 に間引く (大ブロックでも反復コストを一定に)
-    const int st = std::max(1, std::max(w, h) / 16);
+    // 標本は最大 8x8 に間引く (大ブロックでも反復コストを一定に)
+    const int st = std::max(1, std::max(w, h) / 8);
     double tx = sx, ty = sy, m1x = 0, m1y = 0, m2x = 0, m2y = 0;
     constexpr double b1 = 0.9, b2 = 0.999, eps2 = 16.0;
-    constexpr int kIter = 20;
+    constexpr int kIter = 12;
     for (int it = 1; it <= kIter; ++it) {
         const bool coarse = it <= kIter / 2;
         double gx = 0, gy = 0;
