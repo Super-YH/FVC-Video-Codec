@@ -2043,6 +2043,10 @@ void BlockCoder::code_leaf(SymIO& io, Models& md, Leaf& lf, int x0, int y0, int 
     }
     set_modes4(x0, y0, s, lf.pt ? kModePlanar : lf.mode);
     fill_mf(lf, x0, y0, s);
+    if (io.w && tools_.dict) {  // 符号器: 原子の使用記録 (捨てる判断用、規範外)
+        if (lf.pt == 3) for (int k = 0; k < lf.nat; ++k) mark_atom_used(lf.at_idx[k], s);
+        if (lf.dres >= 0) mark_atom_used(lf.dres, s);
+    }
     if (io.w) {  // 符号器の統計 (輝度面積)
         const uint64_t a = static_cast<uint64_t>(s) * s;
         if (plane_ == 0) {
@@ -2155,8 +2159,42 @@ void BlockCoder::code_ctu(SymIO& io, Models& md, int cx, int cy, int ctu) {
             }
             code_node(io, md, bx, by, max_log2_);
             dict_on_ = true;  // RD 中は辞書を使える前提でレートを見積もる
+            if (tools_.dict && bx < vw_ && by < vh_) { code_discard(io, md); ++root_no_; }
         }
     if (tools_.dict) learn_atoms(cx, cy, ctu);
+}
+
+void BlockCoder::mark_atom_used(int k, int s) {
+    const int c = s <= 8 ? 0 : 1;
+    const auto& g = dict_->ids_for(c ? 16 : 8);
+    if (k < static_cast<int>(g.size())) used_global_.push_back(g[k]);
+    else if (k - g.size() < local_[c].size()) local_[c][k - g.size()].last_used = root_no_;
+}
+
+// 「捨てる」指示 (規範): フラグ 1 のとき、各サイズの学習原子について個数と、昇順の番号を差分で送り、その原子を取り除く。
+// 符号器は search_.dict_age 根ブロック以上使われていない原子を、4 個以上たまったら (またはリストが満杯なら) 捨てる
+void BlockCoder::code_discard(SymIO& io, Models& md) {
+    std::vector<int> del[2];
+    if (io.enc)
+        for (int c = 0; c < 2; ++c)
+            for (size_t i = 0; i < local_[c].size(); ++i)
+                if (root_no_ - local_[c][i].last_used >= search_.dict_age) del[c].push_back(static_cast<int>(i));
+    const bool want = io.enc && (del[0].size() + del[1].size() >= 4 || (local_[0].size() >= kLocalCap && !del[0].empty()) ||
+                                 (local_[1].size() >= kLocalCap && !del[1].empty()));
+    if (!io.bit(md.dict, 41, 0, 0, want)) return;
+    for (int c = 0; c < 2; ++c) {
+        const uint32_t cnt = io.uint(md.dict, 42, static_cast<uint32_t>(c), static_cast<uint32_t>(del[c].size()));
+        if (cnt > local_[c].size()) throw std::runtime_error("corrupt stream: discard count");
+        if (!io.enc) del[c].assign(cnt, 0);
+        int prev = -1;
+        for (uint32_t k = 0; k < cnt; ++k) {
+            const int d = static_cast<int>(io.uint(md.dict, 43, static_cast<uint32_t>(c), static_cast<uint32_t>(del[c][k] - prev - 1)));
+            del[c][k] = prev + 1 + d;
+            if (del[c][k] >= static_cast<int>(local_[c].size())) throw std::runtime_error("corrupt stream: discard index");
+            prev = del[c][k];
+        }
+        for (auto it = del[c].rbegin(); it != del[c].rend(); ++it) local_[c].erase(local_[c].begin() + *it);
+    }
 }
 
 bool BlockCoder::root_uses_dict(int x0, int y0, int l) {
@@ -2195,6 +2233,7 @@ void BlockCoder::learn_atoms(int cx, int cy, int ctu) {
             LocalAtom a;
             a.n = n;
             a.serial = local_serial_++;
+            a.last_used = root_no_;  // 登録時点を「使用」とみなす (すぐに捨てない)
             a.d.resize(static_cast<size_t>(n) * n);
             int64_t sum = 0;
             for (int y = 0; y < n; ++y) for (int x = 0; x < n; ++x) { a.d[y * n + x] = rec_->at(x0 + x, y0 + y); sum += a.d[y * n + x]; }

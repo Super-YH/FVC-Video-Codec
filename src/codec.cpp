@@ -1192,6 +1192,8 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     }
                 }
                 if (cur_usage) for (int t = 0; t < nt; ++t) cur_usage->add(coders[t]->usage());
+                if (io.w && pi == 0)
+                    for (int t = 0; t < nt; ++t) for (int id : coders[t]->used_global()) st.dict.touch(id);
                 // ループフィルタ用のブロック情報をタイルから合成
                 EdgeInfo einfo;
                 einfo.w4 = W / 4; einfo.h4 = H / 4;
@@ -1310,6 +1312,22 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             if (fp.dict_add) for (size_t i = 0; i < cand.size() && i < 16; ++i) adds.push_back(cand[i].second);
         }
+        // 捨てる (DISCARD): 符号器は 8 回の更新の間使われなかった動的項目を捨てる。昇順 ID の差分で送る
+        std::vector<int> drop;
+        if (io.w)
+            for (int id = Dictionary::kReserved; id < Dictionary::kCapacity; ++id)
+                if (st.dict.valid(id) && st.dict.epoch() - st.dict.stamp(id) >= 8) drop.push_back(id);
+        const uint32_t nd = io.uint(md.dict, 14, 0, static_cast<uint32_t>(drop.size()));
+        if (nd > static_cast<uint32_t>(Dictionary::kCapacity)) throw std::runtime_error("corrupt stream: dict discard");
+        if (!io.w) drop.assign(nd, 0);
+        int prev = Dictionary::kReserved - 1;
+        for (auto& id : drop) {
+            id = prev + 1 + static_cast<int>(io.uint(md.dict, 15, 0, static_cast<uint32_t>(id - prev - 1)));
+            if (id >= Dictionary::kCapacity) throw std::runtime_error("corrupt stream: dict discard id");
+            st.dict.remove(id);
+            prev = id;
+        }
+        st.dict.next_epoch();
         const uint32_t n = io.uint(md.dict, 10, 0, static_cast<uint32_t>(adds.size()));
         if (n > 1024) throw std::runtime_error("corrupt stream: dict adds");
         adds.resize(n);
@@ -1385,6 +1403,7 @@ FrameParams params_from(const EncoderConfig& c) {
     if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
     s.adam_me = c.adam >= 0 ? c.adam != 0 : false;
     if (c.dict_bias >= 0) s.dict_bias = c.dict_bias;
+    if (c.dict_age >= 0) s.dict_age = c.dict_age;
     t.firb = c.firb >= 0 ? c.firb != 0 : c.preset == Preset::Placebo;  // 9 フレーム試験では効果が雑音 (±0.1 dB) 以下
     t.gs = c.gs >= 0 ? c.gs != 0 : c.preset == Preset::Placebo;  // 実測: RD 混在で -0.03 dB (slow では時間だけ増える)
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない

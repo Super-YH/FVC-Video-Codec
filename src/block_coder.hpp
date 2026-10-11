@@ -145,6 +145,7 @@ struct Search {
     bool inter_skip_intra = false; // インター候補が十分よければイントラを評価しない
     int max_rd_cands = 0;          // >0: SAD 上位 K 候補のみ RD 評価
     bool requant = false;          // 符号化時に再量子化する (従来動作、比較用)
+    int dict_age = 48;             // 学習原子をこの根ブロック数使われなければ捨てる (符号器の方針、実測で 4〜48 は誤差内)
     double dict_bias = 64.0;       // 辞書を使う葉の RD 罰則 (ビット)
     int refine_top = 2;            // MTS/E8/利得形状を試す上位候補数 (1 段目の J の順)
     bool skip_split_on_skip = false; // 残差なしインター葉なら分割を試さない
@@ -264,7 +265,7 @@ private:
     mutable std::unordered_map<uint64_t, std::vector<int32_t>> atom_cache_;
     // フレーム内学習原子 (タイルごと): CTU を符号化するたびに再構成の高分散 16x16 / 8x8 を平均除去して登録する。
     // 規則は再構成だけで決まるので構文は不要 (符号器・復号器で同一)。番号 serial は再標本化キャッシュ用
-    struct LocalAtom { int n; uint64_t serial; std::vector<int32_t> d; };
+    struct LocalAtom { int n; uint64_t serial; std::vector<int32_t> d; int last_used = 0; };  // last_used: 符号器の管理用 (根番号)
     std::vector<LocalAtom> local_[2];  // [0]: 8x8, [1]: 16x16
     uint64_t local_serial_ = 0;
     static constexpr size_t kLocalCap = 256;
@@ -272,6 +273,11 @@ private:
     // 根ブロック単位の辞書使用フラグ: 0 なら配下の葉は辞書関連のフラグを持たない (未使用時のフラグ代を省く)
     bool dict_on_ = true;
     bool root_uses_dict(int x0, int y0, int l);
+    int root_no_ = 0;                 // 符号化した根ブロックの番号
+    std::vector<int> used_global_;
+    void mark_atom_used(int k, int s); // 符号器: リスト番号 k (サイズ s) の原子を使用済みにする
+    void code_discard(SymIO& io, Models& md);  // 根ブロックごとの「捨てる」指示 (いつでも立てられる)
+
     void obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const;
     // Adam による動き推定: 開始点 (sx, sy) [画素] から連続 MV を最適化し、整数画素に丸めて返す
     void adam_motion(const Plane& rp, int x0, int y0, int w, int h, double sx, double sy, int& ox, int& oy) const;
@@ -306,6 +312,8 @@ private:
     int vw_ = 1 << 30, vh_ = 1 << 30;  // 有効領域 (これより外のブロックは符号化しない)
 public:
     void set_valid(int vw, int vh) { vw_ = vw; vh_ = vh; }
+    // 符号器: このフレームで使われた大域辞書の項目 ID (捨てる判断用)
+    const std::vector<int>& used_global() const { return used_global_; }
     // 符号化しない (画面外の) ブロックの動き情報は既定値 (イントラ扱い) に戻す。符号器の試行符号化の残りが
     // 色差の動き導出や時間方向候補に漏れて復号器とずれないように、符号器・復号器で同じく行う
     void clear_outside_mf(int x0, int y0, int s) {

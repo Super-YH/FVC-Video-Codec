@@ -87,6 +87,7 @@ int Dictionary::add_from(const Plane& p, int x, int y, int s) {
     const int32_t mean = static_cast<int32_t>(sum / (static_cast<int64_t>(s) * s));
     for (auto& v : e.d) v -= mean;  // 平均 0 で保持
     by_size_[s == 8 ? 0 : 1].push_back(id);
+    stamp_[id] = epoch_;
     return id;
 }
 

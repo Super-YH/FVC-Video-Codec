@@ -22,6 +22,13 @@ public:
     // 再構成から切り出して登録 (ADD_FROM_RECON)。容量超過時は最古の動的項目を置換 (FIFO)。
     int add_from(const Plane& p, int x, int y, int s);
     void reset_dynamic();
+    // 項目を捨てる (DISCARD)。予約項目は捨てられない
+    void remove(int id) { if (id >= kReserved && id < kCapacity && entries_[id].s) { index_remove(id); entries_[id] = Entry{}; } }
+    // 符号器の管理用 (規範外): 最後に使われた (または登録された) 更新番号
+    int stamp(int id) const { return stamp_[id]; }
+    void touch(int id) { if (id >= 0 && id < kCapacity) stamp_[id] = epoch_; }
+    int epoch() const { return epoch_; }
+    void next_epoch() { ++epoch_; }
     int count() const { return static_cast<int>(by_size_[0].size() + by_size_[1].size()); }
 
 private:
@@ -29,6 +36,8 @@ private:
     std::vector<Entry> entries_;
     std::vector<int> by_size_[2];
     int next_dyn_ = kReserved;
+    std::vector<int> stamp_ = std::vector<int>(kCapacity, 0);
+    int epoch_ = 0;
     void add_reserved(int id, int s, std::vector<int32_t> d);
     void index_remove(int id);
 };
