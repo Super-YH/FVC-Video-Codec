@@ -93,13 +93,19 @@ void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const P
 }
 
 void code_line_motion(SymIO& io, CMModel& m, std::vector<LineSeg>& lines, const GlobalModel& gm) {
-    int prev = 0;
+    // 文脈: 左と上のセルの線が変わったか (動物体の線はまとまって変わる)
+    int cw = 1, ch = 1;
+    for (const LineSeg& L : lines) { cw = std::max(cw, L.x / kLineCell + 1); ch = std::max(ch, L.y / kLineCell + 1); }
+    std::vector<int8_t> st(static_cast<size_t>(cw) * ch, 0);  // 0: 線なし/未変更, 1: 変更
     int pdx = 0, pdy = 0;  // 直前に変わった線の差分 (差分の予測に使う: 動物体の線は同じ向きに動く)
     for (LineSeg& L : lines) {
         int px, py;
         gm.mv_at(L.x, L.y, px, py);
-        L.changed = io.bit(m, 0, static_cast<uint32_t>(prev), 0, L.changed) != 0;
-        prev = L.changed ? 1 : 0;
+        const int cx = L.x / kLineCell, cy = L.y / kLineCell;
+        const uint32_t ctx = static_cast<uint32_t>((cx > 0 ? st[static_cast<size_t>(cy) * cw + cx - 1] : 0) +
+                                                   2 * (cy > 0 ? st[static_cast<size_t>(cy - 1) * cw + cx] : 0));
+        L.changed = io.bit(m, 0, ctx, 0, L.changed) != 0;
+        st[static_cast<size_t>(cy) * cw + cx] = L.changed ? 1 : 0;
         if (!L.changed) { L.mvx = px; L.mvy = py; continue; }
         const int dx = pdx + io.sint(m, 1, 0, L.mvx - px - pdx);
         const int dy = pdy + io.sint(m, 2, 0, L.mvy - py - pdy);
