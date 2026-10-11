@@ -144,6 +144,8 @@ struct Search {
     bool qpel = true;              // 1/4 画素精密化 (false: 1/2 まで)
     bool inter_skip_intra = false; // インター候補が十分よければイントラを評価しない
     int max_rd_cands = 0;          // >0: SAD 上位 K 候補のみ RD 評価
+    bool requant = false;          // 符号化時に再量子化する (従来動作、比較用)
+    double dict_bias = 64.0;       // 辞書を使う葉の RD 罰則 (ビット)
     int refine_top = 2;            // MTS/E8/利得形状を試す上位候補数 (1 段目の J の順)
     bool skip_split_on_skip = false; // 残差なしインター葉なら分割を試さない
     bool approx_subpel = false;    // サブ画素探索コストを双線形で近似
@@ -188,7 +190,8 @@ private:
         int fir[4] = {0, 0, 0, 0};
         int cg[3] = {8, 8, 8};      // pt==2 輝度: 予測係数のバンド別利得 a_b/8 (低/中/高, §7.6-2 係数コピー)  // pt==2 輝度: FIR 動き基底係数 ψ (∂x, ∂y, ∂xx, ∂yy)/16 (§7.3)
         int dict_idx = 0, dict_gain = 0;
-        int dres = -1, dres_g = 0;  // 残差の辞書原子 (任意の予測に g/16 · 原子を加える)。-1: なし
+        int dres = -1, dres_g = 0;
+        double rd_dist = -1;  // 符号器: RD 評価時の歪み (診断用)  // 残差の辞書原子 (任意の予測に g/16 · 原子を加える)。-1: なし
         int xgain = 0;
         int xsrc = 0;
         int ns = 0;          // pt==4 時間方向・残差なし: ノイズ置換レベル 0..7 (包絡は参照帯域の振幅)        // pt==4: 0 = 帯域間 (ゲイン ±1..4 /4), 1 = 時間方向 (ゲイン 1..5 /4)       // pt==4: 帯域間予測ゲイン (±1..4)/4  // pt==3: サイズ別リスト内の位置, ゲイン (1/16)
@@ -255,6 +258,9 @@ private:
     uint64_t local_serial_ = 0;
     static constexpr size_t kLocalCap = 256;
     void learn_atoms(int cx, int cy, int ctu);
+    // 根ブロック単位の辞書使用フラグ: 0 なら配下の葉は辞書関連のフラグを持たない (未使用時のフラグ代を省く)
+    bool dict_on_ = true;
+    bool root_uses_dict(int x0, int y0, int l);
     void obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const;
     // Adam による動き推定: 開始点 (sx, sy) [画素] から連続 MV を最適化し、整数画素に丸めて返す
     void adam_motion(const Plane& rp, int x0, int y0, int w, int h, double sx, double sy, int& ox, int& oy) const;

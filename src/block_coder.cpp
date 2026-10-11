@@ -1491,7 +1491,11 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         } else {
             dist = sse(x0, y0, s);
         }
-        const double j = dist + lambda_ * (leaf_rate(lf, x0, y0, l) + split_rate(x0, y0, l, 0));
+        // 辞書を使う葉には固定のビット罰則を加える: 辞書の葉は確率モデル・近傍文脈を乱して他の葉の符号量を
+        // 増やすが、葉ごとの貪欲な RD ではそれが見えないため (実測: 罰則なしでは全体が悪化)
+        const double bias = (lf.pt == 3 || lf.dres >= 0) ? search_.dict_bias : 0.0;
+        const double j = dist + lambda_ * (leaf_rate(lf, x0, y0, l) + split_rate(x0, y0, l, 0) + bias);
+        lf.rd_dist = dist;
         if (j < best) { best = j; best_leaf = lf; save(x0, y0, s, best_rec); }
         restore(x0, y0, s, before);
         return j;
@@ -1620,7 +1624,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
             lf.xgain = io.sint(md.dict, 21, L, lf.xgain);
             if (lf.xgain == 0 || std::abs(lf.xgain) > 4) throw std::runtime_error("corrupt stream: xband gain");
         }
-    } else if (tools_.dict && io.bit(md.dict, 0, L, 0, lf.pt == 3)) {
+    } else if (tools_.dict && dict_on_ && io.bit(md.dict, 0, L, 0, lf.pt == 3)) {
         lf.pt = 3;
         lf.dict_idx = static_cast<int>(io.uint(md.dict, 1, L, static_cast<uint32_t>(lf.dict_idx)));
         if (lf.dict_idx >= dict_count(s)) throw std::runtime_error("corrupt stream: dict index");
@@ -1690,7 +1694,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
     }
 
     // 残差の辞書原子 (pt=3 以外の任意の予測に加算)
-    if (tools_.dict && lf.pt != 3) {
+    if (tools_.dict && dict_on_ && lf.pt != 3) {
         const int on = io.bit(md.dict, 30, L, static_cast<uint32_t>(lf.pt), lf.dres >= 0);
         if (on) {
             lf.dres = static_cast<int>(io.uint(md.dict, 31, L, static_cast<uint32_t>(std::max(lf.dres, 0))));
@@ -1873,7 +1877,9 @@ void BlockCoder::code_leaf(SymIO& io, Models& md, Leaf& lf, int x0, int y0, int 
     std::vector<int32_t> pred(n);
     if (io.enc) {
         predict(lf, x0, y0, l, pred.data());
-        quantize(lf, x0, y0, l, pred.data());  // 再構成ずれを防ぐため現在の再構成から再量子化
+        // RD で決めた係数をそのまま使う。再量子化すると RDOQ が更新後の確率モデルで別の係数を選び、
+        // RD 時に評価した歪み・符号量と実際の符号化がずれる (実測で葉の約 2 割)
+        if (!search_.requant) {} else quantize(lf, x0, y0, l, pred.data());
         lf.ns = 0;
         if (ns_allowed(lf) && lf.last < 0) {
             // 失われた残差の (インターは高域成分の) エネルギーを測る
@@ -2013,9 +2019,25 @@ void BlockCoder::code_ctu(SymIO& io, Models& md, int cx, int cy, int ctu) {
                 modes4_ = m4;
                 bv_px_ = px; bv_py_ = py;
             }
+            if (tools_.dict && bx < vw_ && by < vh_) {
+                const int used = io.enc ? root_uses_dict(bx, by, max_log2_) : 0;
+                dict_on_ = io.bit(md.dict, 40, static_cast<uint32_t>(max_log2_), 0, used) != 0;
+            }
             code_node(io, md, bx, by, max_log2_);
+            dict_on_ = true;  // RD 中は辞書を使える前提でレートを見積もる
         }
     if (tools_.dict) learn_atoms(cx, cy, ctu);
+}
+
+bool BlockCoder::root_uses_dict(int x0, int y0, int l) {
+    if (x0 >= vw_ || y0 >= vh_) return false;
+    if (l > min_log2_ && split_at(x0, y0, l)) {
+        const int h = 1 << (l - 1);
+        return root_uses_dict(x0, y0, l - 1) || root_uses_dict(x0 + h, y0, l - 1) || root_uses_dict(x0, y0 + h, l - 1) ||
+               root_uses_dict(x0 + h, y0 + h, l - 1);
+    }
+    const Leaf& lf = leaf_at(x0, y0, l);
+    return lf.pt == 3 || lf.dres >= 0;
 }
 
 // フレーム内学習原子の登録 (規範): CTU 内の有効領域にある 16x16 / 8x8 セルのうち、再構成の分散が最大の 2 個
