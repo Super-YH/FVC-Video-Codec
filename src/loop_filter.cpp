@@ -347,10 +347,11 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
 }
 
 namespace {
-constexpr int kBrBands = 6;
+// 帯域: 半径 (u+v で 6 区分) × 向き (u > v: 横方向の変化, v > u: 縦方向の変化, u = v: 斜め)
+constexpr int kBrRad = 6, kBrBands = kBrRad * 3;
 inline int br_band(int u, int v) {
     static constexpr int kB[15] = {0, 0, 1, 2, 2, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5};
-    return kB[u + v];
+    return kB[u + v] * 3 + (u > v ? 0 : v > u ? 1 : 2);
 }
 // 8x8 正弦窓 DCT の重畳加算。cls_gain(cls, band) を係数に掛ける。classify はブロックの AC エネルギーからクラスを返す
 template <class F>
@@ -415,20 +416,29 @@ void code_band_restore(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool l
         std::vector<double> num(g.size(), 0.0), den(g.size(), 0.0);
         Plane dummy;
         br_apply(R, dummy, ncls, sigma2, [](int, int) { return 1.0; }, lo, hi, &num, &den, org);
-        for (size_t k = 0; k < g.size(); ++k)
-            g[k] = den[k] > 0 ? std::clamp(static_cast<int>(std::lround(num[k] / den[k] * 32.0)), 0, 64) : 32;
+        // 係数領域の SSE 減少 (num - den)² / den が符号量 (約 6 ビット) に見合うゲインだけ 1 以外にする
+        for (size_t k = 0; k < g.size(); ++k) {
+            if (den[k] <= 0) continue;
+            const int q = std::clamp(static_cast<int>(std::lround(num[k] / den[k] * 32.0)), 0, 64);
+            const double gg = q / 32.0, red = 2.0 * (gg - 1.0) * (num[k] - den[k]) - (gg - 1.0) * (gg - 1.0) * den[k];
+            g[k] = red > lambda * 6.0 ? q : 32;
+        }
         br_apply(R, F, ncls, sigma2, [&](int c, int b) { return g[static_cast<size_t>(c) * kBrBands + b] / 32.0; }, lo, hi);
         double s0 = 0, s1 = 0;
         for (size_t i = 0; i < R.v.size(); ++i) {
             const double d0 = R.v[i] - org->v[i], d1 = F.v[i] - org->v[i];
             s0 += d0 * d0; s1 += d1 * d1;
         }
-        on = s0 - s1 > lambda * 8.0 * static_cast<double>(g.size());
+        int nz = 0;
+        for (int v : g) nz += v != 32;
+        on = nz > 0 && s0 - s1 > lambda * (6.0 * nz + 1.0 * static_cast<double>(g.size()));
     }
     on = io.bit(m, 70, luma ? 1 : 0, 0, on);
     if (!on) return;
     for (size_t k = 0; k < g.size(); ++k) {
-        g[k] = 32 + io.sint(m, 71 + static_cast<uint32_t>(k % kBrBands), luma ? 1u : 0u, g[k] - 32);
+        // 同じ帯域の 1 つ下のクラスのゲインとの差分
+        const int pr = k >= kBrBands ? g[k - kBrBands] : 32;
+        g[k] = pr + io.sint(m, 71 + static_cast<uint32_t>(k % kBrBands), luma ? 1u : 0u, g[k] - pr);
         if (g[k] < 0 || g[k] > 64) throw std::runtime_error("corrupt stream: band restore gain");
     }
     if (!(io.enc && org)) br_apply(R, F, ncls, sigma2, [&](int c, int b) { return g[static_cast<size_t>(c) * kBrBands + b] / 32.0; }, lo, hi);
