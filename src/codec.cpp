@@ -1766,8 +1766,27 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         for (size_t i = 0; i < f.p[0].v.size(); ++i) { const double d = f.p[0].v[i] - crec.p[0].v[i]; se += d * d; }
         // 実測の量子化歪み (RDO 後) は Δ²/12 の 1 割未満なので、それと同等以下の時のみ COPY
         constexpr double kCopyK = 0.06;
-        const bool ok = ssim_mode ? plane_ssim(f.p[0], crec.p[0], info_.bit_depth) >= cfg_.target_ssim
-                                  : se / f.p[0].v.size() <= kCopyK * step * step / 12.0;
+        // 局所の変化も見る: 画面全体の平均誤差が小さくても、小さな領域 (口パク・小さな動物体) が動いていれば
+        // COPY にすると止まって見える。全プレーンの 16x16 (色差は対応する大きさ) ブロックの MSE が
+        // (量子化ステップ / 2)² 以下のときだけ COPY を許す
+        bool local_ok = true;
+        for (int pi = 0; pi < 3 && local_ok; ++pi) {
+            const Plane& o = f.p[pi];
+            const Plane& c = crec.p[pi];
+            const int bs = pi && info_.chroma == ChromaFormat::C420 ? 8 : 16;
+            const int pqp = std::clamp(fp.qp + (pi ? fp.cqp_off : 0), 0, 63);
+            const double st = qp_step(pqp, info_.bit_depth), lim = st * st / 4.0;
+            for (int by = 0; by < o.h && local_ok; by += bs)
+                for (int bx = 0; bx < o.w && local_ok; bx += bs) {
+                    double e = 0;
+                    int n = 0;
+                    for (int y = by; y < std::min(by + bs, o.h); ++y)
+                        for (int x = bx; x < std::min(bx + bs, o.w); ++x) { const double d = o.at(x, y) - c.at(x, y); e += d * d; ++n; }
+                    local_ok = e <= lim * n;
+                }
+        }
+        const bool ok = local_ok && (ssim_mode ? plane_ssim(f.p[0], crec.p[0], info_.bit_depth) >= cfg_.target_ssim
+                                               : se / f.p[0].v.size() <= kCopyK * step * step / 12.0);
         if (ok) { payload = std::move(pl); rec = std::move(crec); done = true; type = FrameType::Copy; }
     }
     if (!done && ssim_mode) {
