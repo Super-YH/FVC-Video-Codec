@@ -1943,6 +1943,42 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& forig, int poc, FrameT
         }
         done = true;
     }
+    if (!done && type != FrameType::I && fp.tools.line_mv && cfg_.lossy_layer && !cfg_.l2_lossless) {
+        // 線の動き場のフレーム単位 RD: 線の構文 (フレームあたり数十バイト) が予測の改善に見合わないフレームでは
+        // 線を使わない符号化を採る (D + λR が小さい方)。線が損になるフレームを無くす
+        const Dictionary dict0 = st_->dict;
+        const std::vector<Shape> sh0 = st_->last_shapes;
+        auto mf0 = st_->last_mf;
+        const std::vector<int> rp0[2] = {st_->last_ref_poc[0], st_->last_ref_poc[1]};
+        const double lam = 0.57 * std::pow(2.0, (fp.qp - 12) / 3.0) * std::pow(4.0, info_.bit_depth - 8);
+        auto jcost = [&](const std::vector<uint8_t>& pl, const Frame& r) {
+            double d = 0;
+            for (int pi = 0; pi < 3; ++pi)
+                for (size_t i = 0; i < f.p[pi].v.size(); ++i) { const double e = f.p[pi].v[i] - r.p[pi].v[i]; d += e * e; }
+            return d + lam * 8.0 * static_cast<double>(pl.size());
+        };
+        payload = run(fp, rec);
+        ++trials;
+        const double j0 = jcost(payload, rec);
+        const Dictionary dict1 = st_->dict;
+        const std::vector<Shape> sh1 = st_->last_shapes;
+        auto mf1 = st_->last_mf;
+        const std::vector<int> rp1[2] = {st_->last_ref_poc[0], st_->last_ref_poc[1]};
+        const BlockUsage u1 = usage;
+        st_->dict = dict0; st_->last_shapes = sh0; st_->last_mf = mf0; st_->last_ref_poc[0] = rp0[0]; st_->last_ref_poc[1] = rp0[1];
+        FrameParams nol = fp;
+        nol.tools.line_mv = false;
+        Frame rec2;
+        auto pl2 = run(nol, rec2);
+        ++trials;
+        if (jcost(pl2, rec2) < j0) {
+            payload = std::move(pl2); rec = std::move(rec2); fp = nol;
+        } else {
+            st_->dict = dict1; st_->last_shapes = sh1; st_->last_mf = mf1; st_->last_ref_poc[0] = rp1[0]; st_->last_ref_poc[1] = rp1[1];
+            usage = u1;
+        }
+        done = true;
+    }
     if (!done) { payload = run(fp, rec); ++trials; }
     std::vector<uint8_t> out;
     put_unit(out, UnitType::Frame, payload);
