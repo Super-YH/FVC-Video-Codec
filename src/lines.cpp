@@ -30,17 +30,23 @@ std::vector<LineSeg> extract_lines(const Plane& ref, int vw, int vh, int bit_dep
 }
 
 namespace {
-constexpr int kWin = 8;  // 動き推定の窓 (線上の点を中心に 2*kWin 四方)
+constexpr int kWin = 8;  // 動き推定の窓 (線の現在位置を中心に 2*kWin 四方)
 
-int64_t window_sad(const Plane& cur, const Plane& ref, int x0, int y0, int mvx, int mvy, int64_t bound) {
-    // 1/4 画素は双線形 (推定用の近似)
+// 線 L が動き (mvx, mvy) で動いたときの窓の SAD。窓は現フレームでの線の位置 c = r - mv を中心にとる
+// (予測は pred(p) = ref(p + mv))。half: 0 = 全体, 1 = 法線の + 側, -1 = − 側
+int64_t window_sad(const Plane& cur, const Plane& ref, const LineSeg& L, int mvx, int mvy, int64_t bound, int half = 0) {
     const int ix = mvx >> 2, iy = mvy >> 2, fx = mvx & 3, fy = mvy & 3;
     const int w00 = (4 - fx) * (4 - fy), w10 = fx * (4 - fy), w01 = (4 - fx) * fy, w11 = fx * fy;
     auto r = [&](int x, int y) { return ref.at(std::clamp(x, 0, ref.w - 1), std::clamp(y, 0, ref.h - 1)); };
+    const int x0 = L.x - (mvx >> 2), y0 = L.y - (mvy >> 2);
     int64_t sad = 0;
     for (int y = y0 - kWin; y < y0 + kWin && sad < bound; ++y) {
         const int cy = std::clamp(y, 0, cur.h - 1);
         for (int x = x0 - kWin; x < x0 + kWin; ++x) {
+            if (half) {
+                const int64_t dn = static_cast<int64_t>(x - x0) * L.gx + static_cast<int64_t>(y - y0) * L.gy;
+                if ((half > 0) != (dn > 0) || dn == 0) continue;
+            }
             const int cx = std::clamp(x, 0, cur.w - 1);
             const int32_t p = (w00 * r(cx + ix, cy + iy) + w10 * r(cx + ix + 1, cy + iy) + w01 * r(cx + ix, cy + iy + 1) +
                                w11 * r(cx + ix + 1, cy + iy + 1) + 8) >> 4;
@@ -59,28 +65,34 @@ void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const P
     for (LineSeg& L : lines) {
         int px, py;
         gm.mv_at(L.x, L.y, px, py);
-        const double c0 = static_cast<double>(window_sad(cur, ref, L.x, L.y, px, py, INT64_MAX)) + lsad * 1.0;
-        // 整数探索: 予測 (大域動き) の周りと 0 の周り
+        const double c0 = static_cast<double>(window_sad(cur, ref, L, px, py, INT64_MAX)) + lsad * 1.0;
         int bx = (px + 2) >> 2, by = (py + 2) >> 2;
         double bc = 1e300;
         auto test = [&](int ix, int iy) {
-            const double c = static_cast<double>(window_sad(cur, ref, L.x, L.y, ix * 4, iy * 4, static_cast<int64_t>(std::min(bc, 1e15)) + 1)) +
+            const double c = static_cast<double>(window_sad(cur, ref, L, ix * 4, iy * 4, static_cast<int64_t>(std::min(bc, 1e15)) + 1)) +
                              lsad * mv_bits(ix * 4 - px, iy * 4 - py);
             if (c < bc) { bc = c; bx = ix; by = iy; }
         };
         const int cx = bx, cy = by;
         for (int dy = -range; dy <= range; ++dy)
             for (int dx = -range; dx <= range; ++dx) test(cx + dx, cy + dy);
+        // 粗い格子 (大きな動き)
+        for (int dy = -4 * range; dy <= 4 * range; dy += 4)
+            for (int dx = -4 * range; dx <= 4 * range; dx += 4) test(cx + dx, cy + dy);
+        if (bx != cx || by != cy) {
+            const int ox = bx, oy = by;
+            for (int dy = -2; dy <= 2; ++dy)
+                for (int dx = -2; dx <= 2; ++dx) test(ox + dx, oy + dy);
+        }
         test(0, 0);
-        // 1/2, 1/4 画素
         int mx = bx * 4, my = by * 4;
-        double sc = static_cast<double>(window_sad(cur, ref, L.x, L.y, mx, my, INT64_MAX)) + lsad * mv_bits(mx - px, my - py);
+        double sc = static_cast<double>(window_sad(cur, ref, L, mx, my, INT64_MAX)) + lsad * mv_bits(mx - px, my - py);
         for (int st = 2; st >= 1; st >>= 1) {
             const int ox = mx, oy = my;
             for (int dy = -st; dy <= st; dy += st)
                 for (int dx = -st; dx <= st; dx += st) {
                     if (!dx && !dy) continue;
-                    const double c = static_cast<double>(window_sad(cur, ref, L.x, L.y, ox + dx, oy + dy, INT64_MAX)) +
+                    const double c = static_cast<double>(window_sad(cur, ref, L, ox + dx, oy + dy, INT64_MAX)) +
                                      lsad * mv_bits(ox + dx - px, oy + dy - py);
                     if (c < sc) { sc = c; mx = ox + dx; my = oy + dy; }
                 }
@@ -89,6 +101,14 @@ void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const P
         L.changed = (mx != px || my != py) && sc + lsad * 1.0 < c0 * 0.9;
         L.mvx = L.changed ? mx : px;
         L.mvy = L.changed ? my : py;
+        L.side = 2;
+        if (L.changed) {
+            // どちら側が動いたか: 半窓ごとに、線の動きと大域動きの SAD を比べる
+            const int64_t pm = window_sad(cur, ref, L, mx, my, INT64_MAX, 1), pg = window_sad(cur, ref, L, px, py, INT64_MAX, 1);
+            const int64_t nm = window_sad(cur, ref, L, mx, my, INT64_MAX, -1), ng = window_sad(cur, ref, L, px, py, INT64_MAX, -1);
+            const bool pos = pm * 10 < pg * 9, neg = nm * 10 < ng * 9;
+            L.side = pos && !neg ? 1 : (neg && !pos ? 0 : 2);
+        }
     }
 }
 
@@ -106,13 +126,15 @@ void code_line_motion(SymIO& io, CMModel& m, std::vector<LineSeg>& lines, const 
                                                    2 * (cy > 0 ? st[static_cast<size_t>(cy - 1) * cw + cx] : 0));
         L.changed = io.bit(m, 0, ctx, 0, L.changed) != 0;
         st[static_cast<size_t>(cy) * cw + cx] = L.changed ? 1 : 0;
-        if (!L.changed) { L.mvx = px; L.mvy = py; continue; }
+        if (!L.changed) { L.mvx = px; L.mvy = py; L.side = 2; continue; }
         const int dx = pdx + io.sint(m, 1, 0, L.mvx - px - pdx);
         const int dy = pdy + io.sint(m, 2, 0, L.mvy - py - pdy);
         if (std::abs(dx) > 4096 || std::abs(dy) > 4096) throw std::runtime_error("corrupt stream: line motion");
         L.mvx = px + dx;
         L.mvy = py + dy;
         pdx = dx; pdy = dy;
+        const int both = io.bit(m, 3, 0, 0, L.side == 2);
+        L.side = both ? 2 : io.bit(m, 4, 0, 0, L.side == 1);
     }
 }
 
@@ -121,8 +143,13 @@ void build_line_field(const std::vector<LineSeg>& lines, const GlobalModel& gm, 
     // 線をセルに登録 (近傍探索用)
     const int cw = (w4 * 4 + kLineCell - 1) / kLineCell, ch = (h4 * 4 + kLineCell - 1) / kLineCell;
     std::vector<std::vector<int>> cell(static_cast<size_t>(cw) * ch);
+    // 線の現フレームでの位置 (変わった線は参照位置から動きの分だけずらす。動きは pred(p) = ref(p + mv))
+    std::vector<int> lx(lines.size()), ly(lines.size());
+    auto fdiv4 = [](int v) { return v >= 0 ? v / 4 : -((-v + 3) / 4); };
     for (size_t i = 0; i < lines.size(); ++i) {
-        const int cx = std::min(lines[i].x / kLineCell, cw - 1), cy = std::min(lines[i].y / kLineCell, ch - 1);
+        lx[i] = lines[i].changed ? lines[i].x - fdiv4(lines[i].mvx) : lines[i].x;
+        ly[i] = lines[i].changed ? lines[i].y - fdiv4(lines[i].mvy) : lines[i].y;
+        const int cx = std::clamp(lx[i] / kLineCell, 0, cw - 1), cy = std::clamp(ly[i] / kLineCell, 0, ch - 1);
         cell[static_cast<size_t>(cy) * cw + cx].push_back(static_cast<int>(i));
     }
     constexpr int kR2 = 24 * 24;    // 影響半径の 2 乗
@@ -139,9 +166,16 @@ void build_line_field(const std::vector<LineSeg>& lines, const GlobalModel& gm, 
                 for (int cx = std::max(0, ccx - 2); cx <= std::min(cw - 1, ccx + 2); ++cx)
                     for (int i : cell[static_cast<size_t>(cy) * cw + cx]) {
                         const LineSeg& L = lines[static_cast<size_t>(i)];
-                        const int dx = L.x - x, dy = L.y - y;
+                        const int dx = lx[static_cast<size_t>(i)] - x, dy = ly[static_cast<size_t>(i)] - y;
                         const int d2 = dx * dx + dy * dy;
                         if (d2 > kR2) continue;
+                        if (L.side != 2) {
+                            // 動く側でない画素 (線から 2 画素より離れた反対側) には効かせない
+                            const int64_t dn = -(static_cast<int64_t>(dx) * L.gx + static_cast<int64_t>(dy) * L.gy);  // (p - c)·n
+                            const int64_t nn = static_cast<int64_t>(L.gx) * L.gx + static_cast<int64_t>(L.gy) * L.gy;
+                            const bool on_pos = dn > 0;
+                            if (on_pos != (L.side == 1) && dn * dn > 4 * nn) continue;
+                        }
                         const int64_t w = 65536 / (d2 + kSoft);
                         ws += w; sx += w * L.mvx; sy += w * L.mvy;
                     }

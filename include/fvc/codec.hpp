@@ -100,7 +100,7 @@ private:
     int next_poc_ = 0;
     std::vector<std::pair<int, Frame>> pend_;  // 未符号化フレーム (表示順)
     const Frame* code_src_ = nullptr;           // 符号化に使う入力 (時間フィルタ済み)。統計は元の入力で測る
-    int tf_strength() const { return cfg_.tf >= 0 ? cfg_.tf : (getenv("FVC_TF") ? atoi(getenv("FVC_TF")) : 0); }
+    int tf_strength() const { return cfg_.tf >= 0 ? cfg_.tf : (cfg_.preset >= Preset::Medium ? 3 : 0); }  // 実測 v17: 強さ 3 で +0.08 dB
     std::vector<uint8_t> flush_pending();
     void encode_b_range(const std::vector<std::pair<int, Frame>>& v, int a, int b, int depth, std::vector<uint8_t>& out);
     std::vector<FrameStats> stats_;
