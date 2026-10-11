@@ -1383,6 +1383,7 @@ FrameParams params_from(const EncoderConfig& c) {
     t.inter_ns = !c.tune_psnr;
     fp.cdef = c.cdef >= 0 ? c.cdef != 0 : c.preset >= Preset::Medium;
     if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
+    s.adam_me = c.adam >= 0 ? c.adam != 0 : false;
     t.firb = c.firb >= 0 ? c.firb != 0 : c.preset == Preset::Placebo;  // 9 フレーム試験では効果が雑音 (±0.1 dB) 以下
     t.gs = c.gs >= 0 ? c.gs != 0 : c.preset == Preset::Placebo;  // 実測: RD 混在で -0.03 dB (slow では時間だけ増える)
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない

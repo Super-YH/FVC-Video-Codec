@@ -173,9 +173,13 @@ void BlockCoder::intra_angular(int x0, int y0, int s, int mode, int32_t* pred) c
         top[i] = ht ? r.at(x0 + i, y0 - 1) : (hl ? r.at(x0 - 1, y0) : mid_);
         left[i] = hl ? r.at(x0 - 1, y0 + i) : (ht ? r.at(x0, y0 - 1) : mid_);
     }
+    // 参照可能性は 4x4 単位で変わるので 4 画素ごとに判定し、有効領域の端だけ画素ごとに確認する (高速化、結果は同一)
+    bool at_ok = false, al_ok = false;
     for (int i = s; i < 2 * s; ++i) {
-        top[i] = (ht && coded_before(x0 + i, y0 - 1, x0, y0)) ? r.at(x0 + i, y0 - 1) : top[i - 1];
-        left[i] = (hl && coded_before(x0 - 1, y0 + i, x0, y0)) ? r.at(x0 - 1, y0 + i) : left[i - 1];
+        if (((x0 + i) & 3) == 0 || i == s) at_ok = ht && coded_before(x0 + i, y0 - 1, x0, y0);
+        if (((y0 + i) & 3) == 0 || i == s) al_ok = hl && coded_before(x0 - 1, y0 + i, x0, y0);
+        top[i] = (at_ok && x0 + i < vw_) ? r.at(x0 + i, y0 - 1) : top[i - 1];
+        left[i] = (al_ok && y0 + i < vh_) ? r.at(x0 - 1, y0 + i) : left[i - 1];
     }
     int32_t corner = (ht && hl) ? r.at(x0 - 1, y0 - 1) : (ht ? top[0] : left[0]);
     if (mode == kModePaeth) {
@@ -425,6 +429,67 @@ bool BlockCoder::fir_fit(const Leaf& lf, int x0, int y0, int s, int* psi) const 
         any |= psi[k] != 0;
     }
     return any;
+}
+
+// Adam 動き推定 (符号器のみ)。損失 L(θ) = mean ρ(org(p) − ref(p + θ))、ρ(e) = sqrt(e² + ε²) (Charbonnier)。
+// ref は双線形補間、勾配は ∂L/∂θ = −mean ρ'(e) ∇ref。前半は ±2 画素の 4 点平均 (ぼかし) で大きな動きを捉え、
+// 後半は原信号で詰める (粗→密)。β1 = 0.9, β2 = 0.999。
+void BlockCoder::adam_motion(const Plane& rp, int x0, int y0, int w, int h, double sx, double sy, int& ox, int& oy) const {
+    auto smp = [&](double fx, double fy) {
+        fx = std::clamp(fx, 0.0, rp.w - 1.001);
+        fy = std::clamp(fy, 0.0, rp.h - 1.001);
+        const int ix = static_cast<int>(fx), iy = static_cast<int>(fy);
+        const double ax = fx - ix, ay = fy - iy;
+        const int ix1 = std::min(ix + 1, rp.w - 1), iy1 = std::min(iy + 1, rp.h - 1);
+        const double a = rp.at(ix, iy), b = rp.at(ix1, iy), c = rp.at(ix, iy1), d = rp.at(ix1, iy1);
+        return std::array<double, 3>{(a * (1 - ax) + b * ax) * (1 - ay) + (c * (1 - ax) + d * ax) * ay,
+                                     ((b - a) * (1 - ay) + (d - c) * ay), ((c - a) * (1 - ax) + (d - b) * ax)};
+    };
+    // 標本は最大 16x16 に間引く (大ブロックでも反復コストを一定に)
+    const int st = std::max(1, std::max(w, h) / 16);
+    double tx = sx, ty = sy, m1x = 0, m1y = 0, m2x = 0, m2y = 0;
+    constexpr double b1 = 0.9, b2 = 0.999, eps2 = 16.0;
+    constexpr int kIter = 20;
+    for (int it = 1; it <= kIter; ++it) {
+        const bool coarse = it <= kIter / 2;
+        double gx = 0, gy = 0;
+        int n = 0;
+        for (int y = 0; y < h; y += st)
+            for (int x = 0; x < w; x += st) {
+                const double px = x0 + x + tx, py = y0 + y + ty;
+                std::array<double, 3> r;
+                double o;
+                if (coarse) {
+                    r = {0, 0, 0};
+                    o = 0;
+                    for (const auto& d : {std::pair<double, double>{-2, -2}, {2, -2}, {-2, 2}, {2, 2}}) {
+                        const auto t = smp(px + d.first, py + d.second);
+                        for (int k = 0; k < 3; ++k) r[k] += t[k] * 0.25;
+                        o += 0.25 * org_->at(std::clamp(x0 + x + static_cast<int>(d.first), 0, org_->w - 1),
+                                             std::clamp(y0 + y + static_cast<int>(d.second), 0, org_->h - 1));
+                    }
+                } else {
+                    r = smp(px, py);
+                    o = org_->at(x0 + x, y0 + y);
+                }
+                const double e = o - r[0];
+                const double dr = e / std::sqrt(e * e + eps2);  // ρ'(e)
+                gx -= dr * r[1];
+                gy -= dr * r[2];
+                ++n;
+            }
+        gx /= n; gy /= n;
+        m1x = b1 * m1x + (1 - b1) * gx; m1y = b1 * m1y + (1 - b1) * gy;
+        m2x = b2 * m2x + (1 - b2) * gx * gx; m2y = b2 * m2y + (1 - b2) * gy * gy;
+        const double c1 = 1 - std::pow(b1, it), c2 = 1 - std::pow(b2, it);
+        const double lr = coarse ? 1.0 : 0.35;  // 画素/反復
+        tx -= lr * (m1x / c1) / (std::sqrt(m2x / c2) + 1e-8);
+        ty -= lr * (m1y / c1) / (std::sqrt(m2y / c2) + 1e-8);
+        tx = std::clamp(tx, sx - 64.0, sx + 64.0);
+        ty = std::clamp(ty, sy - 64.0, sy + 64.0);
+    }
+    ox = static_cast<int>(std::lround(tx));
+    oy = static_cast<int>(std::lround(ty));
 }
 
 void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) const {
@@ -679,7 +744,15 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
                 if ((ml[i].dir >> list) & 1) test_int((ml[i].mvx[list] + 2) >> 2, (ml[i].mvy[list] + 2) >> 2);
             const int R = search_.me_range;
             const int cx = bx, cy = by;
-            if (R >= 8) {
+            if (search_.adam_me) {
+                // Adam: 最良の開始点から連続 MV を勾配で最適化し、結果の整数位置と近傍を評価
+                int ax, ay;
+                adam_motion(rp, x0, y0, w, h, cx, cy, ax, ay);
+                test_int(ax, ay);
+                const int fx = bx, fy = by;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) test_int(fx + dx, fy + dy);
+            } else if (R >= 8) {
                 // 粗探索 (ステップ 2) → 中心近傍の全探索
                 for (int dy = -R; dy <= R; dy += 2)
                     for (int dx = -R; dx <= R; dx += 2) test_int(cx + dx, cy + dy);

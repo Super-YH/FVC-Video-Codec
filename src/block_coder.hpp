@@ -137,6 +137,7 @@ struct Search {
     int ibc_range = 64;     // IBC 探索範囲 (画素)
     bool try_e8 = false, try_tns = false;
     int me_range = 16;      // 整数動き探索範囲
+    bool adam_me = false;   // 整数探索を Adam (連続 MV の勾配最適化) に置き換える
     bool me_bi = true;      // 双予測探索
     bool try_fir = true;
     bool qpel = true;              // 1/4 画素精密化 (false: 1/2 まで)
@@ -238,6 +239,8 @@ private:
     void set_modes4(int x0, int y0, int s, int mode);
     void predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) const;
     void obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const;
+    // Adam による動き推定: 開始点 (sx, sy) [画素] から連続 MV を最適化し、整数画素に丸めて返す
+    void adam_motion(const Plane& rp, int x0, int y0, int w, int h, double sx, double sy, int& ox, int& oy) const;
     void fir_apply(const int* psi, int s, int32_t* pred) const;
     bool fir_fit(const Leaf& lf, int x0, int y0, int s, int* psi) const;
     void cg_apply(const int* cg, int s, int32_t* pred) const;

@@ -116,20 +116,33 @@ void code_cdef(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, int
     std::vector<std::pair<int, int>> presets;
     std::vector<int> choice(static_cast<size_t>(cw) * ch, 0);
     if (io.enc) {
+        // 2 段探索 (高速化): 主強度を副 0 で評価 → 総 SSE の良い主強度 2 つについて副強度を評価 (36 → 17 回のフィルタ)
         std::vector<std::pair<int, int>> cand;
-        for (int p : {0, 1, 2, 3, 4, 6, 8, 11, 15})
-            for (int s2 : {0, 1, 2, 4}) cand.push_back({p, s2});
-        std::vector<std::vector<double>> sse(cand.size(), std::vector<double>(choice.size(), 0.0));
+        std::vector<std::vector<double>> sse;
         Plane F;
-        for (size_t c = 0; c < cand.size(); ++c) {
-            if (cand[c].first == 0 && cand[c].second == 0) F = R;
-            else filt_all(cand[c].first, cand[c].second, F);
+        auto eval = [&](int p, int s2) {
+            if (p == 0 && s2 == 0) F = R;
+            else filt_all(p, s2, F);
+            std::vector<double> e(choice.size(), 0.0);
             for (int y = 0; y < R.h; ++y)
                 for (int x = 0; x < R.w; ++x) {
                     const double d = org->at(x, y) - F.at(x, y);
-                    sse[c][(y / kBlk) * cw + x / kBlk] += d * d;
+                    e[(y / kBlk) * cw + x / kBlk] += d * d;
                 }
+            cand.push_back({p, s2});
+            sse.push_back(std::move(e));
+        };
+        for (int p : {0, 1, 2, 3, 4, 6, 8, 11, 15}) eval(p, 0);
+        std::vector<std::pair<double, int>> tot;
+        for (size_t c = 1; c < cand.size(); ++c) {
+            double t = 0;
+            for (double v : sse[c]) t += v;
+            tot.push_back({t, cand[c].first});
         }
+        std::sort(tot.begin(), tot.end());
+        eval(0, 1); eval(0, 2); eval(0, 4);
+        for (size_t k = 0; k < std::min<size_t>(2, tot.size()); ++k)
+            for (int s2 : {1, 2, 4}) eval(tot[k].second, s2);
         std::vector<size_t> sel = {0};  // (0,0) = 無効 は常に含める
         auto total = [&](const std::vector<size_t>& s) {
             double t = 0;
