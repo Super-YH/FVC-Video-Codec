@@ -1381,40 +1381,56 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         for (int k = 0; k < search_.max_rd_cands; ++k) idx.push_back(rank[k].second);
         keep_only(idx);
     }
-    // 量子化モード/TNS の組み合わせ
+    // 量子化モード/TNS/MTS の組み合わせ (高速化: 2 段階)
+    //  1 段目: 全候補を DCT-II・スカラ量子化 (+TNS) で評価
+    //  2 段目: 1 段目の J 上位 search_.refine_top 候補だけに MTS・E8・利得形状を試す
     double best = 1e300;
     Leaf best_leaf;
+    auto eval = [&](size_t ci, int mt, int qm, int tn) -> double {
+        Leaf lf = cands[ci];
+        lf.qmode = qm;
+        lf.mts = mt;
+        lf.tns_on = tn;
+        quantize(lf, x0, y0, l, preds[ci].data());
+        if (tn && !lf.tns_on) return 1e300;
+        reconstruct(lf, x0, y0, l, preds[ci].data());
+        double dist;
+        if (tools_.pred_only) {
+            // 予測のみの段階: 残差は後段 (帯域符号化) で変換符号化されるため、
+            // 残差の SATD を符号量+歪みの近似として評価する (SSE だと残差コストを無視してしまう)
+            std::vector<int32_t> res(static_cast<size_t>(n));
+            for (int y = 0; y < s; ++y)
+                for (int x = 0; x < s; ++x) res[y * s + x] = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y);
+            dist = static_cast<double>(satd4(res.data(), s)) * std::sqrt(lambda_) * 2.0;
+        } else {
+            dist = sse(x0, y0, s);
+        }
+        const double j = dist + lambda_ * (leaf_rate(lf, x0, y0, l) + split_rate(x0, y0, l, 0));
+        if (j < best) { best = j; best_leaf = lf; save(x0, y0, s, best_rec); }
+        restore(x0, y0, s, before);
+        return j;
+    };
+    const int ntn = tools_.tns && search_.try_tns && s >= 8 ? 1 : 0;
+    std::vector<std::pair<double, size_t>> j1;
     for (size_t ci = 0; ci < cands.size(); ++ci) {
-        const Leaf& base = cands[ci];
-        std::copy(preds[ci].begin(), preds[ci].end(), pred.begin());
-        const int nmts = (tools_.mts && search_.try_mts && is_luma() && s <= 32) ? (s <= 16 ? 9 : 5) : 1;
-        for (int mt = 0; mt < nmts; ++mt)
-        for (int qm = 0; qm <= 2; ++qm)
-            for (int tn = 0; tn <= (tools_.tns && search_.try_tns && s >= 8 && qm == 0 ? 1 : 0); ++tn) {
-                if (qm == 1 && !(tools_.e8 && search_.try_e8)) continue;
-                if (qm == 2 && !(tools_.gs && md_ && !tools_.pred_only)) continue;
-                Leaf lf = base;
-                lf.qmode = qm;
-                lf.mts = mt;
-                lf.tns_on = tn;
-                quantize(lf, x0, y0, l, pred.data());
-                if (tn && !lf.tns_on) continue;
-                reconstruct(lf, x0, y0, l, pred.data());
-                double dist;
-                if (tools_.pred_only) {
-                    // 予測のみの段階: 残差は後段 (帯域符号化) で変換符号化されるため、
-                    // 残差の SATD を符号量+歪みの近似として評価する (SSE だと残差コストを無視してしまう)
-                    std::vector<int32_t> res(static_cast<size_t>(n));
-                    for (int y = 0; y < s; ++y)
-                        for (int x = 0; x < s; ++x) res[y * s + x] = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y);
-                    dist = static_cast<double>(satd4(res.data(), s)) * std::sqrt(lambda_) * 2.0;
-                } else {
-                    dist = sse(x0, y0, s);
-                }
-                const double j = dist + lambda_ * (leaf_rate(lf, x0, y0, l) + split_rate(x0, y0, l, 0));
-                if (j < best) { best = j; best_leaf = lf; save(x0, y0, s, best_rec); }
-                restore(x0, y0, s, before);
+        double jb = 1e300;
+        for (int tn = 0; tn <= ntn; ++tn) jb = std::min(jb, eval(ci, 0, 0, tn));
+        j1.push_back({jb, ci});
+    }
+    const int nmts = (tools_.mts && search_.try_mts && is_luma() && s <= 32) ? (s <= 16 ? 9 : 5) : 1;
+    const bool try_e8 = tools_.e8 && search_.try_e8, try_gs = tools_.gs && md_ && !tools_.pred_only;
+    if (nmts > 1 || try_e8 || try_gs) {
+        std::sort(j1.begin(), j1.end());
+        const size_t top = std::min<size_t>(j1.size(), static_cast<size_t>(std::max(1, search_.refine_top)));
+        for (size_t k = 0; k < top; ++k) {
+            const size_t ci = j1[k].second;
+            for (int mt = 1; mt < nmts; ++mt)
+                for (int tn = 0; tn <= ntn; ++tn) eval(ci, mt, 0, tn);
+            for (int mt = 0; mt < nmts; ++mt) {
+                if (try_e8) eval(ci, mt, 1, 0);
+                if (try_gs) eval(ci, mt, 2, 0);
             }
+        }
     }
     leaf_at(x0, y0, l) = best_leaf;
     restore(x0, y0, s, best_rec);

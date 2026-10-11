@@ -143,6 +143,7 @@ struct Search {
     bool qpel = true;              // 1/4 画素精密化 (false: 1/2 まで)
     bool inter_skip_intra = false; // インター候補が十分よければイントラを評価しない
     int max_rd_cands = 0;          // >0: SAD 上位 K 候補のみ RD 評価
+    int refine_top = 2;            // MTS/E8/利得形状を試す上位候補数 (1 段目の J の順)
     bool skip_split_on_skip = false; // 残差なしインター葉なら分割を試さない
     bool approx_subpel = false;    // サブ画素探索コストを双線形で近似
     bool rdoq = false;             // レート歪み最適化量子化
