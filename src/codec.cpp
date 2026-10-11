@@ -559,6 +559,7 @@ struct FrameParams {
     bool no_deblock = false;  // 特許安全: HEVC 型デブロックを使わない
     bool range_coder = false; // 特許安全: rANS の代わりに範囲符号器
     bool gm_translation_only = false;  // 符号器のみ: 大域動きを平行移動に限る
+    bool brest = false;  // 帯域ゲイン復元 (特許安全モードの ALF 代替)
     bool alf = false;                                  // 適応ウィーナーフィルタ (§9.4)
     bool band_blocks = true;                           // 帯域画像をブロック符号化 (false: 標本単位)
     bool band_ns = false;                              // 帯域の時間差分ノイズ置換 (心理視覚)
@@ -1106,6 +1107,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 code_bands_blocks(io, md, pqmf_cfg(fp, ll_split), org ? &opad : nullptr, nullptr, R, step, lam, lo, hi, pi, fp.tools,
                                   fp.search, fp.min_log2, fp.max_log2, false, 0);
                 if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lam, lo, hi);
+                else if (fp.brest) code_band_restore(io, md.lf, R, org ? &opad : nullptr, pi == 0, step, lam, lo, hi);
             } else if (bands && !inter) {
                 code_bands(io, md, pqmf_cfg(fp), org ? &opad : nullptr, R, step, 1.0 / 3.0, lo, hi, fp.band_tools, fp.psy,
                            static_cast<uint64_t>(fp.poc) * 3 + pi);
@@ -1288,6 +1290,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 }
                 if (fp.cdef) code_cdef(io, md.lf, R, org ? &opad : nullptr, pi == 0, pqp, info.bit_depth, lambda, lo, hi);
                 if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lambda, lo, hi);
+                else if (fp.brest) code_band_restore(io, md.lf, R, org ? &opad : nullptr, pi == 0, step, lambda, lo, hi);
             }
                 };
         if (fp.lossy) {
@@ -1475,6 +1478,7 @@ FrameParams params_from(const EncoderConfig& c) {
     // --safe: 特許リスク区分ごとにツールを外す (法的保証ではない)
     if (c.safe & 1) {
         t.tmvp = t.mts = s.try_mts = t.ibc = t.rect = false;
+        fp.brest = fp.alf;  // ALF の代わりに帯域ゲイン復元
         fp.alf = false;
         t.all_angular = false;
         t.safe_intra = true;
@@ -1493,6 +1497,9 @@ FrameParams params_from(const EncoderConfig& c) {
     t.line_mv = c.line_mv >= 0 ? c.line_mv != 0 : (c.safe & 1) != 0;
     t.sr = c.sr >= 0 ? c.sr != 0 : false;
     if (c.safe_intra >= 0) t.safe_intra = c.safe_intra != 0;
+    if (c.merge >= 0) t.no_merge = c.merge == 0;
+    if (c.brest >= 0) { fp.brest = c.brest != 0; if (fp.brest) fp.alf = false; }
+    if (c.guide >= 0) { t.guide = c.guide != 0; if (t.guide) t.cfl = false; }
     if (c.safe & 8) {
         fp.pqmf_log2 = 0;
         t.tns = s.try_tns = t.e8 = s.try_e8 = t.dict = t.gs = t.firb = false;
@@ -1522,7 +1529,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
     put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u) |
                   (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u) | (fp.tools.firb ? 128u : 0u));
-    put_u8(p, fp.tools.guide ? 1u : 0u);
+    put_u8(p, (fp.tools.guide ? 1u : 0u) | (fp.brest ? 2u : 0u));
     put_u8(p, (fp.tools.no_merge ? 1u : 0u) | (fp.no_deblock ? 2u : 0u) | (fp.range_coder ? 4u : 0u) |
                   (fp.tools.no_obmc ? 8u : 0u) | (fp.tools.no_sp ? 16u : 0u) | (fp.tools.line_mv ? 32u : 0u) |
                   (fp.tools.sr ? 64u : 0u) | (fp.tools.safe_intra ? 128u : 0u));
@@ -1565,8 +1572,9 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.tools.gs = (f3 >> 6) & 1;
     fp.tools.firb = (f3 >> 7) & 1;
     const uint32_t f5 = br.u8();
-    if (f5 > 1) return false;
+    if (f5 > 3) return false;
     fp.tools.guide = f5 & 1;
+    fp.brest = (f5 >> 1) & 1;
     const uint32_t f4 = br.u8();
     fp.tools.safe_intra = (f4 >> 7) & 1;
     fp.tools.line_mv = (f4 >> 5) & 1;

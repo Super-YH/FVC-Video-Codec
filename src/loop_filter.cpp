@@ -346,4 +346,93 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
         }
 }
 
+namespace {
+constexpr int kBrBands = 6;
+inline int br_band(int u, int v) {
+    static constexpr int kB[15] = {0, 0, 1, 2, 2, 3, 3, 4, 4, 4, 5, 5, 5, 5, 5};
+    return kB[u + v];
+}
+// 8x8 正弦窓 DCT の重畳加算。cls_gain(cls, band) を係数に掛ける。classify はブロックの AC エネルギーからクラスを返す
+template <class F>
+void br_apply(const Plane& in, Plane& out, int ncls, double sigma2, F&& gain, int32_t lo, int32_t hi,
+              std::vector<double>* num = nullptr, std::vector<double>* den = nullptr, const Plane* org = nullptr) {
+    constexpr int N = 8, hop = 4;
+    constexpr double kPi = 3.14159265358979323846;
+    double w[N];
+    for (int n = 0; n < N; ++n) w[n] = std::sin(kPi * (n + 0.5) / N);
+    std::vector<double> acc(in.v.size(), 0.0), wsum(in.v.size(), 0.0);
+    double blk[N * N], c[N * N], r[N * N], ob[N * N], oc[N * N];
+    for (int by = -hop; by < in.h; by += hop)
+        for (int bx = -hop; bx < in.w; bx += hop) {
+            for (int y = 0; y < N; ++y)
+                for (int x = 0; x < N; ++x) {
+                    const int X = std::clamp(bx + x, 0, in.w - 1), Y = std::clamp(by + y, 0, in.h - 1);
+                    blk[y * N + x] = w[x] * w[y] * in.at(X, Y);
+                    if (org) ob[y * N + x] = w[x] * w[y] * org->at(X, Y);
+                }
+            forward_2d(TxType::DCT2, TxType::DCT2, blk, N, N, c);
+            double ac = 0;
+            for (int i = 1; i < N * N; ++i) ac += c[i] * c[i];
+            // 活動度クラス: log2(AC エネルギー / σ²) を 2 刻みで
+            const double rel = ac / std::max(sigma2, 1e-9);
+            int cls = rel < 4 ? 0 : rel < 16 ? 1 : rel < 64 ? 2 : 3;
+            cls = std::min(cls, ncls - 1);
+            if (org) {
+                forward_2d(TxType::DCT2, TxType::DCT2, ob, N, N, oc);
+                for (int i = 1; i < N * N; ++i) {
+                    const int k = cls * kBrBands + br_band(i % N, i / N);
+                    (*num)[k] += c[i] * oc[i];
+                    (*den)[k] += c[i] * c[i];
+                }
+                continue;
+            }
+            for (int i = 1; i < N * N; ++i) c[i] *= gain(cls, br_band(i % N, i / N));
+            inverse_2d(TxType::DCT2, TxType::DCT2, c, N, N, r);
+            for (int y = 0; y < N; ++y)
+                for (int x = 0; x < N; ++x) {
+                    const int X = bx + x, Y = by + y;
+                    if (X < 0 || Y < 0 || X >= in.w || Y >= in.h) continue;
+                    const size_t i = static_cast<size_t>(Y) * in.w + X;
+                    acc[i] += w[x] * w[y] * r[y * N + x];
+                    wsum[i] += w[x] * w[x] * w[y] * w[y];
+                }
+        }
+    if (org) return;
+    out = in;
+    for (size_t i = 0; i < acc.size(); ++i)
+        out.v[i] = std::clamp(static_cast<int32_t>(std::lround(acc[i] / wsum[i])), lo, hi);
+}
+}  // namespace
+
+void code_band_restore(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, double step, double lambda,
+                       int32_t lo, int32_t hi) {
+    const int ncls = luma ? 4 : 2;
+    const double sigma2 = step * step / 12.0;
+    std::vector<int> g(static_cast<size_t>(ncls) * kBrBands, 32);
+    int on = 0;
+    Plane F;
+    if (io.enc && org) {
+        std::vector<double> num(g.size(), 0.0), den(g.size(), 0.0);
+        Plane dummy;
+        br_apply(R, dummy, ncls, sigma2, [](int, int) { return 1.0; }, lo, hi, &num, &den, org);
+        for (size_t k = 0; k < g.size(); ++k)
+            g[k] = den[k] > 0 ? std::clamp(static_cast<int>(std::lround(num[k] / den[k] * 32.0)), 0, 64) : 32;
+        br_apply(R, F, ncls, sigma2, [&](int c, int b) { return g[static_cast<size_t>(c) * kBrBands + b] / 32.0; }, lo, hi);
+        double s0 = 0, s1 = 0;
+        for (size_t i = 0; i < R.v.size(); ++i) {
+            const double d0 = R.v[i] - org->v[i], d1 = F.v[i] - org->v[i];
+            s0 += d0 * d0; s1 += d1 * d1;
+        }
+        on = s0 - s1 > lambda * 8.0 * static_cast<double>(g.size());
+    }
+    on = io.bit(m, 70, luma ? 1 : 0, 0, on);
+    if (!on) return;
+    for (size_t k = 0; k < g.size(); ++k) {
+        g[k] = 32 + io.sint(m, 71 + static_cast<uint32_t>(k % kBrBands), luma ? 1u : 0u, g[k] - 32);
+        if (g[k] < 0 || g[k] > 64) throw std::runtime_error("corrupt stream: band restore gain");
+    }
+    if (!(io.enc && org)) br_apply(R, F, ncls, sigma2, [&](int c, int b) { return g[static_cast<size_t>(c) * kBrBands + b] / 32.0; }, lo, hi);
+    R = std::move(F);
+}
+
 }  // namespace fvc

@@ -36,6 +36,11 @@ void deblock_plane(Plane& p, const EdgeInfo& e, const MotionField* mf, bool chro
 void decay_deblock(Plane& p, const EdgeInfo& e, int rq, int thr, int32_t lo, int32_t hi);
 void freq_gain_filter(const Plane& in, Plane& out, double step, int mu_q, int32_t lo, int32_t hi);
 
+// 帯域ゲイン復元 (特許安全モードの ALF 代替): 8x8 正弦窓 DCT (ホップ 4) の係数に、ブロックの活動度クラスと
+// 周波数帯域 (u+v で 6 区分) ごとのゲイン g/32 (g ∈ [0, 64]) を掛けて重畳加算する。ゲインは符号器が最小二乗で求めて伝送
+void code_band_restore(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, double step, double lambda,
+                       int32_t lo, int32_t hi);
+
 // 符号化/復号共通: R (ブロック再構成, パディング済み) にループフィルタを適用する。
 // 符号器 (org != nullptr) はパラメータを決めて符号化、復号器は読み取って同じ処理をする。
 void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const EdgeInfo& e, const MotionField* mf,
