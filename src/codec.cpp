@@ -22,6 +22,7 @@
 #include "cdef.hpp"
 #include "loop_filter.hpp"
 #include "shapes.hpp"
+#include "lines.hpp"
 #include "fvc/quant.hpp"
 
 namespace fvc {
@@ -369,6 +370,10 @@ void code_bands_blocks(SymIO& io, Models& md, const PqmfCfg& pq, const Plane* or
     const int32_t range = 8 * (hi - lo + 1) * std::max(Mx, My);  // 帯域値の取りうる範囲 (正規化後) に十分な余裕
     std::vector<Plane> rk_plane(Mx * My);           // 各帯域の再構成 (正規化整数, パディング込み)
     Plane tp0, chg;                               // LL 帯域の時間方向予測と変化マスク
+    // 帯域の超解像 (イントラ): LL だけから合成した画像を、局所範囲に制限した鮮鋭化で「超解像」し、
+    // それを再び帯域分解した高域帯域を各高域帯域の予測 (ゲイン 1..5 / 4) に使う
+    const bool band_sr = tools.sr && !P && Mx * My > 1;
+    std::vector<std::vector<double>> srb;
     for (int ky = 0; ky < My; ++ky)
         for (int kx = 0; kx < Mx; ++kx) {
             const int k = ky * Mx + kx;
@@ -400,6 +405,13 @@ void code_bands_blocks(SymIO& io, Models& md, const PqmfCfg& pq, const Plane* or
                 bc.set_xband(&xp);
             }
             Plane tp;
+            if (band_sr && k > 0 && !srb.empty()) {
+                tp = Plane(BW, BH);
+                for (int y = 0; y < BH; ++y)
+                    for (int x = 0; x < BW; ++x)
+                        tp.at(x, y) = static_cast<int32_t>(std::lround(srb[k][static_cast<size_t>(std::min(y, bh - 1)) * bw + std::min(x, bw - 1)] * nrm));
+                bc.set_tband(&tp);
+            }
             if (P) {
                 tp = Plane(BW, BH);
                 for (int y = 0; y < BH; ++y)
@@ -436,6 +448,27 @@ void code_bands_blocks(SymIO& io, Models& md, const PqmfCfg& pq, const Plane* or
                     const size_t i = static_cast<size_t>(y) * bw + x;
                     rb[k][i] = R.at(x, y) / nrm;
                 }
+            if (k == 0 && band_sr) {
+                std::vector<std::vector<double>> lb(Mx * My, std::vector<double>(static_cast<size_t>(bw) * bh, 0.0));
+                lb[0] = rb[0];
+                std::vector<double> y0, y1;
+                fb.synthesize(lb, W, H, y0);
+                y1.resize(y0.size());
+                auto at = [&](int x, int y) { return y0[static_cast<size_t>(std::clamp(y, 0, H - 1)) * W + std::clamp(x, 0, W - 1)]; };
+                for (int y = 0; y < H; ++y)
+                    for (int x = 0; x < W; ++x) {
+                        double bl = 0, mn = 1e300, mx = -1e300;
+                        for (int dy = -1; dy <= 1; ++dy)
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                const double v = at(x + dx, y + dy);
+                                bl += v * ((dx ? 1 : 2) * (dy ? 1 : 2));
+                                mn = std::min(mn, v); mx = std::max(mx, v);
+                            }
+                        const double v0 = at(x, y);
+                        y1[static_cast<size_t>(y) * W + x] = std::clamp(v0 + (v0 - bl / 16.0), mn, mx);
+                    }
+                fb.analyze(y1, W, H, srb);
+            }
             if (k == 0 && P) {
                 // 変化マスク: |LL 再構成 - LL 時間方向予測| (動いた場所は全帯域で共通)
                 chg = Plane(BW, BH);
@@ -536,6 +569,8 @@ struct FrameParams {
     int threads = 1;                                   // 符号器/復号器のスレッド数 (ビットストリームに影響しない)
     // 符号器: グローバルパラメータのキャッシュ (COPY 判定と本符号化で共有)
     mutable bool gm_valid = false;
+    mutable bool lines_valid = false;            // 符号器: 線の動きの推定結果のキャッシュ
+    mutable std::vector<LineSeg> lines_cache;
     mutable int gm_x = 0, gm_y = 0, gm_gain[3] = {64, 64, 64}, gm_off[3] = {0, 0, 0};
     mutable GlobalModel gm_model;
     mutable int gm_hg[3] = {64, 64, 64};
@@ -962,6 +997,28 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 throw std::runtime_error("corrupt stream: global params");
         }
     }
+    // 線に基づく動き場 (lines.hpp): 線は参照輝度から両側で抽出し、動きの変化だけを伝送する
+    std::vector<int16_t> lfield;
+    int lf_w4 = 0, lf_h4 = 0;
+    if (inter && fp.tools.line_mv && fp.type != FrameType::Copy) {
+        const Plane& rref = refs[0][0]->p[0];
+        std::vector<LineSeg> lines;
+        if (io.w && fp.lines_valid) {
+            lines = fp.lines_cache;
+        } else {
+            lines = extract_lines(rref, info.width, info.height, info.bit_depth);
+            if (io.w) {
+                const double lam = 0.57 * std::pow(2.0, (fp.qp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
+                estimate_line_motion(lines, org->p[0], rref, gm, lam, 5);
+                fp.lines_cache = lines;
+                fp.lines_valid = true;
+            }
+        }
+        code_line_motion(io, md.line, lines, gm);
+        lf_w4 = (info.width + kCtu - 1) / kCtu * kCtu / 4;
+        lf_h4 = (info.height + kCtu - 1) / kCtu * kCtu / 4;
+        build_line_field(lines, gm, lf_w4, lf_h4, lfield);
+    }
     MotionField mf;
     Plane luma_rec;
     Plane fref;  // 帯域別ゲインを適用した参照 (プレーンごとに作り直す)
@@ -998,6 +1055,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             ic.chroma_shift = pi ? cs : 0;
             ic.gmv_x = gmv_x; ic.gmv_y = gmv_y;
             ic.gm = gm;
+            if (!lfield.empty()) { ic.lfield = &lfield; ic.lf_w4 = lf_w4; ic.lf_h4 = lf_h4; }
             ic.cur_poc = fp.poc;
             for (int l = 0; l < 2; ++l)
                 for (size_t r = 0; r < fp.ref_poc[l].size() && r < 4; ++r) ic.ref_poc[l][r] = fp.ref_poc[l][r];
@@ -1429,6 +1487,9 @@ FrameParams params_from(const EncoderConfig& c) {
         fp.gm_translation_only = true;
     }
     if (c.safe & 4) fp.range_coder = true;
+    // 線の動き場: 既定は特許安全モード (マージ/TMVP を外す区分 1) で有効
+    t.line_mv = c.line_mv >= 0 ? c.line_mv != 0 : (c.safe & 1) != 0;
+    t.sr = c.sr >= 0 ? c.sr != 0 : false;
     if (c.safe & 8) {
         fp.pqmf_log2 = 0;
         t.tns = s.try_tns = t.e8 = s.try_e8 = t.dict = t.gs = t.firb = false;
@@ -1459,7 +1520,8 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u) |
                   (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u) | (fp.tools.firb ? 128u : 0u));
     put_u8(p, (fp.tools.no_merge ? 1u : 0u) | (fp.no_deblock ? 2u : 0u) | (fp.range_coder ? 4u : 0u) |
-                  (fp.tools.no_obmc ? 8u : 0u) | (fp.tools.no_sp ? 16u : 0u));
+                  (fp.tools.no_obmc ? 8u : 0u) | (fp.tools.no_sp ? 16u : 0u) | (fp.tools.line_mv ? 32u : 0u) |
+                  (fp.tools.sr ? 64u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_uv(p, static_cast<uint32_t>(poc));
@@ -1499,7 +1561,9 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.tools.gs = (f3 >> 6) & 1;
     fp.tools.firb = (f3 >> 7) & 1;
     const uint32_t f4 = br.u8();
-    if (f4 > 31) return false;
+    if (f4 > 127) return false;
+    fp.tools.line_mv = (f4 >> 5) & 1;
+    fp.tools.sr = (f4 >> 6) & 1;
     fp.range_coder = (f4 >> 2) & 1;
     fp.tools.no_obmc = (f4 >> 3) & 1;
     fp.tools.no_sp = (f4 >> 4) & 1;

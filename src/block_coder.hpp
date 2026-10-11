@@ -1,5 +1,6 @@
 // FVC 内部: ブロック単位のイントラ符号化 (仕様 §5, §6, §2.3)
 #pragma once
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <cstdint>
@@ -86,7 +87,7 @@ struct SymIO {
 
 struct Models {
     CMModel split, mode, cbf, last, coef_y, coef_c, band_ll, band_hi, lossless, l2, ibc, cfl, tns, e8, nf;
-    CMModel inter, mvd, dict, shape, global, band_mode, lf, aqp, gs;
+    CMModel inter, mvd, dict, shape, global, band_mode, lf, aqp, gs, line;
 };
 
 const std::vector<int>& diag_scan(int log2s);
@@ -109,6 +110,8 @@ struct Tools {
     bool no_merge = false;    // マージ候補を使わない (特許安全モード)
     bool no_obmc = false;     // OBMC を使わない (特許安全モード)
     bool no_sp = false;       // Smooth/Paeth イントラを使わない (特許安全モード)
+    bool line_mv = false;     // 線に基づく動き場のモード (lines.hpp)
+    bool sr = false;          // ブロック超解像: 残差を 1/2 解像度で符号化し予測に導かれた補間で戻す
     bool mts = false;         // 複数変換選択 (DCT2/DST7/DCT8)
     bool pred_only = false;   // 予測のみ (残差は別経路: 動画 PQMF)
     bool band_ns = false;     // 帯域の時間差分ノイズ置換 (心理視覚)
@@ -133,6 +136,9 @@ struct InterCtx {
     int col_poc = 0, cur_poc = 0;
     int col_ref_poc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
     int ref_poc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
+    // 線に基づく動き場 (輝度 4x4 単位の (mvx, mvy), L0 先頭参照)。nullptr なら無効
+    const std::vector<int16_t>* lfield = nullptr;
+    int lf_w4 = 0, lf_h4 = 0;
 };
 
 // 符号器探索パラメータ (ビットストリームに影響しない)
@@ -191,6 +197,8 @@ private:
         int part = 0;        // pt==2 (輝度): 0 = 2Nx2N, 1 = 2NxN (上下), 2 = Nx2N (左右)
         MotionInfo mi2;      // 第 2 区画の動き
         int merge2 = -1;
+        int lmode = 0;       // pt==2 (輝度, 2Nx2N): 1 = 線の動き場で 4x4 ごとに予測 (動き情報は送らない)
+        int sr = 0;          // 残差の超解像: 0 = なし, 1 = 双線形, 2 = 予測の勾配に沿う補間 (係数は (s/2)^2)
         int fir[4] = {0, 0, 0, 0};
         int cg[3] = {8, 8, 8};      // pt==2 輝度: 予測係数のバンド別利得 a_b/8 (低/中/高, §7.6-2 係数コピー)  // pt==2 輝度: FIR 動き基底係数 ψ (∂x, ∂y, ∂xx, ∂yy)/16 (§7.3)
         int dict_idx = 0, dict_gain = 0;
@@ -282,6 +290,19 @@ private:
     void code_discard(SymIO& io, Models& md);  // 根ブロックごとの「捨てる」指示 (いつでも立てられる)
 
     void obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const;
+    // 線の動き場: 輝度位置 (x, y) の動き (L0 先頭参照)
+    MotionInfo line_mi(int x, int y) const {
+        MotionInfo m;
+        m.dir = 1;
+        const int bx = std::clamp(x / 4, 0, inter_.lf_w4 - 1), by = std::clamp(y / 4, 0, inter_.lf_h4 - 1);
+        const size_t i = (static_cast<size_t>(by) * inter_.lf_w4 + bx) * 2;
+        m.mvx[0] = (*inter_.lfield)[i];
+        m.mvy[0] = (*inter_.lfield)[i + 1];
+        return m;
+    }
+    bool line_ok() const { return tools_.line_mv && inter_.lfield && is_luma(); }
+    // 超解像: 1/2 解像度の残差 rl (h x h) を予測 pred (s x s) に導かれた補間で s x s に戻す
+    void sr_upsample(int mode, const double* rl, const int32_t* pred, int s, double* r) const;
     // Adam による動き推定: 開始点 (sx, sy) [画素] から連続 MV を最適化し、整数画素に丸めて返す
     void adam_motion(const Plane& rp, int x0, int y0, int w, int h, double sx, double sy, int& ox, int& oy) const;
     void fir_apply(const int* psi, int s, int32_t* pred) const;

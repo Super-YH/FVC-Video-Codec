@@ -25,7 +25,7 @@ static bool ends_with(const std::string& s, const char* suf) {
 static int usage() {
     std::fprintf(stderr,
                  "usage:\n  fvc enc [-q QP] [--preset faster|fast|medium|slow|placebo] [--lossless] [--l2] [--pqmf N]"
-                 " [--frames N]\n      [--keyint N] [--bframes N] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] [--aqp=0|1] [--rect=0|1] [--tmvp=0|1] [--alf=0|1] [--mts=0|1] [--cdef=0|1] [--gs=0|1] [--firb=0|1] [--me=adam|full] [--tune psy|psnr|ssim] [--safe[=1,2,3,4]] [--band-coder blocks|samples] [--psy-rd X]\n      [--ssim TARGET] [-v] [--quiet] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
+                 " [--frames N]\n      [--keyint N] [--bframes N] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] [--aqp=0|1] [--rect=0|1] [--tmvp=0|1] [--alf=0|1] [--mts=0|1] [--cdef=0|1] [--gs=0|1] [--firb=0|1] [--linemv=0|1] [--sr=0|1] [--me=adam|full] [--tune psy|psnr|ssim] [--safe[=1,2,3,4]] [--band-coder blocks|samples] [--psy-rd X]\n      [--ssim TARGET] [-v] [--quiet] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
     return 2;
 }
 
@@ -70,6 +70,8 @@ static int cmd_enc(int argc, char** argv) {
         }
         else if (a.rfind("--cdef=", 0) == 0) cfg.cdef = std::atoi(a.c_str() + 7);
         else if (a.rfind("--gs=", 0) == 0) cfg.gs = std::atoi(a.c_str() + 5);
+        else if (a.rfind("--linemv=", 0) == 0) cfg.line_mv = std::atoi(a.c_str() + 9);
+        else if (a.rfind("--sr=", 0) == 0) cfg.sr = std::atoi(a.c_str() + 5);
         else if (a.rfind("--firb=", 0) == 0) cfg.firb = std::atoi(a.c_str() + 7);
         else if (a == "--me=adam") cfg.adam = 1;
         else if (a == "--dict-bias" && i + 1 < argc) cfg.dict_bias = std::atof(argv[++i]);
@@ -234,10 +236,10 @@ static int cmd_enc(int argc, char** argv) {
             std::printf("\nBlock modes (luma area)\n");
             std::printf("  intra   %6.2f%%  %s\n", pc(u.intra), bar(u.intra).c_str());
             std::printf("  inter   %6.2f%%  %s\n", pc(u.inter), bar(u.inter).c_str());
-            std::printf("    merge %6.2f%%  (skip %.2f%%)  bi-pred %.2f%%  rect %.2f%%\n", pc(u.merge), pc(u.skip), pc(u.bi), pc(u.rect));
+            std::printf("    merge %6.2f%%  (skip %.2f%%)  bi-pred %.2f%%  rect %.2f%%  line %.2f%%\n", pc(u.merge), pc(u.skip), pc(u.bi), pc(u.rect), pc(u.line));
             std::printf("  ibc     %6.2f%%  %s\n", pc(u.ibc), bar(u.ibc).c_str());
             std::printf("  dict    %6.2f%%  %s\n", pc(u.dict), bar(u.dict).c_str());
-            std::printf("  tools   TNS %.2f%%  E8-VQ %.2f%%  GainShape %.2f%%  DictAtom %.2f%%  CfL(chroma area) %llu px\n", pc(u.tns), pc(u.e8), pc(u.gs), pc(u.dres),
+            std::printf("  tools   TNS %.2f%%  E8-VQ %.2f%%  GainShape %.2f%%  DictAtom %.2f%%  SR %.2f%%  CfL(chroma area) %llu px\n", pc(u.tns), pc(u.e8), pc(u.gs), pc(u.dres), pc(u.sr),
                         static_cast<unsigned long long>(u.cfl));
             std::printf("\nBlock sizes (luma area)\n");
             for (int i = 0; i < 7; ++i) {

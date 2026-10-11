@@ -208,12 +208,15 @@ static void test_codec() {
         {"pqmf-video-l2", true, true, 1, 30, Preset::Medium, 4, 1, 0, false},
         {"safe-123", true, false, 0, 30, Preset::Slow, 6, 1, 0, false, 7},
         {"safe-1234", true, false, 0, 30, Preset::Placebo, 5, 1, 0, false, 15},
+        {"line-sr", true, false, 0, 28, Preset::Slow, 7, 1, 0, false, 1},
+        {"pqmf-sr", true, false, 2, 26, Preset::Medium, 2, 0, 0, false},
     };
     for (const Case& c : cases) {
         EncoderConfig cfg;
         cfg.lossy_layer = c.lossy; cfg.l2_lossless = c.l2; cfg.pqmf_log2 = c.pqmf; cfg.qp = c.qp; cfg.preset = c.pr;
         cfg.bframes = c.bframes; cfg.keyint = c.keyint; cfg.psy = c.psy; cfg.keep_recon = true; cfg.safe = c.safe;
         if (std::string(c.name) == "ssim-target") cfg.target_ssim = 0.97;
+        if (std::string(c.name).find("sr") != std::string::npos) cfg.sr = 1;
         Encoder enc(info, cfg);
         auto s = enc.sequence_header();
         std::vector<Frame> src;

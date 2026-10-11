@@ -1,0 +1,36 @@
+// FVC 内部: 線に基づく動き (特許安全モードのマージ/時間方向候補の代替)
+//  1. 線の抽出: 参照ピクチャ (復号済み輝度) の 16x16 セルごとに最も強いエッジ点を選び、
+//     その点と勾配 (法線) で直線をパラメトリックに表す。復号器も同じ参照から同じ線を得るので形は伝送しない。
+//  2. 線の動き: 線ごとに「大域動きから変わったか」のフラグと、変わった線だけ動きの差分を伝送する。
+//  3. 動き場: 4x4 ごとに近傍の線の動きを距離の逆数で重み付け平均した密な動き場を作る (線がなければ大域動き)。
+//  ブロックは「線の動き場で予測する」1 ビットのモードを選べる (4x4 ごとに異なる動き)。
+#pragma once
+#include <cstdint>
+#include <vector>
+
+#include "block_coder.hpp"
+#include "fvc/frame.hpp"
+#include "inter.hpp"
+
+namespace fvc {
+
+struct LineSeg {
+    int x = 0, y = 0;       // 線上の点 (エッジ点, 輝度画素)
+    int gx = 0, gy = 0;     // 勾配 (法線方向, Sobel)
+    int mvx = 0, mvy = 0;   // 動き (1/4 画素)
+    bool changed = false;   // 大域動きから変わったか
+};
+
+constexpr int kLineCell = 16;
+
+// 参照輝度から線を抽出する (符号器・復号器で同一の整数演算)
+std::vector<LineSeg> extract_lines(const Plane& ref, int vw, int vh, int bit_depth);
+// 符号器: 線ごとの動きを推定し、変わったかを RD で決める
+void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const Plane& ref, const GlobalModel& gm,
+                          double lambda, int range);
+// 線の動きの構文 (符号器/復号器共通)。変わらない線の動きは大域動きになる
+void code_line_motion(SymIO& io, CMModel& m, std::vector<LineSeg>& lines, const GlobalModel& gm);
+// 4x4 単位の動き場 (mvx, mvy の組, 1/4 画素) を作る
+void build_line_field(const std::vector<LineSeg>& lines, const GlobalModel& gm, int w4, int h4, std::vector<int16_t>& field);
+
+}  // namespace fvc

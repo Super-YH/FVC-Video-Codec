@@ -583,7 +583,21 @@ void BlockCoder::predict_base(const Leaf& lf, int x0, int y0, int l, int32_t* pr
     const int s = 1 << l;
     if (lf.pt == 2) {
         if (is_luma()) {
-            if (lf.part == 0) {
+            if (lf.lmode) {
+                // 線の動き場: 4x4 ごとに動き場の動きで補償 (同じ動きが続く行はまとめて補償)
+                std::vector<int32_t> sub(static_cast<size_t>(s) * 4);
+                for (int by = 0; by < s; by += 4)
+                    for (int bx = 0; bx < s;) {
+                        const MotionInfo m = line_mi(x0 + bx, y0 + by);
+                        int ex = bx + 4;
+                        while (ex < s && line_mi(x0 + ex, y0 + by) == m) ex += 4;
+                        const int bw = ex - bx;
+                        inter_predict(m, inter_.l0, inter_.l1, x0 + bx, y0 + by, bw, 4, 0, lo_, hi_, sub.data());
+                        for (int y = 0; y < 4; ++y)
+                            for (int x = 0; x < bw; ++x) pred[(by + y) * s + bx + x] = sub[y * bw + x];
+                        bx = ex;
+                    }
+            } else if (lf.part == 0) {
                 inter_predict(lf.mi, inter_.l0, inter_.l1, x0, y0, s, s, 0, lo_, hi_, pred);
                 fir_apply(lf.fir, s, pred);
                 cg_apply(lf.cg, s, pred);
@@ -766,6 +780,7 @@ void BlockCoder::mv_pred(int x0, int y0, int list, int ref, int& px, int& py) co
     if (y0 > ty0_ && try_mi(inter_.mf->at(x0, y0 - 1))) return;
     MotionInfo t;
     if (ref == 0 && temporal_cand(x0, y0, t) && try_mi(t)) return;
+    if (list == 0 && ref == 0 && line_ok()) { const MotionInfo m = line_mi(x0, y0); px = m.mvx[0]; py = m.mvy[0]; return; }
     if (list == 0) inter_.gmv_at(x0, y0, px, py);
     else px = py = 0;
 }
@@ -805,6 +820,8 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
     MotionInfo ml[kMaxMerge];
     const int nm = merge_list(x0, y0, w, h, ml);
     for (int i = 0; i < nm; ++i) { Leaf lf; lf.pt = 2; lf.mi = ml[i]; lf.merge = i; cands.push_back(lf); }
+    // 線の動き場の候補 (動き情報を送らない)
+    if (line_ok() && w == h) { Leaf lf; lf.pt = 2; lf.lmode = 1; lf.mi = line_mi(x0 + w / 2, y0 + h / 2); cands.push_back(lf); }
     MotionInfo best_uni[2];
     double best_uni_cost[2] = {1e300, 1e300};
     for (int list = 0; list < (inter_.bframe ? 2 : 1); ++list)
@@ -834,6 +851,10 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
                 int gx, gy;
                 inter_.gmv_at(x0 + w / 2, y0 + h / 2, gx, gy);
                 test_int((gx + 2) >> 2, (gy + 2) >> 2);
+            }
+            if (line_ok() && list == 0 && ref == 0) {
+                const MotionInfo lm = line_mi(x0 + w / 2, y0 + h / 2);
+                test_int((lm.mvx[0] + 2) >> 2, (lm.mvy[0] + 2) >> 2);
             }
             for (int i = 0; i < nm; ++i)
                 if ((ml[i].dir >> list) & 1) test_int((ml[i].mvx[list] + 2) >> 2, (ml[i].mvy[list] + 2) >> 2);
@@ -1151,6 +1172,29 @@ void BlockCoder::quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred, 
         lf.q.assign(n, 0); lf.last = -1; lf.nf = 0; lf.tns_on = false; lf.mts = 0; lf.qmode = 0;
         return;
     }
+    if (lf.sr) {
+        // 超解像: 残差を 2x2 平均で縮小し (s/2)^2 の DCT-II で量子化 (TNS/MTS/E8/利得形状なし)
+        const int h = s / 2, nh = h * h;
+        std::vector<double> rl(nh), c(nh);
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < h; ++x) {
+                double a = 0;
+                for (int k = 0; k < 4; ++k) {
+                    const int xx = 2 * x + (k & 1), yy = 2 * y + (k >> 1);
+                    a += org_->at(x0 + xx, y0 + yy) - pred[yy * s + xx];
+                }
+                rl[y * h + x] = a * 0.25;
+            }
+        forward_2d(TxType::DCT2, TxType::DCT2, rl.data(), h, h, c.data());
+        const auto& sc = diag_scan(l - 1);
+        lf.q.assign(nh, 0); lf.last = -1; lf.nf = 0; lf.tns_on = false; lf.mts = 0; lf.qmode = 0;
+        for (int i = 0; i < nh; ++i) {
+            const int32_t v = quant_dz(c[sc[i]], step_, 1.0 / 3.0);
+            lf.q[sc[i]] = v;
+            if (v) lf.last = i;
+        }
+        return;
+    }
     const auto& scan = diag_scan(l);
     std::vector<double> cl, e(n);
     if (!coefs) { fwd_coefs(lf.mts, x0, y0, l, pred, cl); coefs = &cl; }
@@ -1210,11 +1254,42 @@ void BlockCoder::quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred, 
     }
 }
 
+// 超解像の補間 (§5.x): 出力画素 (x, y) の縮小格子上の最近傍 a と、x/y 方向の隣 b/c、対角 d から
+//  mode 1: 双線形 (9a + 3b + 3c + d) / 16
+//  mode 2: 予測ブロックの勾配に導かれた補間。予測が x 方向に強く変化する (縦のエッジ) なら x 方向には
+//          補間しない (3a + c) / 4、y 方向に強く変化するなら (3a + b) / 4、それ以外は双線形。
+//          残差の高域をエッジの位置に揃え、エッジをまたいでぼかさない。
+void BlockCoder::sr_upsample(int mode, const double* rl, const int32_t* pred, int s, double* r) const {
+    const int h = s / 2;
+    auto L = [&](int x, int y) { return rl[std::clamp(y, 0, h - 1) * h + std::clamp(x, 0, h - 1)]; };
+    auto P = [&](int x, int y) { return pred[std::clamp(y, 0, s - 1) * s + std::clamp(x, 0, s - 1)]; };
+    for (int y = 0; y < s; ++y)
+        for (int x = 0; x < s; ++x) {
+            const int i = x >> 1, j = y >> 1;
+            const int i2 = i + ((x & 1) ? 1 : -1), j2 = j + ((y & 1) ? 1 : -1);
+            const double a = L(i, j), b = L(i2, j), c = L(i, j2), d = L(i2, j2);
+            double v = (9.0 * a + 3.0 * b + 3.0 * c + d) / 16.0;
+            if (mode == 2) {
+                const int gx = std::abs(P(x + 1, y) - P(x - 1, y)), gy = std::abs(P(x, y + 1) - P(x, y - 1));
+                if (gx > 2 * gy + 2) v = (3.0 * a + c) / 4.0;
+                else if (gy > 2 * gx + 2) v = (3.0 * a + b) / 4.0;
+            }
+            r[y * s + x] = v;
+        }
+}
+
 void BlockCoder::reconstruct(const Leaf& lf, int x0, int y0, int l, const int32_t* pred) {
     const int s = 1 << l, n = s * s;
     const auto& scan = diag_scan(l);
     std::vector<double> r(n, 0.0);
-    if (lf.last >= 0 || lf.nf) {
+    if (lf.sr && lf.last >= 0) {
+        const int h = s / 2, nh = h * h;
+        const auto& sc = diag_scan(l - 1);
+        std::vector<double> c(nh, 0.0), rl(nh);
+        for (int i = 0; i <= lf.last; ++i) c[sc[i]] = lf.q[sc[i]] * step_;
+        inverse_2d(TxType::DCT2, TxType::DCT2, c.data(), h, h, rl.data());
+        sr_upsample(lf.sr, rl.data(), pred, s, r.data());
+    } else if (lf.last >= 0 || lf.nf) {
         std::vector<double> e(n, 0.0), c(n);
         if (lf.qmode == 2) {
             gs_reconstruct(lf.gs, l, gs_seed(x0, y0), e.data());
@@ -1319,8 +1394,8 @@ double BlockCoder::leaf_bits(const Leaf& lf, int x0, int y0, int l) const {
     if (tools_.e8) b += 1.0;
     if (lf.tns_on) b += 2.0 + 4.0 * lf.tns.order;
     if (lf.qmode == 0) {
-        const auto& scan = diag_scan(l);
-        b += 2.0 + 2.0 * std::log2(2.0 + lf.last);
+        const auto& scan = diag_scan(lf.sr ? l - 1 : l);
+        b += 2.0 + 2.0 * std::log2(2.0 + lf.last) + (tools_.sr ? 1.0 : 0.0);
         for (int i = 0; i <= lf.last; ++i) {
             const int32_t a = std::abs(lf.q[scan[i]]);
             b += a ? 2.0 + 2.0 * std::log2(1.0 + a) : 0.6;
@@ -1620,12 +1695,35 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         restore(x0, y0, s, before);
         return j;
     };
+    auto eval_sr = [&](size_t ci, int sm) {
+        Leaf lf = cands[ci];
+        lf.qmode = 0; lf.mts = 0; lf.tns_on = false; lf.sr = sm;
+        quantize(lf, x0, y0, l, preds[ci].data());
+        if (lf.last < 0) return;  // 係数がなければ通常の残差なしと同じ
+        reconstruct(lf, x0, y0, l, preds[ci].data());
+        const double dist = sse(x0, y0, s);
+        const double j = dist + lambda_ * (leaf_rate(lf, x0, y0, l) + split_rate(x0, y0, l, 0));
+        lf.rd_dist = dist;
+        if (j < best) { best = j; best_leaf = lf; save(x0, y0, s, best_rec); }
+        restore(x0, y0, s, before);
+    };
     const int ntn = tools_.tns && search_.try_tns && s >= 8 ? 1 : 0;
     std::vector<std::pair<double, size_t>> j1;
     for (size_t ci = 0; ci < cands.size(); ++ci) {
         double jb = 1e300;
         for (int tn = 0; tn <= ntn; ++tn) jb = std::min(jb, eval(ci, 0, 0, tn));
         j1.push_back({jb, ci});
+    }
+    // 超解像: 1 段目の上位候補に、残差を 1/2 解像度で符号化する変種を試す
+    if (tools_.sr && s >= 8 && s <= 64 && !tools_.pred_only) {
+        std::vector<std::pair<double, size_t>> srt = j1;
+        std::sort(srt.begin(), srt.end());
+        const size_t top = std::min<size_t>(srt.size(), static_cast<size_t>(std::max(1, search_.refine_top)));
+        for (size_t t = 0; t < top; ++t) {
+            const size_t ci = srt[t].second;
+            if (cands[ci].pt == 3 || cands[ci].dres >= 0) continue;
+            for (int sm = 1; sm <= 2; ++sm) eval_sr(ci, sm);
+        }
     }
     // 残差の辞書原子: 1 段目の上位候補に、残差に最も合う原子を加えた変種を追加して評価
     if (tools_.dict && !tools_.pred_only) {
@@ -1708,7 +1806,13 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
                 part = is_part ? 1 + io.bit(md.inter, 13, L, 0, lf.part == 2) : 0;
             }
             lf.part = part;
-            if (part == 0) {
+            lf.lmode = (part == 0 && line_ok()) ? io.bit(md.inter, 50, L, 0, lf.lmode) : 0;
+            if (lf.lmode) {
+                lf.merge = -1;
+                lf.mi = line_mi(x0 + s / 2, y0 + s / 2);
+                for (int& v : lf.fir) v = 0;
+                for (int& v : lf.cg) v = 8;
+            } else if (part == 0) {
                 code_motion(io, md, L, x0, y0, s, s, lf.mi, lf.merge);
                 if (tools_.firb && s >= 16) {
                     const int on = io.bit(md.inter, 40, L, 0, lf.fir[0] || lf.fir[1] || lf.fir[2] || lf.fir[3]);
@@ -1846,6 +1950,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         lf.tns_on = false;
         lf.nf = 0;
         lf.mts = 0;
+        lf.sr = 0;
         // 時間方向予測で残差なし: 高域ノイズを強さだけで置換 (包絡は参照帯域の振幅から)
         if (ns_allowed(lf)) {
             lf.ns = static_cast<int>(io.uint(md.nf, 8 + (lf.pt == 2 ? 1u : 0u), cbc, static_cast<uint32_t>(lf.ns)));
@@ -1855,7 +1960,13 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         }
     } else {
         lf.ns = 0;
-        if (tools_.mts && is_luma() && s <= 32) {
+        if (tools_.sr && s >= 8 && s <= 64) {
+            const int on = io.bit(md.e8, 20, L, pc, lf.sr != 0);
+            lf.sr = on ? 1 + io.bit(md.e8, 21, L, pc, lf.sr == 2) : 0;
+        } else {
+            lf.sr = 0;
+        }
+        if (tools_.mts && is_luma() && s <= 32 && !lf.sr) {
             int m = io.bit(md.e8, 5, L, static_cast<uint32_t>(lf.pt), lf.mts != 0);
             if (m) {
                 // 1..4: DST7/DCT8 の組, 5..8 (16x16 以下): DCT2 混合と恒等変換
@@ -1869,7 +1980,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         } else {
             lf.mts = 0;
         }
-        if (tools_.e8 || tools_.gs) {
+        if ((tools_.e8 || tools_.gs) && !lf.sr) {
             const int nzq = io.bit(md.e8, 0, L, pc, lf.qmode != 0);
             if (!nzq) lf.qmode = 0;
             else if (tools_.e8 && tools_.gs) lf.qmode = 1 + io.bit(md.e8, 12, L, pc, lf.qmode == 2);
@@ -1877,7 +1988,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         } else {
             lf.qmode = 0;
         }
-        if (tools_.tns && s >= 8 && lf.qmode != 2) {
+        if (tools_.tns && s >= 8 && lf.qmode != 2 && !lf.sr) {
             lf.tns_on = io.bit(md.tns, 0, L, pc, lf.tns_on);
             if (lf.tns_on) {
                 lf.tns.qbits = 4;
@@ -1892,7 +2003,9 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         } else {
             lf.tns_on = false;
         }
-        const auto& scan = diag_scan(l);
+        // 超解像の葉は (s/2)^2 の係数を持つ
+        const int lc = l - (lf.sr ? 1 : 0), nc = 1 << (2 * lc);
+        const auto& scan = diag_scan(lc);
         if (lf.qmode == 2) {
             if (lf.tns_on) throw std::runtime_error("corrupt stream: gs with tns");
             gs_syntax(io, md.gs, lf.gs, l, pc, gs_mem_);
@@ -1900,15 +2013,15 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
             lf.nf = 0;
         } else if (lf.qmode == 0) {
             lf.last = static_cast<int>(io.uintc(md.last, L, pc, static_cast<uint32_t>(lf.last)));
-            if (lf.last >= n) throw std::runtime_error("corrupt stream: last");
-            if (!io.enc) lf.q.assign(n, 0);
+            if (lf.last >= nc) throw std::runtime_error("corrupt stream: last");
+            if (!io.enc) lf.q.assign(nc, 0);
             CMModel& cm = plane_ ? md.coef_c : md.coef_y;
             const uint32_t xbc = xb_ctx(x0, y0, s);
             for (int i = 0; i <= lf.last; ++i) {
                 const int pos = scan[i];
-                const int u = pos & (s - 1), v = pos >> l;
-                const uint32_t a = coef_ctx(lf.q.data(), u, v, l);
-                const uint32_t b = (L * 4 + (i == lf.last ? 1u : 0u) + (i == 0 ? 2u : 0u) + (lf.tns_on ? 64u : 0u)) | (xbc << 8) | (cbc << 11);
+                const int u = pos & ((1 << lc) - 1), v = pos >> lc;
+                const uint32_t a = coef_ctx(lf.q.data(), u, v, lc);
+                const uint32_t b = (static_cast<uint32_t>(lc) * 4 + (i == lf.last ? 1u : 0u) + (i == 0 ? 2u : 0u) + (lf.tns_on || lf.sr ? 64u : 0u)) | (xbc << 8) | (cbc << 11);
                 if (i == lf.last) {
                     const int32_t cv = lf.q[pos];
                     const uint32_t mag = io.uint(cm, a, b, io.enc ? static_cast<uint32_t>(std::abs(cv)) - 1u : 0u) + 1u;
@@ -1918,7 +2031,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
                     lf.q[pos] = io.sint(cm, a, b, lf.q[pos]);
                 }
             }
-            if (tools_.nf) {
+            if (tools_.nf && !lf.sr) {
                 if (lf.last + 1 < n) lf.nf = static_cast<int>(io.uint(md.nf, L, pc, static_cast<uint32_t>(lf.nf)));
                 else lf.nf = 0;
                 if (lf.nf > 3) throw std::runtime_error("corrupt stream: nf");
@@ -1997,6 +2110,11 @@ void BlockCoder::code_motion(SymIO& io, Models& md, uint32_t L, int x0, int y0, 
 void BlockCoder::fill_mf(const Leaf& lf, int x0, int y0, int s) {
     if (!(inter_.enabled && is_luma())) return;
     if (lf.pt != 2) { inter_.mf->fill(x0, y0, s, s, MotionInfo{}); return; }
+    if (lf.lmode) {
+        for (int y = 0; y < s; y += 4)
+            for (int x = 0; x < s; x += 4) inter_.mf->fill(x0 + x, y0 + y, 4, 4, line_mi(x0 + x, y0 + y));
+        return;
+    }
     if (lf.part == 0) { inter_.mf->fill(x0, y0, s, s, lf.mi); return; }
     const int pw = lf.part == 2 ? s / 2 : s, ph = lf.part == 1 ? s / 2 : s;
     inter_.mf->fill(x0, y0, pw, ph, lf.mi);
@@ -2058,11 +2176,13 @@ void BlockCoder::code_leaf(SymIO& io, Models& md, Leaf& lf, int x0, int y0, int 
                 if (lf.part) usage_.rect += a;
                 else if (lf.merge >= 0) { usage_.merge += a; if (lf.last < 0) usage_.skip += a; }
                 if (lf.mi.dir == 3) usage_.bi += a;
+                if (lf.lmode) usage_.line += a;
             } else if (lf.pt == 1) usage_.ibc += a;
             else if (lf.pt == 3) usage_.dict += a;
             if (lf.dres >= 0) usage_.dres += a;
             else usage_.intra += a;
             if (lf.tns_on) usage_.tns += a;
+            if (lf.sr && lf.last >= 0) usage_.sr += a;
             if (lf.qmode == 1 && lf.last >= 0) usage_.e8 += a;
             if (lf.qmode == 2 && lf.last >= 0) usage_.gs += a;
         } else if (lf.pt == 0 && lf.mode == kModeCfl) {

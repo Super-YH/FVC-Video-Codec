@@ -20,7 +20,7 @@ struct EncoderConfig {
     Preset preset = Preset::Medium;
     bool psy = false;         // ノイズ補完/帯域ノイズ置換 (PSNR は下がるが質感保持)
     int ibc = -1;             // -1: プリセット依存, 0/1: 強制
-    int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1, rect = -1, tmvp = -1, alf = -1, mts = -1, cdef = -1, gs = -1, firb = -1;
+    int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1, rect = -1, tmvp = -1, alf = -1, mts = -1, cdef = -1, gs = -1, firb = -1, line_mv = -1, sr = -1;
     int adam = -1;
     double dict_bias = -1;
     int dict_age = -1;        // 学習原子を捨てるまでの未使用根ブロック数。負: 既定    // 辞書の葉の RD 罰則 (ビット)。負: 既定            // 動き探索: 1 = Adam (勾配最適化), 0 = 格子探索, -1 = プリセット依存
@@ -57,11 +57,12 @@ struct BlockUsage {
     uint64_t merge = 0, skip = 0, rect = 0, bi = 0;    // インターの内訳 (skip = マージかつ残差なし)
     uint64_t size[7] = {0, 0, 0, 0, 0, 0, 0};          // 4x4 .. 256x256 (log2 2..8)
     uint64_t tns = 0, e8 = 0, cfl = 0, leaves = 0, gs = 0, dres = 0;
+    uint64_t line = 0, sr = 0;                         // 線の動き場モード / 超解像残差
     void add(const BlockUsage& o) {
         intra += o.intra; inter += o.inter; ibc += o.ibc; dict += o.dict;
         merge += o.merge; skip += o.skip; rect += o.rect; bi += o.bi;
         for (int i = 0; i < 7; ++i) size[i] += o.size[i];
-        tns += o.tns; e8 += o.e8; cfl += o.cfl; leaves += o.leaves; gs += o.gs; dres += o.dres;
+        tns += o.tns; e8 += o.e8; cfl += o.cfl; leaves += o.leaves; gs += o.gs; dres += o.dres; line += o.line; sr += o.sr;
     }
 };
 
