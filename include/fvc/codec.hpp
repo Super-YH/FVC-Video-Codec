@@ -35,6 +35,12 @@ struct EncoderConfig {
     int chroma_qp_offset = 0; // 色差 QP オフセット (-12..12)
     bool band_samples = false;  // PQMF 帯域を標本単位で符号化 (既定はブロック符号化)
     bool tune_psnr = false;     // true: 歪みを純粋な SSE で評価 (PSNR 最大化)
+    // 特許リスク区分ごとにツールを外す (ビット k-1 = 区分 k)。法的保証ではない
+    //  1: HEVC/VVC 由来 (マージ/TMVP/角度イントラ/MTS/ALF/IBC/長方形分割/HEVC 型デブロック)
+    //  2: AV1 由来 (CfL/Smooth/Paeth/CDEF/OBMC/射影・アフィン大域動き)
+    //  3: rANS (範囲符号器に置換)
+    //  4: 独自・期限切れ技術 (PQMF/TNS/E8/辞書/図形/利得形状/FIR 基底) — 比較測定用
+    int safe = 0;
     bool tune_ssim = false;     // true: 歪みを局所分散で重み付けした SSE (SSIM 近似) で評価
     double psy_strength = 1.0;  // 心理視覚マスキングの強さ
     int total_frames = 0;     // 入力の総フレーム数 (0: 不明)。1 なら将来参照用の辞書追加を送らない

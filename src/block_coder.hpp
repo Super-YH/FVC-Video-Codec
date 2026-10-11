@@ -106,6 +106,9 @@ struct Tools {
     bool fir = true;          // FIR 動き平滑 (§7.3)
     bool rect = false;        // 長方形予測分割 (2NxN / Nx2N)
     bool tmvp = false;        // 時間方向動きベクトル候補
+    bool no_merge = false;    // マージ候補を使わない (特許安全モード)
+    bool no_obmc = false;     // OBMC を使わない (特許安全モード)
+    bool no_sp = false;       // Smooth/Paeth イントラを使わない (特許安全モード)
     bool mts = false;         // 複数変換選択 (DCT2/DST7/DCT8)
     bool pred_only = false;   // 予測のみ (残差は別経路: 動画 PQMF)
     bool band_ns = false;     // 帯域の時間差分ノイズ置換 (心理視覚)

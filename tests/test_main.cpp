@@ -134,7 +134,7 @@ static void test_transform() {
     std::printf("transform: ok (TNS order=%d, pred gain %.1f dB)\n", f.order, 10 * std::log10(ec / ee));
 }
 
-static void test_entropy() {
+static void test_entropy(bool rc) {
     SplitMix64 rng(7);
     std::vector<int32_t> vals(50000);
     // ラプラス分布的な整数列 (前値と相関)
@@ -149,14 +149,14 @@ static void test_entropy() {
     vals.push_back(2000000000);
     vals.push_back(-2000000000);
     CMModel me, md;
-    EntropyWriter w;
+    EntropyWriter w(rc);
     prev = 0;
     for (int32_t v : vals) {
         w.sint(me, static_cast<uint32_t>(std::min(std::abs(prev), 15)), prev < 0, v);
         prev = v;
     }
     auto bytes = w.finish();
-    EntropyReader r(bytes.data(), bytes.size());
+    EntropyReader r(bytes.data(), bytes.size(), rc);
     prev = 0;
     bool ok = true;
     for (int32_t v : vals) {
@@ -165,7 +165,7 @@ static void test_entropy() {
         prev = d;
     }
     CHECK(ok);
-    std::printf("entropy: %zu symbols -> %zu bytes (%.3f bits/sym), roundtrip %s\n", vals.size(), bytes.size(),
+    std::printf("entropy %s: %zu symbols -> %zu bytes (%.3f bits/sym), roundtrip %s\n", rc ? "range" : "rans ", vals.size(), bytes.size(),
                 bytes.size() * 8.0 / vals.size(), ok ? "ok" : "NG");
 }
 
@@ -190,7 +190,7 @@ static Frame synth_frame(const VideoInfo& info, int t) {
 static void test_codec() {
     VideoInfo info;
     info.width = 83; info.height = 61; info.chroma = ChromaFormat::C420; info.ct = ColorTransform::Identity;
-    struct Case { const char* name; bool lossy, l2; int pqmf, qp; Preset pr; int frames, bframes, keyint; bool psy; };
+    struct Case { const char* name; bool lossy, l2; int pqmf, qp; Preset pr; int frames, bframes, keyint; bool psy; int safe = 0; };
     const Case cases[] = {
         {"lossless", false, false, 0, 0, Preset::Medium, 2, 0, 0, false},
         {"l2", true, true, 0, 30, Preset::Medium, 3, 0, 0, false},
@@ -206,11 +206,13 @@ static void test_codec() {
         {"ssim-target", true, false, 0, 30, Preset::Fast, 6, 3, 0, false},
         {"pqmf-video", true, false, 2, 30, Preset::Fast, 6, 3, 0, false},
         {"pqmf-video-l2", true, true, 1, 30, Preset::Medium, 4, 1, 0, false},
+        {"safe-123", true, false, 0, 30, Preset::Slow, 6, 1, 0, false, 7},
+        {"safe-1234", true, false, 0, 30, Preset::Placebo, 5, 1, 0, false, 15},
     };
     for (const Case& c : cases) {
         EncoderConfig cfg;
         cfg.lossy_layer = c.lossy; cfg.l2_lossless = c.l2; cfg.pqmf_log2 = c.pqmf; cfg.qp = c.qp; cfg.preset = c.pr;
-        cfg.bframes = c.bframes; cfg.keyint = c.keyint; cfg.psy = c.psy; cfg.keep_recon = true;
+        cfg.bframes = c.bframes; cfg.keyint = c.keyint; cfg.psy = c.psy; cfg.keep_recon = true; cfg.safe = c.safe;
         if (std::string(c.name) == "ssim-target") cfg.target_ssim = 0.97;
         Encoder enc(info, cfg);
         auto s = enc.sequence_header();
@@ -256,7 +258,8 @@ int main() {
     test_pqmf();
     test_lattice();
     test_transform();
-    test_entropy();
+    test_entropy(false);
+    test_entropy(true);
     test_codec();
     if (g_fail) { std::printf("%d failure(s)\n", g_fail); return 1; }
     std::printf("all tests passed\n");

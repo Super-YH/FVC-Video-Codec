@@ -296,7 +296,7 @@ void BlockCoder::intra_cfl(int x0, int y0, int s, int alpha, int32_t* pred) cons
 // OBMC (§7.3): 上・左の (符号化済み) インター近傍の動きで予測した値を、境界から離れるほど重みが 0 になる
 // 余弦窓で重ね合わせる。動きの異なるブロック境界の段差 (ブロック状の継ぎ目) を予測段階で消す。
 void BlockCoder::obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const {
-    if (!inter_.mf || s < 8) return;
+    if (!inter_.mf || s < 8 || tools_.no_obmc) return;
     const int ov = std::min(s / 2, 16);
     // 規範の整数重み: round(16 (1 + cos(π (i + 0.5) / ov))) を表で持つ (libm の差で復号が変わらないように)
     static constexpr int kW4[4] = {31, 22, 10, 1};
@@ -730,6 +730,7 @@ bool BlockCoder::temporal_cand(int x, int y, MotionInfo& out) const {
 
 int BlockCoder::merge_list(int x0, int y0, int w, int h, MotionInfo* out) const {
     int n = 0;
+    if (tools_.no_merge) return 0;
     auto push = [&](const MotionInfo& m) {
         if (m.dir == 0 || n >= kMaxMerge) return;
         if (((m.dir >> 1) & 1) && inter_.nref[1] == 0) return;
@@ -1441,7 +1442,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     {
         std::vector<std::pair<int64_t, int>> sads;
         std::vector<int> modes;
-        if (tools_.all_angular) for (int m = 0; m < kNumIntra; ++m) { if (m != kModeCfl) modes.push_back(m); }
+        if (tools_.all_angular) for (int m = 0; m < kNumIntra; ++m) { if (m != kModeCfl && !(tools_.no_sp && m >= kModeSmooth)) modes.push_back(m); }
         else modes = {kModeDC, kModePlanar, kModeHor, kModeVer};
         Leaf t;
         for (int m : modes) {

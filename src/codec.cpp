@@ -523,6 +523,9 @@ struct FrameParams {
     int tile_cols = 1, tile_rows = 1;                  // タイル分割 (CTU 単位で均等)
     int cqp_off = 0;                                   // 色差 QP オフセット
     bool aqp = false;                                  // CTU 単位の適応 QP
+    bool no_deblock = false;  // 特許安全: HEVC 型デブロックを使わない
+    bool range_coder = false; // 特許安全: rANS の代わりに範囲符号器
+    bool gm_translation_only = false;  // 符号器のみ: 大域動きを平行移動に限る
     bool alf = false;                                  // 適応ウィーナーフィルタ (§9.4)
     bool band_blocks = true;                           // 帯域画像をブロック符号化 (false: 標本単位)
     bool band_ns = false;                              // 帯域の時間差分ノイズ置換 (心理視覚)
@@ -882,6 +885,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         } else if (io.w) {
             estimate_global_motion(org->p[0], refs[0][0]->p[0], gmv_x, gmv_y);
             gm = estimate_global_model(org->p[0], refs[0][0]->p[0], gmv_x, gmv_y);
+            if (fp.gm_translation_only) { const int tx = gmv_x, ty = gmv_y; gm = GlobalModel{}; gm.tx = tx; gm.ty = ty; }
             gmv_x = gm.tx; gmv_y = gm.ty;
             for (int pi = 0; pi < 3; ++pi) {
                 // MC(ref0, gmv) と原画の線形回帰でゲイン/オフセット
@@ -1148,13 +1152,13 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                         coders[t]->set_noise_seed(static_cast<uint64_t>(fp.poc) * 7919u + static_cast<uint64_t>(pi) * 104729u + static_cast<uint64_t>(t));
                         coders[t]->set_valid(vw, vh);
                         if (io.enc) {
-                            tw[t] = std::make_unique<EntropyWriter>();
+                            tw[t] = std::make_unique<EntropyWriter>(fp.range_coder);
                             tio[t].w = tw[t].get();
                             tio[t].enc = true;
                         } else {
                             if (ts.next >= ts.in.size()) throw std::runtime_error("corrupt stream: missing tile");
                             const auto& b = ts.in[ts.next++];
-                            tr[t] = std::make_unique<EntropyReader>(b.first, b.second);
+                            tr[t] = std::make_unique<EntropyReader>(b.first, b.second, fp.range_coder);
                             tio[t].r = tr[t].get();
                         }
                     }
@@ -1222,7 +1226,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 }
                 if (fp.lf) {
                     code_loop_filter(io, md.lf, R, org ? &opad : nullptr, einfo, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, pqp,
-                                     info.bit_depth, step, lambda, fp.lf_freq, fp.lf_map, lo, hi);
+                                     info.bit_depth, step, lambda, fp.lf_freq, fp.lf_map, lo, hi, !fp.no_deblock);
                 }
                 if (fp.cdef) code_cdef(io, md.lf, R, org ? &opad : nullptr, pi == 0, pqp, info.bit_depth, lambda, lo, hi);
                 if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lambda, lo, hi);
@@ -1241,7 +1245,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                         if (b == 2 && !fp.band_blocks) break;
                         ll_split = b == 2;
                         Models mt = md;
-                        EntropyWriter tw;
+                        EntropyWriter tw(fp.range_coder);
                         SymIO tio;
                         tio.w = &tw;
                         tio.enc = true;
@@ -1410,6 +1414,26 @@ FrameParams params_from(const EncoderConfig& c) {
     if (c.dict_age >= 0) s.dict_age = c.dict_age;
     t.firb = c.firb >= 0 ? c.firb != 0 : c.preset == Preset::Placebo;  // 9 フレーム試験では効果が雑音 (±0.1 dB) 以下
     t.gs = c.gs >= 0 ? c.gs != 0 : c.preset == Preset::Placebo;  // 実測: RD 混在で -0.03 dB (slow では時間だけ増える)
+    // --safe: 特許リスク区分ごとにツールを外す (法的保証ではない)
+    if (c.safe & 1) {
+        t.tmvp = t.mts = s.try_mts = t.ibc = t.rect = false;
+        fp.alf = false;
+        t.all_angular = false;
+        t.no_merge = true;
+        fp.no_deblock = true;
+    }
+    if (c.safe & 2) {
+        t.cfl = false;
+        fp.cdef = false;
+        t.no_obmc = t.no_sp = true;
+        fp.gm_translation_only = true;
+    }
+    if (c.safe & 4) fp.range_coder = true;
+    if (c.safe & 8) {
+        fp.pqmf_log2 = 0;
+        t.tns = s.try_tns = t.e8 = s.try_e8 = t.dict = t.gs = t.firb = false;
+        fp.shapes = false;
+    }
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
     // 実測: 2x2 は 1x1 より 4-7% 効率が落ちるため、medium 以上は 1x1 (速度より効率)
     const int dt = c.preset >= Preset::Medium ? 1 : 2;
@@ -1434,6 +1458,8 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
     put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u) |
                   (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u) | (fp.tools.firb ? 128u : 0u));
+    put_u8(p, (fp.tools.no_merge ? 1u : 0u) | (fp.no_deblock ? 2u : 0u) | (fp.range_coder ? 4u : 0u) |
+                  (fp.tools.no_obmc ? 8u : 0u) | (fp.tools.no_sp ? 16u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_uv(p, static_cast<uint32_t>(poc));
@@ -1472,6 +1498,13 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.cdef = (f3 >> 5) & 1;
     fp.tools.gs = (f3 >> 6) & 1;
     fp.tools.firb = (f3 >> 7) & 1;
+    const uint32_t f4 = br.u8();
+    if (f4 > 31) return false;
+    fp.range_coder = (f4 >> 2) & 1;
+    fp.tools.no_obmc = (f4 >> 3) & 1;
+    fp.tools.no_sp = (f4 >> 4) & 1;
+    fp.tools.no_merge = f4 & 1;
+    fp.no_deblock = (f4 >> 1) & 1;
     if (fp.cqp_off < -12 || fp.cqp_off > 12) return false;
     for (int l = 0; l < 2; ++l) {
         const uint32_t n = br.u8();
@@ -1612,7 +1645,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
     apply_aqp(fp);
     BlockUsage usage;
     auto run = [&](FrameParams& par, Frame& rec) {
-        EntropyWriter ew;
+        EntropyWriter ew(par.range_coder);
         SymIO io;
         io.w = &ew;
         io.enc = true;
@@ -1901,7 +1934,7 @@ bool Decoder::decode_unit() {
         if (!read_frame_header(hr, fp)) { ok_ = false; return false; }
         const uint32_t mlen = hr.uv();
         if (hr.fail || hr.pos + mlen > len) { ok_ = false; return false; }
-        EntropyReader er(pl + hr.pos, mlen);
+        EntropyReader er(pl + hr.pos, mlen, fp.range_coder);
         hr.pos += mlen;
         TileStreams ts;
         const uint32_t ntl = hr.uv();

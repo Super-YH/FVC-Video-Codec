@@ -36,6 +36,6 @@ void freq_gain_filter(const Plane& in, Plane& out, double step, int mu_q, int32_
 // 符号器 (org != nullptr) はパラメータを決めて符号化、復号器は読み取って同じ処理をする。
 void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const EdgeInfo& e, const MotionField* mf,
                       bool chroma, int chroma_shift, int qp, int bit_depth, double step, double lambda, bool allow_freq,
-                      bool allow_map, int32_t lo, int32_t hi);
+                      bool allow_map, int32_t lo, int32_t hi, bool deblock = true);
 
 }  // namespace fvc

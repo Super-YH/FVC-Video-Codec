@@ -41,6 +41,50 @@ int RansBitDecoder::get(uint32_t p1) {
     return bit;
 }
 
+// ---------------- 範囲符号器 ----------------
+namespace {
+constexpr uint32_t kRcTop = 1u << 24;
+}
+
+void RangeBitEncoder::shift_low() {
+    if (static_cast<uint32_t>(low_) < 0xFF000000u || (low_ >> 32) != 0) {
+        const uint8_t carry = static_cast<uint8_t>(low_ >> 32);
+        uint8_t t = cache_;
+        do { out_.push_back(static_cast<uint8_t>(t + carry)); t = 0xFF; } while (--cache_size_ != 0);
+        cache_ = static_cast<uint8_t>(low_ >> 24);
+    }
+    ++cache_size_;
+    low_ = (low_ & 0x00FFFFFFu) << 8;
+}
+
+void RangeBitEncoder::put(int bit, uint32_t p1) {
+    const uint32_t bound = (range_ >> kProbBits) * p1;
+    if (bit) range_ = bound;
+    else { low_ += bound; range_ -= bound; }
+    while (range_ < kRcTop) { range_ <<= 8; shift_low(); }
+}
+
+std::vector<uint8_t> RangeBitEncoder::finish() {
+    for (int i = 0; i < 5; ++i) shift_low();
+    std::vector<uint8_t> o;
+    o.swap(out_);
+    low_ = 0; range_ = 0xFFFFFFFFu; cache_ = 0; cache_size_ = 1;
+    return o;
+}
+
+RangeBitDecoder::RangeBitDecoder(const uint8_t* data, size_t size) : d_(data), n_(size) {
+    for (int i = 0; i < 5; ++i) code_ = (code_ << 8) | byte();
+}
+
+int RangeBitDecoder::get(uint32_t p1) {
+    const uint32_t bound = (range_ >> kProbBits) * p1;
+    int bit;
+    if (code_ < bound) { range_ = bound; bit = 1; }
+    else { code_ -= bound; range_ -= bound; bit = 0; }
+    while (range_ < kRcTop) { range_ <<= 8; code_ = (code_ << 8) | byte(); }
+    return bit;
+}
+
 // ---------------- stretch / squash ----------------
 namespace {
 // squash の表 (4095 項目)。値は 4096/(1+exp(-s/256)) の切り捨て (従来の直接計算と同一)。毎回 exp を呼ばない (高速化)
@@ -140,12 +184,12 @@ void CMModel::update(int bit) {
 void EntropyWriter::bit(CMModel& m, uint32_t node, uint32_t a, uint32_t b, int v) {
     const uint32_t p = m.predict(node, a, b);
     m.stat_bits[node == 0 ? 0 : node == 1 ? 1 : 2] += -std::log2((v ? p : kProbScale - p) / static_cast<double>(kProbScale));
-    enc_.put(v, p);
+    put(v, p);
     m.update(v);
 }
 
 int EntropyReader::bit(CMModel& m, uint32_t node, uint32_t a, uint32_t b) {
-    const int v = dec_.get(m.predict(node, a, b));
+    const int v = get(m.predict(node, a, b));
     m.update(v);
     return v;
 }

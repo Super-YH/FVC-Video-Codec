@@ -195,7 +195,7 @@ void freq_gain_filter(const Plane& in, Plane& out, double step, int mu_q, int32_
 
 void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const EdgeInfo& e, const MotionField* mf,
                       bool chroma, int chroma_shift, int qp, int bit_depth, double step, double lambda, bool allow_freq,
-                      bool allow_map, int32_t lo, int32_t hi) {
+                      bool allow_map, int32_t lo, int32_t hi, bool deblock) {
     LoopFilterParams lp;
     const Plane pre = R;
     Plane D = R;
@@ -204,6 +204,7 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
         for (size_t i = 0; i < a.v.size(); ++i) { const double d = a.v[i] - org->v[i]; s += d * d; }
         return s;
     };
+    if (deblock) {
     // 9.1 デブロック: 符号器は強さオフセット (β, tc) を候補から最小 SSE で選ぶ
     if (io.enc && org) {
         double best = 1e300;
@@ -219,6 +220,7 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
     lp.tc_off = io.sint(m, 1, 0, lp.tc_off);
     if (std::abs(lp.beta_off) > 12 || std::abs(lp.tc_off) > 12) throw std::runtime_error("corrupt stream: deblock offsets");
     if (!(io.enc && org)) deblock_plane(D, e, mf, chroma, chroma_shift, qp, bit_depth, lp.beta_off, lp.tc_off, lo, hi);
+    }
     // 9.2 周波数ゲイン: 符号器は μ 候補から最小 SSE を選ぶ
     Plane F;
     if (allow_freq) {

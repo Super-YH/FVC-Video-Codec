@@ -32,6 +32,32 @@ private:
     uint8_t byte() { return pos_ < n_ ? d_[pos_++] : 0; }
 };
 
+// ---------- 2値 範囲符号器 (特許安全モード用、rANS の代替) ----------
+// 1970 年代末の範囲符号 (Martin 1979) を LZMA と同じ桁上げ処理で実装したもの。FIFO なので記録不要
+class RangeBitEncoder {
+public:
+    void put(int bit, uint32_t p1);
+    std::vector<uint8_t> finish();
+private:
+    void shift_low();
+    std::vector<uint8_t> out_;
+    uint64_t low_ = 0;
+    uint32_t range_ = 0xFFFFFFFFu;
+    uint8_t cache_ = 0;
+    uint64_t cache_size_ = 1;
+};
+
+class RangeBitDecoder {
+public:
+    RangeBitDecoder(const uint8_t* data, size_t size);
+    int get(uint32_t p1);
+private:
+    const uint8_t* d_;
+    size_t n_, pos_ = 0;
+    uint32_t range_ = 0xFFFFFFFFu, code_ = 0;
+    uint8_t byte() { return pos_ < n_ ? d_[pos_++] : 0; }
+};
+
 // ---------- ロジスティック領域 ----------
 int32_t stretch(int32_t p);  // p∈(0,4096) -> ln(p/(1-p)) * 256, [-2047,2047]
 int32_t squash(int32_t s);   // 逆変換
@@ -75,28 +101,36 @@ private:
 // 符号器/復号器の統一 I/F (同じ 2 値化コードで両側を書けるように)
 class EntropyWriter {
 public:
+    explicit EntropyWriter(bool range_coder = false) : rc_(range_coder) {}
     void bit(CMModel& m, uint32_t node, uint32_t a, uint32_t b, int v);
-    void bypass(int v) { enc_.put(v, kProbScale / 2); }
+    void bypass(int v) { put(v, kProbScale / 2); }
     // 符号付き整数: 0 フラグ / 符号 / 指数 (単進) / 仮数 (指数別文脈)
     void sint(CMModel& m, uint32_t ctx_a, uint32_t ctx_b, int32_t v);
     void uint(CMModel& m, uint32_t ctx_a, uint32_t ctx_b, uint32_t v);
     // 指数部と仮数部の全ビットを文脈モデル化 (仮数の上位 5 ビットは二分木の位置も文脈に含む)
     void uintc(CMModel& m, uint32_t ctx_a, uint32_t ctx_b, uint32_t v);
-    std::vector<uint8_t> finish() { return enc_.finish(); }
+    std::vector<uint8_t> finish() { return rc_ ? rce_.finish() : enc_.finish(); }
 private:
+    void put(int v, uint32_t p) { if (rc_) rce_.put(v, p); else enc_.put(v, p); }
+    bool rc_;
     RansBitEncoder enc_;
+    RangeBitEncoder rce_;
 };
 
 class EntropyReader {
 public:
-    EntropyReader(const uint8_t* d, size_t n) : dec_(d, n) {}
+    EntropyReader(const uint8_t* d, size_t n, bool range_coder = false)
+        : rc_(range_coder), dec_(range_coder ? nullptr : d, range_coder ? 0 : n), rcd_(range_coder ? d : nullptr, range_coder ? n : 0) {}
     int bit(CMModel& m, uint32_t node, uint32_t a, uint32_t b);
-    int bypass() { return dec_.get(kProbScale / 2); }
+    int bypass() { return get(kProbScale / 2); }
     int32_t sint(CMModel& m, uint32_t ctx_a, uint32_t ctx_b);
     uint32_t uint(CMModel& m, uint32_t ctx_a, uint32_t ctx_b);
     uint32_t uintc(CMModel& m, uint32_t ctx_a, uint32_t ctx_b);
 private:
+    int get(uint32_t p) { return rc_ ? rcd_.get(p) : dec_.get(p); }
+    bool rc_;
     RansBitDecoder dec_;
+    RangeBitDecoder rcd_;
 };
 
 }  // namespace fvc
