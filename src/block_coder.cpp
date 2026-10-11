@@ -967,7 +967,7 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
             int bx = (px + 2) >> 2, by = (py + 2) >> 2;
             double bc = 1e300;
             auto test_int = [&](int ix, int iy) {
-                const double c = static_cast<double>(isad(ix, iy, static_cast<int64_t>(bc) + 1)) + lsad * mvbits(ix * 4 - px, iy * 4 - py);
+                const double c = static_cast<double>(isad(ix, iy, bc < 1e18 ? static_cast<int64_t>(bc) + 1 : INT64_MAX)) + lsad * mvbits(ix * 4 - px, iy * 4 - py);
                 if (c < bc) { bc = c; bx = ix; by = iy; }
             };
             test_int((px + 2) >> 2, (py + 2) >> 2);
@@ -979,10 +979,15 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
             }
             if (ref == 0 && inter_.hint[list] && inter_.hint_w > 0) {
                 // 粗い動き推定の候補 (大きな動きの取りこぼしを防ぐ)。ブロックが覆う格子点すべてを試す
-                for (int gy = y0 / 16; gy <= (y0 + h - 1) / 16 && gy < inter_.hint_h; ++gy)
-                    for (int gx = x0 / 16; gx <= (x0 + w - 1) / 16 && gx < inter_.hint_w; ++gx) {
+                // 平坦な内部では動きが見えないので、周囲 1 セルの推定も試す (エッジで見つけた動きを内部へ広げる)
+                std::vector<std::pair<int, int>> tried;
+                for (int gy = std::max(0, y0 / 16 - 1); gy <= (y0 + h - 1) / 16 + 1 && gy < inter_.hint_h; ++gy)
+                    for (int gx = std::max(0, x0 / 16 - 1); gx <= (x0 + w - 1) / 16 + 1 && gx < inter_.hint_w; ++gx) {
                         const size_t i = (static_cast<size_t>(gy) * inter_.hint_w + gx) * 2;
-                        test_int((*inter_.hint[list])[i], (*inter_.hint[list])[i + 1]);
+                        const std::pair<int, int> v{(*inter_.hint[list])[i], (*inter_.hint[list])[i + 1]};
+                        if (std::find(tried.begin(), tried.end(), v) != tried.end()) continue;
+                        tried.push_back(v);
+                        test_int(v.first, v.second);
                     }
             }
             if (line_ok() && list == 0 && ref == 0) {

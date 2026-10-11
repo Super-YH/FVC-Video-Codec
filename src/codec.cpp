@@ -880,8 +880,8 @@ GlobalModel estimate_global_model(const Plane& cur, const Plane& ref, int gx, in
     return bestg;
 }
 
-// 符号器のみ: 粗い動き推定。原画と参照を 1/4 に縮小し、4x4 縮小ブロック (原寸 16x16) ごとに ±R 縮小画素を
-// 全探索 (隣接ブロックの結果も候補にして 3x3 で精密化)。結果は原寸の整数画素ベクトル。大きな動きの取りこぼしを防ぐ
+// 符号器のみ: 粗い動き推定。原画と参照を 1/4 に縮小し、原寸 16x16 のセルごとに、セルを中心とする原寸 32x32 の窓で
+// ±R 縮小画素を全探索する。結果は原寸の整数画素ベクトル。大きな動きの取りこぼしを防ぐ
 void coarse_motion(const Plane& cur, const Plane& ref, int w, int h, std::vector<int16_t>& out, int& gw, int& gh) {
     const int W = w / 4, H = h / 4;
     auto down = [&](const Plane& p) {
@@ -897,11 +897,12 @@ void coarse_motion(const Plane& cur, const Plane& ref, int w, int h, std::vector
     const std::vector<int32_t> a = down(cur), b = down(ref);
     gw = (w + 15) / 16; gh = (h + 15) / 16;
     out.assign(static_cast<size_t>(gw) * gh * 2, 0);
-    constexpr int R = 16;  // 縮小画素 (原寸 ±64)
+    constexpr int R = 24;  // 縮小画素 (原寸 ±96)
+    // 窓はセル (縮小 4x4) を中心に縮小 8x8 (原寸 32x32): 平坦な領域でもエッジを含みやすくする
     auto sad = [&](int bx, int by, int dx, int dy, int64_t bound) {
         int64_t s = 0;
-        for (int y = by; y < std::min(by + 4, H) && s < bound; ++y)
-            for (int x = bx; x < std::min(bx + 4, W); ++x)
+        for (int y = std::max(0, by - 2); y < std::min(by + 6, H) && s < bound; ++y)
+            for (int x = std::max(0, bx - 2); x < std::min(bx + 6, W); ++x)
                 s += std::abs(a[static_cast<size_t>(y) * W + x] - b[static_cast<size_t>(std::clamp(y + dy, 0, H - 1)) * W + std::clamp(x + dx, 0, W - 1)]);
         return s;
     };
@@ -913,7 +914,7 @@ void coarse_motion(const Plane& cur, const Plane& ref, int w, int h, std::vector
             int mx = 0, my = 0;
             for (int dy = -R; dy <= R; ++dy)
                 for (int dx = -R; dx <= R; ++dx) {
-                    const int64_t s = sad(bx, by, dx, dy, best) * 4 + (std::abs(dx) + std::abs(dy));  // 小さな動きを僅かに優先
+                    const int64_t s = sad(bx, by, dx, dy, best) * 16 + (std::abs(dx) + std::abs(dy));  // 同点なら小さな動き
                     if (s < best) { best = s; mx = dx; my = dy; }
                 }
             out[(static_cast<size_t>(gy) * gw + gx) * 2] = static_cast<int16_t>(mx * 4);
