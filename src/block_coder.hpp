@@ -296,7 +296,9 @@ private:
     bool ns_allowed(const Leaf& lf) const {
         return (tools_.band_ns && lf.pt == 4 && lf.xsrc == 1) || (tools_.inter_ns && lf.pt == 2 && plane_ == 0);
     }
-    void quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) const;
+    // coefs: 同じ (予測, 変換) の順変換係数を再利用する場合に与える (ラスタ順)。nullptr なら計算する
+    void quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred, const std::vector<double>* coefs = nullptr) const;
+    void fwd_coefs(int mts, int x0, int y0, int l, const int32_t* pred, std::vector<double>& c) const;
     void reconstruct(const Leaf& lf, int x0, int y0, int l, const int32_t* pred);
     double leaf_bits(const Leaf& lf, int x0, int y0, int l) const;
     double sse(int x0, int y0, int s) const;

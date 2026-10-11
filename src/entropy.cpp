@@ -42,11 +42,25 @@ int RansBitDecoder::get(uint32_t p1) {
 }
 
 // ---------------- stretch / squash ----------------
+namespace {
+// squash の表 (4095 項目)。値は 4096/(1+exp(-s/256)) の切り捨て (従来の直接計算と同一)。毎回 exp を呼ばない (高速化)
+const std::vector<int16_t>& squash_table() {
+    static const std::vector<int16_t> t = [] {
+        std::vector<int16_t> v(4095);
+        for (int s = -2047; s <= 2047; ++s) {
+            const double p = 4096.0 / (1.0 + std::exp(-s / 256.0));
+            v[s + 2047] = static_cast<int16_t>(std::clamp(static_cast<int32_t>(p), 1, 4095));
+        }
+        return v;
+    }();
+    return t;
+}
+}  // namespace
+
 int32_t squash(int32_t s) {
     if (s > 2047) s = 2047;
     if (s < -2047) s = -2047;
-    const double p = 4096.0 / (1.0 + std::exp(-s / 256.0));
-    return std::clamp(static_cast<int32_t>(p), 1, 4095);
+    return squash_table()[s + 2047];
 }
 
 int32_t stretch(int32_t p) {

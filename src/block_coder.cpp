@@ -958,19 +958,27 @@ void BlockCoder::rdoq(Leaf& lf, int l, const std::vector<double>& e, uint32_t xb
 }
 
 // ---------------- 量子化 / 再構成 ----------------
-void BlockCoder::quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred) const {
+void BlockCoder::fwd_coefs(int mts, int x0, int y0, int l, const int32_t* pred, std::vector<double>& c) const {
+    const int s = 1 << l, n = s * s;
+    std::vector<double> r(n);
+    c.resize(n);
+    for (int y = 0; y < s; ++y)
+        for (int x = 0; x < s; ++x) r[y * s + x] = org_->at(x0 + x, y0 + y) - pred[y * s + x];
+    TxType th, tv;
+    tx_pair(mts, s, th, tv);
+    forward_2d(th, tv, r.data(), s, s, c.data());
+}
+
+void BlockCoder::quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred, const std::vector<double>* coefs) const {
     const int s = 1 << l, n = s * s;
     if (tools_.pred_only) {
         lf.q.assign(n, 0); lf.last = -1; lf.nf = 0; lf.tns_on = false; lf.mts = 0; lf.qmode = 0;
         return;
     }
     const auto& scan = diag_scan(l);
-    std::vector<double> r(n), c(n), e(n);
-    for (int y = 0; y < s; ++y)
-        for (int x = 0; x < s; ++x) r[y * s + x] = org_->at(x0 + x, y0 + y) - pred[y * s + x];
-    TxType th, tv;
-    tx_pair(lf.mts, s, th, tv);
-    forward_2d(th, tv, r.data(), s, s, c.data());
+    std::vector<double> cl, e(n);
+    if (!coefs) { fwd_coefs(lf.mts, x0, y0, l, pred, cl); coefs = &cl; }
+    const std::vector<double>& c = *coefs;
     for (int i = 0; i < n; ++i) e[i] = c[scan[i]];
     if (lf.tns_on) {
         lf.tns = tns_design(e.data(), n, 4, 4);
@@ -1386,12 +1394,20 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     //  2 段目: 1 段目の J 上位 search_.refine_top 候補だけに MTS・E8・利得形状を試す
     double best = 1e300;
     Leaf best_leaf;
+    // 順変換係数のキャッシュ (同じ候補・同じ変換で TNS/量子化方式だけが違う試行は係数を再利用)
+    std::vector<double> cache_c;
+    size_t cache_ci = SIZE_MAX;
+    int cache_mt = -1;
     auto eval = [&](size_t ci, int mt, int qm, int tn) -> double {
         Leaf lf = cands[ci];
         lf.qmode = qm;
         lf.mts = mt;
         lf.tns_on = tn;
-        quantize(lf, x0, y0, l, preds[ci].data());
+        if (!tools_.pred_only && (ci != cache_ci || mt != cache_mt)) {
+            fwd_coefs(mt, x0, y0, l, preds[ci].data(), cache_c);
+            cache_ci = ci; cache_mt = mt;
+        }
+        quantize(lf, x0, y0, l, preds[ci].data(), tools_.pred_only ? nullptr : &cache_c);
         if (tn && !lf.tns_on) return 1e300;
         reconstruct(lf, x0, y0, l, preds[ci].data());
         double dist;

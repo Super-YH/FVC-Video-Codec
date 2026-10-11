@@ -93,7 +93,8 @@ const std::vector<double>& tx_matrix(TxType t, int N) {
 void forward_2d(TxType th, TxType tv, const double* in, int w, int h, double* out) {
     const double* Th = tx_matrix(th, w).data();
     const double* Tv = tx_matrix(tv, h).data();
-    std::vector<double> t(static_cast<size_t>(w) * h);
+    thread_local std::vector<double> t;
+    t.resize(static_cast<size_t>(w) * h);
     for (int y = 0; y < h; ++y) fwd1d(th, Th, w, in + static_cast<size_t>(y) * w, 1, t.data() + static_cast<size_t>(y) * w, 1);
     for (int x = 0; x < w; ++x) fwd1d(tv, Tv, h, t.data() + x, w, out + x, w);
 }
@@ -116,11 +117,36 @@ const std::vector<int32_t>& tx_matrix_q14(TxType t, int N) {
 inline int64_t rshift14(int64_t v) { return (v + (int64_t(1) << 13)) >> 14; }
 }  // namespace
 
+namespace {
+// 1D 整数逆変換 (Q14 基底)。DCT-II は偶奇分解で積和を半分にする。kmax 以降の係数は 0
+inline void inv1d_q14(TxType t, const int32_t* T, int N, const int64_t* in, int is, int64_t* out, int os, int kmax) {
+    if (t == TxType::IDTX) { for (int n = 0; n < N; ++n) out[n * os] = in[n * is]; return; }
+    if (t == TxType::DCT2 && N >= 4) {
+        const int h = N / 2;
+        for (int n = 0; n < h; ++n) {
+            int64_t e = 0, o = 0;
+            for (int k = 0; k < kmax; k += 2) e += static_cast<int64_t>(T[static_cast<size_t>(k) * N + n]) * in[k * is];
+            for (int k = 1; k < kmax; k += 2) o += static_cast<int64_t>(T[static_cast<size_t>(k) * N + n]) * in[k * is];
+            // 基底 k の n と N-1-n は偶数 k で対称、奇数 k で反対称 (Q14 丸め後も厳密に成り立つ)
+            out[n * os] = rshift14(e + o);
+            out[(N - 1 - n) * os] = rshift14(e - o);
+        }
+        return;
+    }
+    for (int n = 0; n < N; ++n) {
+        int64_t acc = 0;
+        for (int k = 0; k < kmax; ++k) acc += static_cast<int64_t>(T[static_cast<size_t>(k) * N + n]) * in[k * is];
+        out[n * os] = rshift14(acc);
+    }
+}
+}  // namespace
+
 void inverse_2d(TxType th, TxType tv, const double* in, int w, int h, double* out) {
     const int32_t* Th = th == TxType::IDTX ? nullptr : tx_matrix_q14(th, w).data();
     const int32_t* Tv = tv == TxType::IDTX ? nullptr : tx_matrix_q14(tv, h).data();
     const size_t n = static_cast<size_t>(w) * h;
-    std::vector<int64_t> c(n), t(n, 0);
+    thread_local std::vector<int64_t> c, t, r;
+    c.resize(n); t.assign(n, 0); r.resize(n);
     int rmax = 0, cmax = 0;
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
@@ -129,27 +155,10 @@ void inverse_2d(TxType th, TxType tv, const double* in, int w, int h, double* ou
             if (v) { rmax = std::max(rmax, y + 1); cmax = std::max(cmax, x + 1); }
         }
     if (rmax == 0) { std::fill(out, out + n, 0.0); return; }
-    // 縦 (列ごと)
-    for (int x = 0; x < cmax; ++x)
-        for (int yy = 0; yy < h; ++yy) {
-            if (!Tv) { t[static_cast<size_t>(yy) * w + x] = c[static_cast<size_t>(yy) * w + x]; continue; }
-            int64_t acc = 0;
-            for (int k = 0; k < rmax; ++k) acc += static_cast<int64_t>(Tv[static_cast<size_t>(k) * h + yy]) * c[static_cast<size_t>(k) * w + x];
-            t[static_cast<size_t>(yy) * w + x] = rshift14(acc);
-        }
-    // 横 (行ごと)
-    for (int yy = 0; yy < h; ++yy)
-        for (int xx = 0; xx < w; ++xx) {
-            int64_t v;
-            if (!Th) {
-                v = t[static_cast<size_t>(yy) * w + xx];
-            } else {
-                int64_t acc = 0;
-                for (int k = 0; k < cmax; ++k) acc += static_cast<int64_t>(Th[static_cast<size_t>(k) * w + xx]) * t[static_cast<size_t>(yy) * w + k];
-                v = rshift14(acc);
-            }
-            out[static_cast<size_t>(yy) * w + xx] = static_cast<double>(v) / 256.0;
-        }
+    for (int x = 0; x < cmax; ++x) inv1d_q14(tv, Tv, h, c.data() + x, w, t.data() + x, w, tv == TxType::IDTX ? h : rmax);
+    for (int y = 0; y < h; ++y)
+        inv1d_q14(th, Th, w, t.data() + static_cast<size_t>(y) * w, 1, r.data() + static_cast<size_t>(y) * w, 1, th == TxType::IDTX ? w : cmax);
+    for (size_t i = 0; i < n; ++i) out[i] = static_cast<double>(r[i]) / 256.0;
 }
 
 TnsFilter tns_design(const double* c, int n, int max_order, int qbits) {
