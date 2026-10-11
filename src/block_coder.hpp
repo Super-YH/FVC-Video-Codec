@@ -115,6 +115,7 @@ struct Tools {
     bool no_sp = false;       // Smooth/Paeth イントラを使わない (特許安全モード)
     bool line_mv = false;     // 線に基づく動き場のモード (lines.hpp)
     bool safe_intra = false;  // 特許安全イントラ: DC / 最小二乗平面 / 32 方向の両側線補間 (モードは近傍を文脈にして直接符号化)
+    bool guide = false;       // 輝度誘導の色差予測 (特許安全モードの CfL 代替): 色差モード kModeCfl の意味を置き換える
     bool sr = false;          // ブロック超解像: 残差を 1/2 解像度で符号化し予測に導かれた補間で戻す
     bool mts = false;         // 複数変換選択 (DCT2/DST7/DCT8)
     bool pred_only = false;   // 予測のみ (残差は別経路: 動画 PQMF)
@@ -318,6 +319,7 @@ private:
     bool coded_before(int px, int py, int x0, int y0) const;
     void intra_cfl(int x0, int y0, int s, int alpha, int32_t* pred) const;
     int fit_cfl_alpha(int x0, int y0, int s) const;
+    void guide_refs(int x0, int y0, int s, int64_t& ml, int64_t& mc) const;
     bool ibc_valid(int rx, int ry, int s) const;
     void ibc_search(int x0, int y0, int s, int& bx, int& by) const;
     bool is_luma() const { return plane_ == 0; }

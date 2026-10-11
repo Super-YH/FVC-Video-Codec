@@ -1111,7 +1111,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                            static_cast<uint64_t>(fp.poc) * 3 + pi);
             } else {
                 Plane lds;
-                if (pi > 0 && fp.tools.cfl) lds = luma_at_chroma(luma_rec, info, W, H);
+                if (pi > 0 && (fp.tools.cfl || fp.tools.guide)) lds = luma_at_chroma(luma_rec, info, W, H);
                 const double lambda = 0.57 * std::pow(2.0, (pqp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
                 // 図形レイヤ (§4): 輝度のみ、I フレームのみ。符号器は RD で採否を決める
                 std::vector<Shape> shapes;
@@ -1202,7 +1202,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                         const int y0 = ty * ncy / trn * kCtu, y1 = (ty + 1) * ncy / trn * kCtu;
                         rect[t] = {x0, y0, x1, y1};
                         coders[t] = std::make_unique<BlockCoder>(
-                            &R, org ? (use_shapes ? &target : &opad) : nullptr, (pi > 0 && fp.tools.cfl) ? &lds : nullptr, pi, blo,
+                            &R, org ? (use_shapes ? &target : &opad) : nullptr, (pi > 0 && (fp.tools.cfl || fp.tools.guide)) ? &lds : nullptr, pi, blo,
                             bhi, step, lambda, fp.min_log2, fp.max_log2, btools, fp.search, inter ? &ic : nullptr, &st.dict, x0,
                             y0, x1 - x0, y1 - y0, t << 24);
                         tmd[t] = std::make_unique<Models>();
@@ -1483,6 +1483,7 @@ FrameParams params_from(const EncoderConfig& c) {
     }
     if (c.safe & 2) {
         t.cfl = false;
+        t.guide = true;
         fp.cdef = false;
         t.no_obmc = t.no_sp = true;
         fp.gm_translation_only = true;
@@ -1521,6 +1522,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
     put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u) |
                   (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u) | (fp.tools.firb ? 128u : 0u));
+    put_u8(p, fp.tools.guide ? 1u : 0u);
     put_u8(p, (fp.tools.no_merge ? 1u : 0u) | (fp.no_deblock ? 2u : 0u) | (fp.range_coder ? 4u : 0u) |
                   (fp.tools.no_obmc ? 8u : 0u) | (fp.tools.no_sp ? 16u : 0u) | (fp.tools.line_mv ? 32u : 0u) |
                   (fp.tools.sr ? 64u : 0u) | (fp.tools.safe_intra ? 128u : 0u));
@@ -1562,6 +1564,9 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.cdef = (f3 >> 5) & 1;
     fp.tools.gs = (f3 >> 6) & 1;
     fp.tools.firb = (f3 >> 7) & 1;
+    const uint32_t f5 = br.u8();
+    if (f5 > 1) return false;
+    fp.tools.guide = f5 & 1;
     const uint32_t f4 = br.u8();
     fp.tools.safe_intra = (f4 >> 7) & 1;
     fp.tools.line_mv = (f4 >> 5) & 1;

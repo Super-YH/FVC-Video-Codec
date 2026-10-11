@@ -94,7 +94,7 @@ BlockCoder::BlockCoder(Plane* rec, const Plane* org, const Plane* luma, int plan
                        const InterCtx* inter, Dictionary* dict, int tx0, int ty0, int tw, int th, int32_t leaf_base)
     : rec_(rec), org_(org), luma_(luma), plane_(plane), lo_(lo), hi_(hi), mid_((lo + hi + 1) / 2), step_(step),
       lambda_(lambda), min_log2_(min_log2), max_log2_(max_log2), tools_(tools), search_(search), dict_(dict) {
-    if (!luma_) tools_.cfl = false;
+    if (!luma_) tools_.cfl = tools_.guide = false;
     if (inter) inter_ = *inter;
     tx0_ = tx0; ty0_ = ty0;
     tx1_ = tw > 0 ? tx0 + tw : rec_->w;
@@ -348,7 +348,39 @@ void BlockCoder::intra_safe(int s, int mode, std::vector<int32_t> top, std::vect
         }
 }
 
+// 輝度誘導の色差予測 (Tools::guide): 参照 (上・左の再構成済み) の色差平均 mc と、同じ位置の輝度平均 ml から
+//  pred = mc + a (L(x, y) - ml),  a = alpha / 8 (伝送)
+// 輝度の明るさがブロックと参照で違えば、その分だけ色差も動かす (ブロック内の輝度平均ではなく参照の輝度平均を基準にする)
+void BlockCoder::guide_refs(int x0, int y0, int s, int64_t& ml, int64_t& mc) const {
+    const bool ht = y0 > ty0_, hl = x0 > tx0_;
+    int64_t sl = 0, sc = 0, n = 0;
+    if (ht) for (int i = 0; i < s; ++i) { sl += luma_->at(x0 + i, y0 - 1); sc += rec_->at(x0 + i, y0 - 1); ++n; }
+    if (hl) for (int i = 0; i < s; ++i) { sl += luma_->at(x0 - 1, y0 + i); sc += rec_->at(x0 - 1, y0 + i); ++n; }
+    auto rdiv = [](int64_t a, int64_t b) { return a >= 0 ? (a + b / 2) / b : -((-a + b / 2) / b); };
+    if (n == 0) {
+        // 参照なし: ブロック内の輝度平均と中間値
+        for (int y = 0; y < s; ++y) for (int x = 0; x < s; ++x) sl += luma_->at(x0 + x, y0 + y);
+        ml = rdiv(sl, static_cast<int64_t>(s) * s);
+        mc = mid_;
+        return;
+    }
+    ml = rdiv(sl, n);
+    mc = rdiv(sc, n);
+}
+
 int BlockCoder::fit_cfl_alpha(int x0, int y0, int s) const {
+    if (tools_.guide) {
+        int64_t ml, mc;
+        guide_refs(x0, y0, s, ml, mc);
+        double sxy = 0, sxx = 0;
+        for (int y = 0; y < s; ++y)
+            for (int x = 0; x < s; ++x) {
+                const double dl = static_cast<double>(luma_->at(x0 + x, y0 + y) - ml);
+                sxy += dl * (org_->at(x0 + x, y0 + y) - mc); sxx += dl * dl;
+            }
+        const double a = sxx > 0 ? sxy / sxx : 0.0;
+        return std::clamp(static_cast<int>(std::lround(a * 8.0)), -16, 16);
+    }
     double ml = 0, mc = 0;
     for (int y = 0; y < s; ++y)
         for (int x = 0; x < s; ++x) { ml += luma_->at(x0 + x, y0 + y); mc += org_->at(x0 + x, y0 + y); }
@@ -364,6 +396,16 @@ int BlockCoder::fit_cfl_alpha(int x0, int y0, int s) const {
 }
 
 void BlockCoder::intra_cfl(int x0, int y0, int s, int alpha, int32_t* pred) const {
+    if (tools_.guide) {
+        int64_t ml, mc;
+        guide_refs(x0, y0, s, ml, mc);
+        for (int y = 0; y < s; ++y)
+            for (int x = 0; x < s; ++x) {
+                const int64_t d = static_cast<int64_t>(alpha) * (luma_->at(x0 + x, y0 + y) - ml);
+                pred[y * s + x] = std::clamp(static_cast<int32_t>(mc + ((d + 4) >> 3)), lo_, hi_);
+            }
+        return;
+    }
     intra_angular(x0, y0, s, kModeDC, pred);
     int64_t sum = 0;
     for (int y = 0; y < s; ++y) for (int x = 0; x < s; ++x) sum += luma_->at(x0 + x, y0 + y);
@@ -1626,7 +1668,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             if (std::find(pick.begin(), pick.end(), m) == pick.end() && std::find(modes.begin(), modes.end(), m) != modes.end())
                 pick.push_back(m);
         for (int m : pick) { Leaf lf; lf.mode = m; cands.push_back(lf); }
-        if (tools_.cfl) { Leaf lf; lf.mode = kModeCfl; lf.alpha = fit_cfl_alpha(x0, y0, s); cands.push_back(lf); }
+        if ((tools_.cfl || tools_.guide) && luma_) { Leaf lf; lf.mode = kModeCfl; lf.alpha = fit_cfl_alpha(x0, y0, s); cands.push_back(lf); }
         if (inter_.enabled) {
             if (is_luma()) {
                 const size_t c0 = cands.size();
@@ -1963,7 +2005,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         if (!io.cost) { bv_px_ = lf.bvx; bv_py_ = lf.bvy; }
     } else {
         int is_cfl = 0;
-        if (tools_.cfl) is_cfl = io.bit(md.cfl, 0, L, 0, lf.mode == kModeCfl);
+        if ((tools_.cfl || tools_.guide) && luma_) is_cfl = io.bit(md.cfl, 0, L, 0, lf.mode == kModeCfl);
         if (is_cfl) {
             lf.mode = kModeCfl;
             lf.alpha = io.sint(md.cfl, 1, L, lf.alpha);
