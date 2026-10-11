@@ -182,6 +182,10 @@ void BlockCoder::intra_angular(int x0, int y0, int s, int mode, int32_t* pred) c
         left[i] = (al_ok && y0 + i < vh_) ? r.at(x0 - 1, y0 + i) : left[i - 1];
     }
     int32_t corner = (ht && hl) ? r.at(x0 - 1, y0 - 1) : (ht ? top[0] : left[0]);
+    if (tools_.safe_intra && mode != kModeDC) {
+        intra_safe(s, mode, top, left, corner, pred);
+        return;
+    }
     if (mode == kModePaeth) {
         for (int y = 0; y < s; ++y)
             for (int x = 0; x < s; ++x) {
@@ -263,6 +267,85 @@ void BlockCoder::intra_angular(int x0, int y0, int s, int mode, int32_t* pred) c
             else pred[x * s + y] = v;
         }
     }
+}
+
+// 特許安全イントラ (§6.x)
+//  平面: 参照 (上 s 画素, 左 s 画素, 角) への最小二乗平面 a + b x + c y
+//  線方向 d: 角度 θ = d·π/32 の直線が画素を通るとき、上の参照行 (y = -1) と左の参照列 (x = -1) との交点を
+//  1/64 画素で線形補間する。θ < 90° では直線の両端 (右上側と左下側) に参照があるので、交点までの距離の
+//  逆数で重み付けして両側を補間する。θ > 90° では近い方の交点だけを使う。
+void BlockCoder::intra_safe(int s, int mode, std::vector<int32_t> top, std::vector<int32_t> left, int32_t corner,
+                            int32_t* pred) const {
+    if (s >= 16) {
+        // 参照の平滑化 [1, 2, 1] (16x16 以上では常に)
+        std::vector<int32_t> t2 = top, l2 = left;
+        t2[0] = (corner + 2 * top[0] + top[1] + 2) >> 2;
+        l2[0] = (corner + 2 * left[0] + left[1] + 2) >> 2;
+        for (int i = 1; i < 2 * s - 1; ++i) {
+            t2[i] = (top[i - 1] + 2 * top[i] + top[i + 1] + 2) >> 2;
+            l2[i] = (left[i - 1] + 2 * left[i] + left[i + 1] + 2) >> 2;
+        }
+        top.swap(t2); left.swap(l2);
+    }
+    if (mode == kModePlanar) {
+        // 正規方程式 (点: (i, -1), (-1, i), (-1, -1))
+        double n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0, sv = 0, sxv = 0, syv = 0;
+        auto add = [&](double x, double y, double v) {
+            n += 1; sx += x; sy += y; sxx += x * x; syy += y * y; sxy += x * y; sv += v; sxv += x * v; syv += y * v;
+        };
+        for (int i = 0; i < s; ++i) { add(i, -1, top[i]); add(-1, i, left[i]); }
+        add(-1, -1, corner);
+        const double a11 = n, a12 = sx, a13 = sy, a22 = sxx, a23 = sxy, a33 = syy;
+        const double det = a11 * (a22 * a33 - a23 * a23) - a12 * (a12 * a33 - a23 * a13) + a13 * (a12 * a23 - a22 * a13);
+        double a = sv / n, b = 0, c = 0;
+        if (std::abs(det) > 1e-6) {
+            a = (sv * (a22 * a33 - a23 * a23) - a12 * (sxv * a33 - a23 * syv) + a13 * (sxv * a23 - a22 * syv)) / det;
+            b = (a11 * (sxv * a33 - a23 * syv) - sv * (a12 * a33 - a23 * a13) + a13 * (a12 * syv - sxv * a13)) / det;
+            c = (a11 * (a22 * syv - sxv * a23) - a12 * (a12 * syv - sxv * a13) + sv * (a12 * a23 - a22 * a13)) / det;
+        }
+        for (int y = 0; y < s; ++y)
+            for (int x = 0; x < s; ++x) pred[y * s + x] = std::clamp(static_cast<int32_t>(std::lround(a + b * x + c * y)), lo_, hi_);
+        return;
+    }
+    // cot, tan, sin, |cos| (Q6)
+    static constexpr int kCot[32] = {0, 650, 322, 211, 155, 120, 96, 78, 64, 53, 43, 34, 27, 19, 13, 6,
+                                     0, -6, -13, -19, -27, -34, -43, -53, -64, -78, -96, -120, -155, -211, -322, -650};
+    static constexpr int kTan[32] = {0, 6, 13, 19, 27, 34, 43, 53, 64, 78, 96, 120, 155, 211, 322, 650,
+                                     0, -650, -322, -211, -155, -120, -96, -78, -64, -53, -43, -34, -27, -19, -13, -6};
+    static constexpr int kSin[32] = {0, 6, 12, 19, 24, 30, 36, 41, 45, 49, 53, 56, 59, 61, 63, 64,
+                                     64, 64, 63, 61, 59, 56, 53, 49, 45, 41, 36, 30, 24, 19, 12, 6};
+    static constexpr int kCos[32] = {64, 64, 63, 61, 59, 56, 53, 49, 45, 41, 36, 30, 24, 19, 12, 6,
+                                     0, 6, 12, 19, 24, 30, 36, 41, 45, 49, 53, 56, 59, 61, 63, 64};
+    const int d = mode - kModeLine0;
+    const int lim = (2 * s - 1) * 64;
+    auto ref = [&](const std::vector<int32_t>& a, int i) { return i < 0 ? corner : a[std::min(i, 2 * s - 1)]; };
+    auto interp = [&](const std::vector<int32_t>& a, int q) {
+        q = std::clamp(q, -64, lim);
+        const int i = q >= 0 ? q >> 6 : -1, fr = q - i * 64;
+        return (ref(a, i) * (64 - fr) + ref(a, i + 1) * fr + 32) >> 6;
+    };
+    for (int y = 0; y < s; ++y)
+        for (int x = 0; x < s; ++x) {
+            int32_t v;
+            if (d == 0) v = left[y];
+            else if (d == 16) v = top[x];
+            else {
+                const int qt = x * 64 + (y + 1) * kCot[d];  // 上の参照行との交点 (Q6)
+                const int ql = y * 64 + (x + 1) * kTan[d];  // 左の参照列との交点 (Q6)
+                const bool vt = qt >= -64 && qt <= lim, vl = ql >= -64 && ql <= lim;
+                if (d < 16) {
+                    if (vt && vl) {
+                        const int64_t wt = static_cast<int64_t>(x + 1) * kSin[d], wl = static_cast<int64_t>(y + 1) * kCos[d];
+                        v = static_cast<int32_t>((interp(top, qt) * wt + interp(left, ql) * wl + (wt + wl) / 2) / (wt + wl));
+                    } else if (vt) v = interp(top, qt);
+                    else if (vl) v = interp(left, ql);
+                    else v = interp(top, qt);
+                } else {
+                    v = qt >= -64 ? interp(top, qt) : interp(left, ql);
+                }
+            }
+            pred[y * s + x] = v;
+        }
 }
 
 int BlockCoder::fit_cfl_alpha(int x0, int y0, int s) const {
@@ -1380,7 +1463,9 @@ double BlockCoder::leaf_bits(const Leaf& lf, int x0, int y0, int l) const {
     } else if (lf.mode == kModeCfl) {
         b += 1.0 + 2.0 + std::log2(1.0 + std::abs(lf.alpha));
     } else {
-        if (tools_.all_angular) {
+        if (tools_.safe_intra) {
+            b += lf.mode >= kModeLine0 ? 5.0 : 2.0;
+        } else if (tools_.all_angular) {
             int mp[6];
             mpm6(x0, y0, mp);
             b += std::find(mp, mp + 6, lf.mode) != mp + 6 ? 2.5 : 6.0;
@@ -1519,6 +1604,10 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         std::vector<int> modes;
         if (tools_.all_angular) for (int m = 0; m < kNumIntra; ++m) { if (m != kModeCfl && !(tools_.no_sp && m >= kModeSmooth)) modes.push_back(m); }
         else modes = {kModeDC, kModePlanar, kModeHor, kModeVer};
+        if (tools_.safe_intra) {
+            modes = {kModeDC, kModePlanar};
+            for (int d = 0; d < kNumLine; ++d) modes.push_back(kModeLine0 + d);
+        }
         Leaf t;
         for (int m : modes) {
             t.mode = m;
@@ -1880,7 +1969,27 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
             lf.alpha = io.sint(md.cfl, 1, L, lf.alpha);
             if (lf.alpha < -16 || lf.alpha > 16) throw std::runtime_error("corrupt stream: cfl alpha");
         } else {
-            if (tools_.all_angular) {
+            if (tools_.safe_intra) {
+                // 候補リストは作らず、左と上のモードを文脈にしてモードを直接符号化する
+                const int gw = rec_->w / 4;
+                const int lm = x0 > tx0_ ? modes4_[(y0 / 4) * gw + (x0 / 4 - 1)] : kModePlanar;
+                const int am = y0 > ty0_ ? modes4_[(y0 / 4 - 1) * gw + (x0 / 4)] : kModePlanar;
+                auto cat = [](int m) { return m >= kModeLine0 ? 2 : (m == kModeDC ? 0 : 1); };
+                auto dir = [](int m) { return m >= kModeLine0 ? static_cast<uint32_t>(m - kModeLine0) : 32u; };
+                const uint32_t cc = static_cast<uint32_t>(cat(lm) * 3 + cat(am));
+                const int is_line = io.bit(md.mode, 40, cc, pc, lf.mode >= kModeLine0);
+                if (!is_line) {
+                    lf.mode = io.bit(md.mode, 41, cc, pc, lf.mode == kModePlanar) ? kModePlanar : kModeDC;
+                } else {
+                    const int dv = io.enc ? lf.mode - kModeLine0 : 0;
+                    uint32_t tree = 1;
+                    for (int b = 4; b >= 0; --b) {
+                        const int bt = io.bit(md.mode, 64 + tree, dir(lm) | (pc << 6), dir(am), (dv >> b) & 1);
+                        tree = (tree << 1) | static_cast<uint32_t>(bt);
+                    }
+                    lf.mode = kModeLine0 + static_cast<int>(tree - 32);
+                }
+            } else if (tools_.all_angular) {
                 // 6 候補 MPM: 切り詰め単進のインデックス、それ以外は残り 31 モードを 5 ビット (二分木文脈)
                 int mp[6];
                 mpm6(x0, y0, mp);
@@ -1922,7 +2031,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
                 lf.mode = kSet[idx];
             }
             }
-            if (lf.mode < 0 || lf.mode >= kNumIntra || lf.mode == kModeCfl) throw std::runtime_error("corrupt stream: intra mode");
+            if (!tools_.safe_intra && (lf.mode < 0 || lf.mode >= kNumIntra || lf.mode == kModeCfl)) throw std::runtime_error("corrupt stream: intra mode");
         }
     }
     }
@@ -1943,7 +2052,7 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
     }
     const uint32_t cbc = cb_ctx(x0, y0, s);
     const bool dict_leaf = lf.pt == 3 || lf.dres >= 0;  // 辞書の葉はパラメトリックのみ (残差なし、cbf を送らない)
-    const int cbf = (tools_.pred_only || dict_leaf) ? 0 : io.bit(md.cbf, 0, L | (cbc << 4), pc * 64 + static_cast<uint32_t>(lf.pt ? 60 + lf.pt : lf.mode), lf.last >= 0);
+    const int cbf = (tools_.pred_only || dict_leaf) ? 0 : io.bit(md.cbf, 0, L | (cbc << 4), pc * 128 + static_cast<uint32_t>(lf.pt ? 120 + lf.pt : lf.mode), lf.last >= 0);
     if (!cbf) {
         lf.last = -1;
         lf.q.assign(lf.qmode == 0 ? n : 0, 0);

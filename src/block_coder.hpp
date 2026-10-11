@@ -98,6 +98,9 @@ int32_t quant_dz(double c, double step, double rnd);
 // 36 = Smooth, 37 = Paeth (AV1 型)。35 (CfL) は通常モードの番号空間に含めない
 constexpr int kModeDC = 0, kModePlanar = 1, kModeHor = 10, kModeVer = 26, kNumIntra = 38, kModeCfl = 35;
 constexpr int kModeSmooth = 36, kModePaeth = 37;
+// 特許安全イントラ (Tools::safe_intra): 64..95 = 線方向 d (角度 d·180°/32)。線の両端の参照を距離で重み付け補間。
+// このとき kModePlanar は参照への最小二乗平面 a + bx + cy を表す
+constexpr int kModeLine0 = 64, kNumLine = 32;
 
 // フレーム単位のツール有効化 (フレームヘッダで伝送)
 struct Tools {
@@ -111,6 +114,7 @@ struct Tools {
     bool no_obmc = false;     // OBMC を使わない (特許安全モード)
     bool no_sp = false;       // Smooth/Paeth イントラを使わない (特許安全モード)
     bool line_mv = false;     // 線に基づく動き場のモード (lines.hpp)
+    bool safe_intra = false;  // 特許安全イントラ: DC / 最小二乗平面 / 32 方向の両側線補間 (モードは近傍を文脈にして直接符号化)
     bool sr = false;          // ブロック超解像: 残差を 1/2 解像度で符号化し予測に導かれた補間で戻す
     bool mts = false;         // 複数変換選択 (DCT2/DST7/DCT8)
     bool pred_only = false;   // 予測のみ (残差は別経路: 動画 PQMF)
@@ -310,6 +314,7 @@ private:
     void cg_apply(const int* cg, int s, int32_t* pred) const;
     bool cg_fit(const Leaf& lf, int x0, int y0, int s, int* cg) const;
     void intra_angular(int x0, int y0, int s, int mode, int32_t* pred) const;
+    void intra_safe(int s, int mode, std::vector<int32_t> top, std::vector<int32_t> left, int32_t corner, int32_t* pred) const;
     bool coded_before(int px, int py, int x0, int y0) const;
     void intra_cfl(int x0, int y0, int s, int alpha, int32_t* pred) const;
     int fit_cfl_alpha(int x0, int y0, int s) const;

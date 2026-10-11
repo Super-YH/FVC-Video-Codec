@@ -1477,6 +1477,7 @@ FrameParams params_from(const EncoderConfig& c) {
         t.tmvp = t.mts = s.try_mts = t.ibc = t.rect = false;
         fp.alf = false;
         t.all_angular = false;
+        t.safe_intra = true;
         t.no_merge = true;
         fp.no_deblock = true;
     }
@@ -1490,6 +1491,7 @@ FrameParams params_from(const EncoderConfig& c) {
     // 線の動き場: 既定は特許安全モード (マージ/TMVP を外す区分 1) で有効
     t.line_mv = c.line_mv >= 0 ? c.line_mv != 0 : (c.safe & 1) != 0;
     t.sr = c.sr >= 0 ? c.sr != 0 : false;
+    if (c.safe_intra >= 0) t.safe_intra = c.safe_intra != 0;
     if (c.safe & 8) {
         fp.pqmf_log2 = 0;
         t.tns = s.try_tns = t.e8 = s.try_e8 = t.dict = t.gs = t.firb = false;
@@ -1521,7 +1523,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
                   (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u) | (fp.tools.firb ? 128u : 0u));
     put_u8(p, (fp.tools.no_merge ? 1u : 0u) | (fp.no_deblock ? 2u : 0u) | (fp.range_coder ? 4u : 0u) |
                   (fp.tools.no_obmc ? 8u : 0u) | (fp.tools.no_sp ? 16u : 0u) | (fp.tools.line_mv ? 32u : 0u) |
-                  (fp.tools.sr ? 64u : 0u));
+                  (fp.tools.sr ? 64u : 0u) | (fp.tools.safe_intra ? 128u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
         for (int poc : fp.ref_poc[l]) put_uv(p, static_cast<uint32_t>(poc));
@@ -1561,7 +1563,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.tools.gs = (f3 >> 6) & 1;
     fp.tools.firb = (f3 >> 7) & 1;
     const uint32_t f4 = br.u8();
-    if (f4 > 127) return false;
+    fp.tools.safe_intra = (f4 >> 7) & 1;
     fp.tools.line_mv = (f4 >> 5) & 1;
     fp.tools.sr = (f4 >> 6) & 1;
     fp.range_coder = (f4 >> 2) & 1;

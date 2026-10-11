@@ -20,7 +20,7 @@ struct EncoderConfig {
     Preset preset = Preset::Medium;
     bool psy = false;         // ノイズ補完/帯域ノイズ置換 (PSNR は下がるが質感保持)
     int ibc = -1;             // -1: プリセット依存, 0/1: 強制
-    int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1, rect = -1, tmvp = -1, alf = -1, mts = -1, cdef = -1, gs = -1, firb = -1, line_mv = -1, sr = -1;
+    int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1, rect = -1, tmvp = -1, alf = -1, mts = -1, cdef = -1, gs = -1, firb = -1, line_mv = -1, sr = -1, safe_intra = -1;
     int adam = -1;
     double dict_bias = -1;
     int dict_age = -1;        // 学習原子を捨てるまでの未使用根ブロック数。負: 既定    // 辞書の葉の RD 罰則 (ビット)。負: 既定            // 動き探索: 1 = Adam (勾配最適化), 0 = 格子探索, -1 = プリセット依存
