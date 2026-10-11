@@ -14,17 +14,24 @@ std::vector<LineSeg> extract_lines(const Plane& ref, int vw, int vh, int bit_dep
     auto at = [&](int x, int y) { return ref.at(std::clamp(x, 0, W - 1), std::clamp(y, 0, H - 1)); };
     for (int cy = 0; cy < H; cy += kLineCell)
         for (int cx = 0; cx < W; cx += kLineCell) {
-            LineSeg best;
-            int32_t bm = thr - 1;
-            // セルの内側 (端 2 画素を除く) で Sobel 勾配が最大の点
-            for (int y = cy + 2; y < std::min(cy + kLineCell - 2, H - 1); ++y)
-                for (int x = cx + 2; x < std::min(cx + kLineCell - 2, W - 1); ++x) {
-                    const int32_t gx = (at(x + 1, y - 1) + 2 * at(x + 1, y) + at(x + 1, y + 1)) - (at(x - 1, y - 1) + 2 * at(x - 1, y) + at(x - 1, y + 1));
-                    const int32_t gy = (at(x - 1, y + 1) + 2 * at(x, y + 1) + at(x + 1, y + 1)) - (at(x - 1, y - 1) + 2 * at(x, y - 1) + at(x + 1, y - 1));
-                    const int32_t m = std::abs(gx) + std::abs(gy);
-                    if (m > bm) { bm = m; best.x = x; best.y = y; best.gx = gx; best.gy = gy; }
-                }
-            if (bm >= thr) out.push_back(best);
+            // セルの内側 (端 2 画素を除く) で Sobel 勾配が最大の点、次に最初の点から 6 画素以上離れた 2 番目の点
+            // (曲線や角を 2 本の線で表す)
+            LineSeg first;
+            for (int pass = 0; pass < 2; ++pass) {
+                LineSeg best;
+                int32_t bm = thr - 1;
+                for (int y = cy + 2; y < std::min(cy + kLineCell - 2, H - 1); ++y)
+                    for (int x = cx + 2; x < std::min(cx + kLineCell - 2, W - 1); ++x) {
+                        if (pass && (x - first.x) * (x - first.x) + (y - first.y) * (y - first.y) < 36) continue;
+                        const int32_t gx = (at(x + 1, y - 1) + 2 * at(x + 1, y) + at(x + 1, y + 1)) - (at(x - 1, y - 1) + 2 * at(x - 1, y) + at(x - 1, y + 1));
+                        const int32_t gy = (at(x - 1, y + 1) + 2 * at(x, y + 1) + at(x + 1, y + 1)) - (at(x - 1, y - 1) + 2 * at(x, y - 1) + at(x + 1, y - 1));
+                        const int32_t m = std::abs(gx) + std::abs(gy);
+                        if (m > bm) { bm = m; best.x = x; best.y = y; best.gx = gx; best.gy = gy; }
+                    }
+                if (bm < thr) break;
+                out.push_back(best);
+                first = best;
+            }
         }
     return out;
 }

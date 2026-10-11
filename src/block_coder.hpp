@@ -87,7 +87,7 @@ struct SymIO {
 
 struct Models {
     CMModel split, mode, cbf, last, coef_y, coef_c, band_ll, band_hi, lossless, l2, ibc, cfl, tns, e8, nf;
-    CMModel inter, mvd, dict, shape, global, band_mode, lf, aqp, gs, line;
+    CMModel inter, mvd, dict, shape, global, band_mode, lf, aqp, gs, line, line1;
 };
 
 const std::vector<int>& diag_scan(int log2s);
@@ -143,6 +143,7 @@ struct InterCtx {
     int ref_poc[2][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}};
     // 線に基づく動き場 (輝度 4x4 単位の (mvx, mvy), L0 先頭参照)。nullptr なら無効
     const std::vector<int16_t>* lfield = nullptr;
+    const std::vector<int16_t>* lfield1 = nullptr;  // B フレーム: L1 先頭参照への線の動き場
     int lf_w4 = 0, lf_h4 = 0;
     // 符号器のみ: 粗い動き推定 (1/4 縮小, 16 画素格子) の結果。各リストの先頭参照の整数画素ベクトル (mx, my)
     const std::vector<int16_t>* hint[2] = {nullptr, nullptr};
@@ -306,6 +307,11 @@ private:
         const size_t i = (static_cast<size_t>(by) * inter_.lf_w4 + bx) * 2;
         m.mvx[0] = (*inter_.lfield)[i];
         m.mvy[0] = (*inter_.lfield)[i + 1];
+        if (inter_.lfield1) {
+            m.dir = 3;
+            m.mvx[1] = (*inter_.lfield1)[i];
+            m.mvy[1] = (*inter_.lfield1)[i + 1];
+        }
         return m;
     }
     bool line_ok() const { return tools_.line_mv && inter_.lfield && is_luma(); }

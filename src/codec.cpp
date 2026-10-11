@@ -570,8 +570,8 @@ struct FrameParams {
     int threads = 1;                                   // 符号器/復号器のスレッド数 (ビットストリームに影響しない)
     // 符号器: グローバルパラメータのキャッシュ (COPY 判定と本符号化で共有)
     mutable bool gm_valid = false;
-    mutable bool lines_valid = false;            // 符号器: 線の動きの推定結果のキャッシュ
-    mutable std::vector<LineSeg> lines_cache;
+    mutable bool lines_valid[2] = {false, false};  // 符号器: 線の動きの推定結果のキャッシュ (L0 / L1)
+    mutable std::vector<LineSeg> lines_cache[2];
     mutable int gm_x = 0, gm_y = 0, gm_gain[3] = {64, 64, 64}, gm_off[3] = {0, 0, 0};
     mutable GlobalModel gm_model;
     mutable int gm_hg[3] = {64, 64, 64};
@@ -1040,27 +1040,34 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 throw std::runtime_error("corrupt stream: global params");
         }
     }
-    // 線に基づく動き場 (lines.hpp): 線は参照輝度から両側で抽出し、動きの変化だけを伝送する
-    std::vector<int16_t> lfield;
+    // 線に基づく動き場 (lines.hpp): 線は参照輝度から両側で抽出し、動きの変化だけを伝送する。
+    // B フレームでは未来側 (L1 先頭参照) の線も送り、線モードは両方向の動き場で双予測する
+    std::vector<int16_t> lfield[2];
     int lf_w4 = 0, lf_h4 = 0;
     if (inter && fp.tools.line_mv && fp.type != FrameType::Copy) {
-        const Plane& rref = refs[0][0]->p[0];
-        std::vector<LineSeg> lines;
-        if (io.w && fp.lines_valid) {
-            lines = fp.lines_cache;
-        } else {
-            lines = extract_lines(rref, info.width, info.height, info.bit_depth);
-            if (io.w) {
-                const double lam = 0.57 * std::pow(2.0, (fp.qp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
-                estimate_line_motion(lines, org->p[0], rref, gm, lam, 5);
-                fp.lines_cache = lines;
-                fp.lines_valid = true;
-            }
-        }
-        code_line_motion(io, md.line, lines, gm);
         lf_w4 = (info.width + kCtu - 1) / kCtu * kCtu / 4;
         lf_h4 = (info.height + kCtu - 1) / kCtu * kCtu / 4;
-        build_line_field(lines, gm, lf_w4, lf_h4, lfield);
+        for (int l = 0; l < 2; ++l) {
+            if (refs[l].empty() || (l == 1 && fp.type != FrameType::B)) continue;
+            const Plane& rref = refs[l][0]->p[0];
+            GlobalModel lgm;  // L1 の予測は動き 0 (大域動きは L0 に対して推定している)
+            lgm.cx = gm.cx; lgm.cy = gm.cy;
+            const GlobalModel& pg = l == 0 ? gm : lgm;
+            std::vector<LineSeg> lines;
+            if (io.w && fp.lines_valid[l]) {
+                lines = fp.lines_cache[l];
+            } else {
+                lines = extract_lines(rref, info.width, info.height, info.bit_depth);
+                if (io.w) {
+                    const double lam = 0.57 * std::pow(2.0, (fp.qp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
+                    estimate_line_motion(lines, org->p[0], rref, pg, lam, 5);
+                    fp.lines_cache[l] = lines;
+                    fp.lines_valid[l] = true;
+                }
+            }
+            code_line_motion(io, l ? md.line1 : md.line, lines, pg);
+            build_line_field(lines, pg, lf_w4, lf_h4, lfield[l]);
+        }
     }
     // 符号器: 粗い動き推定 (各リストの先頭参照)
     std::vector<int16_t> hint[2];
@@ -1104,7 +1111,8 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             ic.chroma_shift = pi ? cs : 0;
             ic.gmv_x = gmv_x; ic.gmv_y = gmv_y;
             ic.gm = gm;
-            if (!lfield.empty()) { ic.lfield = &lfield; ic.lf_w4 = lf_w4; ic.lf_h4 = lf_h4; }
+            if (!lfield[0].empty()) { ic.lfield = &lfield[0]; ic.lf_w4 = lf_w4; ic.lf_h4 = lf_h4; }
+            if (!lfield[1].empty() && ic.nref[1] > 0) ic.lfield1 = &lfield[1];
             ic.cur_poc = fp.poc;
             if (pi == 0 && hint_w > 0) {
                 for (int l = 0; l < 2; ++l) ic.hint[l] = hint[l].empty() ? nullptr : &hint[l];
