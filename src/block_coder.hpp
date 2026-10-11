@@ -194,6 +194,7 @@ private:
         static constexpr int kMaxAtoms = 16;
         int nat = 0;
         int16_t at_idx[kMaxAtoms] = {}, at_gain[kMaxAtoms] = {};
+        int8_t at_dx[kMaxAtoms] = {}, at_dy[kMaxAtoms] = {};  // 原子の平行移動 (画素, ±kAtomShift)
         int dres = -1, dres_g = 0;
         double rd_dist = -1;  // 符号器: RD 評価時の歪み (診断用)  // 残差の辞書原子 (任意の予測に g/16 · 原子を加える)。-1: なし
         int xgain = 0;
@@ -252,6 +253,12 @@ private:
     // 辞書 (§10): ブロック一辺 s 用の項目リストと、リスト内 k 番目の項目を s x s に整数双線形で再標本化したもの
     int dict_count(int s) const;  // 大域辞書 + タイル内学習原子の数
     const std::vector<int32_t>& dict_atom(int k, int s) const;
+    static constexpr int kAtomShift = 3;
+    // 平行移動した原子の値 (範囲外は 0)
+    static int32_t atom_at(const std::vector<int32_t>& d, int s, int x, int y, int dx, int dy) {
+        const int sx = x - dx, sy = y - dy;
+        return (sx < 0 || sy < 0 || sx >= s || sy >= s) ? 0 : d[sy * s + sx];
+    }
     // 残差の辞書原子: 予測 pred に対する残差に最も合う原子 (リスト番号, 利得) を探す。見つからなければ false
     bool dict_best_atom(int x0, int y0, int s, const int32_t* pred, int& k, int& g) const;
     mutable std::unordered_map<uint64_t, std::vector<int32_t>> atom_cache_;

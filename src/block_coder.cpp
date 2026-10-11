@@ -654,7 +654,9 @@ void BlockCoder::predict_base(const Leaf& lf, int x0, int y0, int l, int32_t* pr
         std::vector<int64_t> acc(static_cast<size_t>(s) * s, 0);
         for (int k = 0; k < lf.nat; ++k) {
             const std::vector<int32_t>& d = dict_atom(lf.at_idx[k], s);
-            for (int i = 0; i < s * s; ++i) acc[i] += static_cast<int64_t>(lf.at_gain[k]) * d[i];
+            for (int y = 0; y < s; ++y)
+                for (int x = 0; x < s; ++x)
+                    acc[y * s + x] += static_cast<int64_t>(lf.at_gain[k]) * atom_at(d, s, x, y, lf.at_dx[k], lf.at_dy[k]);
         }
         for (int i = 0; i < s * s; ++i)
             pred[i] = std::clamp(pred[i] + static_cast<int32_t>((acc[i] + 8) >> 4), lo_, hi_);
@@ -947,42 +949,72 @@ static int l_of(int s) { int l = 0; while ((1 << l) < s) ++l; return l; }
 void BlockCoder::dict_search(int x0, int y0, int s, std::vector<Leaf>& cands) const {
     std::vector<int32_t> dc(static_cast<size_t>(s) * s);
     intra_angular(x0, y0, s, kModeDC, dc.data());
-    // 直交マッチング追跡 (OMP): 残差に最も合う原子を 1 個ずつ選び、そのたびに選んだ全原子の利得を
-    // 最小二乗で解き直して量子化する。原子数 1, 2, 3, 4, 6, 8, 12, 16 の変種を RD に渡す
+    // 直交マッチング追跡 (OMP): 残差に最も合う (原子, 平行移動) を 1 個ずつ選び、そのたびに選んだ全原子の利得を
+    // 最小二乗で解き直して量子化する。平行移動は、ずらさない相関の上位 16 原子についてだけ ±3 画素を試す。
+    // 原子数 1, 2, 3, 4, 6, 8, 12, 16 の変種を RD に渡す
     const int n = s * s, na = dict_count(s);
     std::vector<double> tgt(n);
     for (int y = 0; y < s; ++y)
         for (int x = 0; x < s; ++x) tgt[y * s + x] = org_->at(x0 + x, y0 + y) - dc[y * s + x];
-    std::vector<int> sel;
+    struct Sel { int idx, dx, dy; };
+    std::vector<Sel> sel;
     std::vector<double> r = tgt;
+    // 平行移動した原子をベクトルにする
+    auto shifted = [&](const Sel& a, std::vector<double>& v) {
+        const auto& d = dict_atom(a.idx, s);
+        v.resize(n);
+        for (int y = 0; y < s; ++y)
+            for (int x = 0; x < s; ++x) v[y * s + x] = atom_at(d, s, x, y, a.dx, a.dy);
+    };
     Leaf lf; lf.pt = 3;
+    std::vector<double> v;
     for (int k = 0; k < Leaf::kMaxAtoms; ++k) {
-        double best = 0;
-        int bi = -1;
+        std::vector<std::pair<double, int>> rank;
         for (int i = 0; i < na; ++i) {
-            if (std::find(sel.begin(), sel.end(), i) != sel.end()) continue;
             const auto& d = dict_atom(i, s);
             double num = 0, den = 0;
             for (int j = 0; j < n; ++j) { num += r[j] * d[j]; den += static_cast<double>(d[j]) * d[j]; }
-            if (den > 0 && num * num / den > best) { best = num * num / den; bi = i; }
+            if (den > 0) rank.push_back({-num * num / den, i});
         }
-        if (bi < 0) break;
-        sel.push_back(bi);
+        if (rank.empty()) break;
+        const size_t top = std::min<size_t>(16, rank.size());
+        std::partial_sort(rank.begin(), rank.begin() + top, rank.end());
+        double best = 0;
+        Sel bs{-1, 0, 0};
+        for (size_t t = 0; t < top; ++t) {
+            const int i = rank[t].second;
+            const auto& d = dict_atom(i, s);
+            for (int dy = -kAtomShift; dy <= kAtomShift; ++dy)
+                for (int dx = -kAtomShift; dx <= kAtomShift; ++dx) {
+                    bool dup = false;
+                    for (const Sel& q : sel) dup |= q.idx == i && q.dx == dx && q.dy == dy;
+                    if (dup) continue;
+                    double num = 0, den = 0;
+                    for (int y = 0; y < s; ++y)
+                        for (int x = 0; x < s; ++x) {
+                            const double a = atom_at(d, s, x, y, dx, dy);
+                            num += r[y * s + x] * a; den += a * a;
+                        }
+                    if (den > 0 && num * num / den > best) { best = num * num / den; bs = {i, dx, dy}; }
+                }
+        }
+        if (bs.idx < 0) break;
+        sel.push_back(bs);
         // 選んだ原子の最小二乗利得 (正規方程式)
         const int m = static_cast<int>(sel.size());
+        std::vector<std::vector<double>> V(m);
+        for (int a2 = 0; a2 < m; ++a2) shifted(sel[a2], V[a2]);
         std::vector<double> G(static_cast<size_t>(m) * (m + 1), 0.0);
-        for (int a = 0; a < m; ++a) {
-            const auto& da = dict_atom(sel[a], s);
-            for (int b = 0; b <= a; ++b) {
-                const auto& db = dict_atom(sel[b], s);
-                double v = 0;
-                for (int j = 0; j < n; ++j) v += static_cast<double>(da[j]) * db[j];
-                G[a * (m + 1) + b] = G[b * (m + 1) + a] = v;
+        for (int a2 = 0; a2 < m; ++a2) {
+            for (int b2 = 0; b2 <= a2; ++b2) {
+                double val = 0;
+                for (int j = 0; j < n; ++j) val += V[a2][j] * V[b2][j];
+                G[a2 * (m + 1) + b2] = G[b2 * (m + 1) + a2] = val;
             }
-            double v = 0;
-            for (int j = 0; j < n; ++j) v += da[j] * tgt[j];
-            G[a * (m + 1) + m] = v;
-            G[a * (m + 1) + a] += 1e-6 * (1 + G[a * (m + 1) + a]);
+            double val = 0;
+            for (int j = 0; j < n; ++j) val += V[a2][j] * tgt[j];
+            G[a2 * (m + 1) + m] = val;
+            G[a2 * (m + 1) + a2] += 1e-6 * (1 + G[a2 * (m + 1) + a2]);
         }
         for (int c = 0; c < m; ++c) {
             int pv = c;
@@ -995,24 +1027,22 @@ void BlockCoder::dict_search(int x0, int y0, int s, std::vector<Leaf>& cands) co
             }
         }
         lf.nat = 0;
-        std::vector<int> keep;
-        for (int a = 0; a < m; ++a) {
-            const double g = G[a * (m + 1) + a] != 0 ? G[a * (m + 1) + m] / G[a * (m + 1) + a] : 0.0;
+        std::vector<Sel> keep;
+        r = tgt;
+        for (int a2 = 0; a2 < m; ++a2) {
+            const double g = G[a2 * (m + 1) + a2] != 0 ? G[a2 * (m + 1) + m] / G[a2 * (m + 1) + a2] : 0.0;
             const int gq = std::clamp(static_cast<int>(std::lround(g * 16.0)), -127, 127);
             if (!gq) continue;
-            lf.at_idx[lf.nat] = static_cast<int16_t>(sel[a]);
+            lf.at_idx[lf.nat] = static_cast<int16_t>(sel[a2].idx);
             lf.at_gain[lf.nat] = static_cast<int16_t>(gq);
+            lf.at_dx[lf.nat] = static_cast<int8_t>(sel[a2].dx);
+            lf.at_dy[lf.nat] = static_cast<int8_t>(sel[a2].dy);
             ++lf.nat;
-            keep.push_back(sel[a]);
+            keep.push_back(sel[a2]);
+            for (int j = 0; j < n; ++j) r[j] -= gq * V[a2][j] / 16.0;
         }
         sel = keep;
         if (!lf.nat) break;
-        // 量子化利得での残差を更新
-        r = tgt;
-        for (int a = 0; a < lf.nat; ++a) {
-            const auto& d = dict_atom(lf.at_idx[a], s);
-            for (int j = 0; j < n; ++j) r[j] -= lf.at_gain[a] * d[j] / 16.0;
-        }
         const int cnt = lf.nat;
         if (cnt == 1 || cnt == 2 || cnt == 3 || cnt == 4 || cnt == 6 || cnt == 8 || cnt == 12 || cnt == 16) cands.push_back(lf);
         if (static_cast<int>(sel.size()) < k + 1) break;  // 利得 0 で原子が落ちた: これ以上は進めない
@@ -1725,6 +1755,9 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
             lf.at_gain[k] = static_cast<int16_t>(pg + io.sint(md.dict, 3, L | (static_cast<uint32_t>(std::min(k, 3)) << 4), lf.at_gain[k] - pg));
             if (lf.at_gain[k] == 0 || std::abs(lf.at_gain[k]) > 127) throw std::runtime_error("corrupt stream: dict gain");
             pg = lf.at_gain[k];
+            lf.at_dx[k] = static_cast<int8_t>(io.sint(md.dict, 4, L, lf.at_dx[k]));
+            lf.at_dy[k] = static_cast<int8_t>(io.sint(md.dict, 5, L, lf.at_dy[k]));
+            if (std::abs(lf.at_dx[k]) > kAtomShift || std::abs(lf.at_dy[k]) > kAtomShift) throw std::runtime_error("corrupt stream: atom shift");
         }
     } else {
     if (lf.pt >= 2) lf.pt = 0;
