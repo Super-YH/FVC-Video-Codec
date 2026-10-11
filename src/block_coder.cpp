@@ -977,6 +977,14 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
                 inter_.gmv_at(x0 + w / 2, y0 + h / 2, gx, gy);
                 test_int((gx + 2) >> 2, (gy + 2) >> 2);
             }
+            if (ref == 0 && inter_.hint[list] && inter_.hint_w > 0) {
+                // 粗い動き推定の候補 (大きな動きの取りこぼしを防ぐ)。ブロックが覆う格子点すべてを試す
+                for (int gy = y0 / 16; gy <= (y0 + h - 1) / 16 && gy < inter_.hint_h; ++gy)
+                    for (int gx = x0 / 16; gx <= (x0 + w - 1) / 16 && gx < inter_.hint_w; ++gx) {
+                        const size_t i = (static_cast<size_t>(gy) * inter_.hint_w + gx) * 2;
+                        test_int((*inter_.hint[list])[i], (*inter_.hint[list])[i + 1]);
+                    }
+            }
             if (line_ok() && list == 0 && ref == 0) {
                 const MotionInfo lm = line_mi(x0 + w / 2, y0 + h / 2);
                 test_int((lm.mvx[0] + 2) >> 2, (lm.mvy[0] + 2) >> 2);

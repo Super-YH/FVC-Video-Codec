@@ -880,6 +880,47 @@ GlobalModel estimate_global_model(const Plane& cur, const Plane& ref, int gx, in
     return bestg;
 }
 
+// 符号器のみ: 粗い動き推定。原画と参照を 1/4 に縮小し、4x4 縮小ブロック (原寸 16x16) ごとに ±R 縮小画素を
+// 全探索 (隣接ブロックの結果も候補にして 3x3 で精密化)。結果は原寸の整数画素ベクトル。大きな動きの取りこぼしを防ぐ
+void coarse_motion(const Plane& cur, const Plane& ref, int w, int h, std::vector<int16_t>& out, int& gw, int& gh) {
+    const int W = w / 4, H = h / 4;
+    auto down = [&](const Plane& p) {
+        std::vector<int32_t> d(static_cast<size_t>(W) * H);
+        for (int y = 0; y < H; ++y)
+            for (int x = 0; x < W; ++x) {
+                int32_t s = 0;
+                for (int k = 0; k < 16; ++k) s += p.at(std::min(4 * x + (k & 3), p.w - 1), std::min(4 * y + (k >> 2), p.h - 1));
+                d[static_cast<size_t>(y) * W + x] = s >> 4;
+            }
+        return d;
+    };
+    const std::vector<int32_t> a = down(cur), b = down(ref);
+    gw = (w + 15) / 16; gh = (h + 15) / 16;
+    out.assign(static_cast<size_t>(gw) * gh * 2, 0);
+    constexpr int R = 16;  // 縮小画素 (原寸 ±64)
+    auto sad = [&](int bx, int by, int dx, int dy, int64_t bound) {
+        int64_t s = 0;
+        for (int y = by; y < std::min(by + 4, H) && s < bound; ++y)
+            for (int x = bx; x < std::min(bx + 4, W); ++x)
+                s += std::abs(a[static_cast<size_t>(y) * W + x] - b[static_cast<size_t>(std::clamp(y + dy, 0, H - 1)) * W + std::clamp(x + dx, 0, W - 1)]);
+        return s;
+    };
+    for (int gy = 0; gy < gh; ++gy)
+        for (int gx = 0; gx < gw; ++gx) {
+            const int bx = gx * 4, by = gy * 4;
+            if (bx >= W || by >= H) continue;
+            int64_t best = INT64_MAX;
+            int mx = 0, my = 0;
+            for (int dy = -R; dy <= R; ++dy)
+                for (int dx = -R; dx <= R; ++dx) {
+                    const int64_t s = sad(bx, by, dx, dy, best) * 4 + (std::abs(dx) + std::abs(dy));  // 小さな動きを僅かに優先
+                    if (s < best) { best = s; mx = dx; my = dy; }
+                }
+            out[(static_cast<size_t>(gy) * gw + gx) * 2] = static_cast<int16_t>(mx * 4);
+            out[(static_cast<size_t>(gy) * gw + gx) * 2 + 1] = static_cast<int16_t>(my * 4);
+        }
+}
+
 // フレームのペイロード (rANS) を符号化/復号。org==nullptr なら復号。
 void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const Frame* org, Frame& rec, CodecState& st,
                 TileStreams& ts, BlockUsage* usage = nullptr) {
@@ -1020,6 +1061,12 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         lf_h4 = (info.height + kCtu - 1) / kCtu * kCtu / 4;
         build_line_field(lines, gm, lf_w4, lf_h4, lfield);
     }
+    // 符号器: 粗い動き推定 (各リストの先頭参照)
+    std::vector<int16_t> hint[2];
+    int hint_w = 0, hint_h = 0;
+    if (inter && io.w && org && fp.type != FrameType::Copy)
+        for (int l = 0; l < 2; ++l)
+            if (!refs[l].empty()) coarse_motion(org->p[0], refs[l][0]->p[0], info.width, info.height, hint[l], hint_w, hint_h);
     MotionField mf;
     Plane luma_rec;
     Plane fref;  // 帯域別ゲインを適用した参照 (プレーンごとに作り直す)
@@ -1058,6 +1105,10 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             ic.gm = gm;
             if (!lfield.empty()) { ic.lfield = &lfield; ic.lf_w4 = lf_w4; ic.lf_h4 = lf_h4; }
             ic.cur_poc = fp.poc;
+            if (pi == 0 && hint_w > 0) {
+                for (int l = 0; l < 2; ++l) ic.hint[l] = hint[l].empty() ? nullptr : &hint[l];
+                ic.hint_w = hint_w; ic.hint_h = hint_h;
+            }
             for (int l = 0; l < 2; ++l)
                 for (size_t r = 0; r < fp.ref_poc[l].size() && r < 4; ++r) ic.ref_poc[l][r] = fp.ref_poc[l][r];
             const int colp = !fp.ref_poc[1].empty() ? fp.ref_poc[1][0] : fp.ref_poc[0][0];

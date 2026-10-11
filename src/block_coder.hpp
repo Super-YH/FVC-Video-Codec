@@ -144,6 +144,9 @@ struct InterCtx {
     // 線に基づく動き場 (輝度 4x4 単位の (mvx, mvy), L0 先頭参照)。nullptr なら無効
     const std::vector<int16_t>* lfield = nullptr;
     int lf_w4 = 0, lf_h4 = 0;
+    // 符号器のみ: 粗い動き推定 (1/4 縮小, 16 画素格子) の結果。各リストの先頭参照の整数画素ベクトル (mx, my)
+    const std::vector<int16_t>* hint[2] = {nullptr, nullptr};
+    int hint_w = 0, hint_h = 0;
 };
 
 // 符号器探索パラメータ (ビットストリームに影響しない)
