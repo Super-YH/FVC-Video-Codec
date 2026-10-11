@@ -25,7 +25,7 @@ static bool ends_with(const std::string& s, const char* suf) {
 static int usage() {
     std::fprintf(stderr,
                  "usage:\n  fvc enc [-q QP] [--preset faster|fast|medium|slow|placebo] [--lossless] [--l2] [--pqmf N]"
-                 " [--frames N]\n      [--keyint N] [--bframes N] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] [--aqp=0|1] [--rect=0|1] [--tmvp=0|1] [--alf=0|1] [--mts=0|1] [--cdef=0|1] [--gs=0|1] [--firb=0|1] [--me=adam|full] [--tune psy|psnr] [--band-coder blocks|samples] [--psy-rd X]\n      [--ssim TARGET] [-v] [--quiet] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
+                 " [--frames N]\n      [--keyint N] [--bframes N] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] [--aqp=0|1] [--rect=0|1] [--tmvp=0|1] [--alf=0|1] [--mts=0|1] [--cdef=0|1] [--gs=0|1] [--firb=0|1] [--me=adam|full] [--tune psy|psnr|ssim] [--band-coder blocks|samples] [--psy-rd X]\n      [--ssim TARGET] [-v] [--quiet] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
     return 2;
 }
 
@@ -70,7 +70,11 @@ static int cmd_enc(int argc, char** argv) {
         else if (a == "--dict-age" && i + 1 < argc) cfg.dict_age = std::atoi(argv[++i]);
         else if (a == "--me=full") cfg.adam = 0;
         else if (a == "--band-coder" && i + 1 < argc) cfg.band_samples = std::string(argv[++i]) == "samples";
-        else if (a == "--tune" && i + 1 < argc) cfg.tune_psnr = std::string(argv[++i]) == "psnr";
+        else if (a == "--tune" && i + 1 < argc) {
+            const std::string t = argv[++i];
+            cfg.tune_psnr = t == "psnr" || t == "ssim";
+            cfg.tune_ssim = t == "ssim";
+        }
         else if (a == "--psy-rd" && i + 1 < argc) cfg.psy_strength = std::atof(argv[++i]);
         else if (a.rfind("--dict=", 0) == 0) cfg.dict = std::atoi(a.c_str() + 7);
         else if (a.rfind("--shapes=", 0) == 0) cfg.shapes = std::atoi(a.c_str() + 9);

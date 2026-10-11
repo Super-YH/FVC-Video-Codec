@@ -1393,6 +1393,10 @@ FrameParams params_from(const EncoderConfig& c) {
     fp.alf = c.preset >= Preset::Fast;
     t.mts = s.try_mts = c.preset >= Preset::Slow;  // 実測 +1% / 時間 2 倍
     s.psy = c.tune_psnr ? 0.0 : c.psy_strength;
+    // --tune ssim: 歪みは SSE のまま、色差 QP を +3 して輝度の構造にビットを寄せる。
+    // 実測 (lena 4:2:0, RGB SSIM): 色差 QP +3 が最良。局所分散で重み付けした SSE や 4x4 窓の実 SSIM を
+    // RD の歪みに使う方式は、いずれも SSE より SSIM が悪化した (超低レートで一次近似が成り立たないため)
+    if (c.tune_ssim) fp.cqp_off = std::clamp(fp.cqp_off + 3, -12, 12);
     s.chroma_weight = c.tune_psnr ? 1.0 : 2.0;
     if (c.mts >= 0) t.mts = s.try_mts = c.mts != 0;
     if (c.alf >= 0) fp.alf = c.alf != 0;

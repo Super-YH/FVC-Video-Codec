@@ -35,6 +35,7 @@ struct EncoderConfig {
     int chroma_qp_offset = 0; // 色差 QP オフセット (-12..12)
     bool band_samples = false;  // PQMF 帯域を標本単位で符号化 (既定はブロック符号化)
     bool tune_psnr = false;     // true: 歪みを純粋な SSE で評価 (PSNR 最大化)
+    bool tune_ssim = false;     // true: 歪みを局所分散で重み付けした SSE (SSIM 近似) で評価
     double psy_strength = 1.0;  // 心理視覚マスキングの強さ
     int total_frames = 0;     // 入力の総フレーム数 (0: 不明)。1 なら将来参照用の辞書追加を送らない
     double target_ssim = 0;   // >0: フレームごとに輝度 SSIM がこの値以上となる最大 QP を探索
