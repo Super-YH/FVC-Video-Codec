@@ -111,6 +111,44 @@ void filter_luma_segment(Px px, int beta, int tc, int32_t lo, int32_t hi, int nl
 }
 }  // namespace
 
+void decay_deblock(Plane& p, const EdgeInfo& e, int rq, int thr, int32_t lo, int32_t hi) {
+    if (rq <= 0 || thr <= 0) return;
+    // 重み表 (Q8): W[0] = 128 (境界の両側で段差の半分ずつ), W[k] = W[k-1] * rq / 16
+    int W[16];
+    W[0] = 128;
+    for (int k = 1; k < 16; ++k) W[k] = (W[k - 1] * rq + 8) >> 4;
+    auto leaf = [&](int cx, int cy) { return e.leaf[static_cast<size_t>(cy) * e.w4 + cx]; };
+    auto run = [&](int cx, int cy, int dx, int dy) {
+        const int32_t id = leaf(cx, cy);
+        int len = 0;
+        while (len < 8 && cx >= 0 && cy >= 0 && cx < e.w4 && cy < e.h4 && leaf(cx, cy) == id) { ++len; cx += dx; cy += dy; }
+        return len * 4;
+    };
+    const int W4 = std::min(e.w4, p.w / 4), H4 = std::min(e.h4, p.h / 4);
+    for (int dir = 0; dir < 2; ++dir)
+        for (int cy = dir; cy < H4; ++cy)
+            for (int cx = 1 - dir; cx < W4; ++cx) {
+                const int ax = dir == 0 ? cx - 1 : cx, ay = dir == 0 ? cy : cy - 1;
+                if (leaf(ax, ay) == leaf(cx, cy)) continue;
+                const int lp = dir == 0 ? run(ax, ay, -1, 0) : run(ax, ay, 0, -1);
+                const int lq = dir == 0 ? run(cx, cy, 1, 0) : run(cx, cy, 0, 1);
+                const int n = std::max(1, std::min(lp, lq) / 2);
+                for (int k = 0; k < 4; ++k) {
+                    // i < 0: P 側 (p_{-i-1}), i >= 0: Q 側
+                    auto px = [&](int i) -> int32_t& { return dir == 0 ? p.at(cx * 4 + i, cy * 4 + k) : p.at(cx * 4 + k, cy * 4 + i); };
+                    // 段差から両側の局所勾配を差し引く (なめらかな傾斜は段差とみなさない)
+                    const int32_t d = n >= 2 ? (4 * (px(0) - px(-1)) - (px(-1) - px(-2)) - (px(1) - px(0))) / 4 : px(0) - px(-1);
+                    if (d == 0 || std::abs(d) >= thr) continue;
+                    for (int j = 0; j < n && W[j]; ++j) {
+                        const int32_t c = (d * W[j] + (d >= 0 ? 128 : -128)) / 256;
+                        if (c == 0) break;
+                        px(-1 - j) = std::clamp(px(-1 - j) + c, lo, hi);
+                        px(j) = std::clamp(px(j) - c, lo, hi);
+                    }
+                }
+            }
+}
+
 void deblock_plane(Plane& p, const EdgeInfo& e, const MotionField* mf, bool chroma, int chroma_shift, int qp,
                    int bit_depth, int beta_off, int tc_off, int32_t lo, int32_t hi) {
     const int bdsh = bit_depth - 8;
@@ -205,21 +243,42 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
         return s;
     };
     if (deblock) {
-    // 9.1 デブロック: 符号器は強さオフセット (β, tc) を候補から最小 SSE で選ぶ
-    if (io.enc && org) {
-        double best = 1e300;
-        for (int bo : {0, 2, 4, 6})
-            for (int to : {-2, 0, 2, 4, 6}) {
-                Plane t = R;
-                deblock_plane(t, e, mf, chroma, chroma_shift, qp, bit_depth, bo, to, lo, hi);
-                const double s = sse(t);
-                if (s < best) { best = s; lp.beta_off = bo; lp.tc_off = to; D = std::move(t); }
-            }
-    }
-    lp.beta_off = io.sint(m, 0, 0, lp.beta_off);
-    lp.tc_off = io.sint(m, 1, 0, lp.tc_off);
-    if (std::abs(lp.beta_off) > 12 || std::abs(lp.tc_off) > 12) throw std::runtime_error("corrupt stream: deblock offsets");
-    if (!(io.enc && org)) deblock_plane(D, e, mf, chroma, chroma_shift, qp, bit_depth, lp.beta_off, lp.tc_off, lo, hi);
+        // 9.1 デブロック: 符号器は強さオフセット (β, tc) を候補から最小 SSE で選ぶ
+        if (io.enc && org) {
+            double best = 1e300;
+            for (int bo : {0, 2, 4, 6})
+                for (int to : {-2, 0, 2, 4, 6}) {
+                    Plane t = R;
+                    deblock_plane(t, e, mf, chroma, chroma_shift, qp, bit_depth, bo, to, lo, hi);
+                    const double s = sse(t);
+                    if (s < best) { best = s; lp.beta_off = bo; lp.tc_off = to; D = std::move(t); }
+                }
+        }
+        lp.beta_off = io.sint(m, 0, 0, lp.beta_off);
+        lp.tc_off = io.sint(m, 1, 0, lp.tc_off);
+        if (std::abs(lp.beta_off) > 12 || std::abs(lp.tc_off) > 12) throw std::runtime_error("corrupt stream: deblock offsets");
+        if (!(io.enc && org)) deblock_plane(D, e, mf, chroma, chroma_shift, qp, bit_depth, lp.beta_off, lp.tc_off, lo, hi);
+    } else {
+        // 減衰デブロック: (rq, 閾値) を候補から最小 SSE で選ぶ。閾値は量子化ステップの t/2 倍
+        int rq = 0, tq = 0;
+        auto thr_of = [&](int t) { return std::max(1, static_cast<int>(std::lround(step * t * 0.5))); };
+        if (io.enc && org) {
+            double best = sse(D);
+            for (int r : {6, 9, 11, 13, 14, 15})
+                for (int t : {1, 2, 3, 4, 6, 8, 12}) {
+                    Plane t2 = R;
+                    decay_deblock(t2, e, r, thr_of(t), lo, hi);
+                    const double s = sse(t2);
+                    if (s < best) { best = s; rq = r; tq = t; D = std::move(t2); }
+                }
+        }
+        rq = static_cast<int>(io.uint(m, 6, 0, static_cast<uint32_t>(rq)));
+        if (rq > 15) throw std::runtime_error("corrupt stream: decay deblock");
+        if (rq) {
+            tq = static_cast<int>(io.uint(m, 7, 0, static_cast<uint32_t>(tq)));
+            if (tq < 1 || tq > 64) throw std::runtime_error("corrupt stream: decay threshold");
+        }
+        if (!(io.enc && org)) decay_deblock(D, e, rq, thr_of(tq), lo, hi);
     }
     // 9.2 周波数ゲイン: 符号器は μ 候補から最小 SSE を選ぶ
     Plane F;
