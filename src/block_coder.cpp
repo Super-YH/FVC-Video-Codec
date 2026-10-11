@@ -1071,6 +1071,39 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
         lf.mi.mvx[1] = best_uni[1].mvx[1];
         lf.mi.mvy[1] = best_uni[1].mvy[1];
         cands.push_back(lf);
+        // 双予測の反復精密化: 一方のリストを固定し、他方を双予測の誤差 (SAD) で 1, 1/2, 1/4 画素の
+        // 8 近傍探索する。これを交互に 2 回。片方向の最良の組合せより良い双予測が見つかる
+        auto bibits = [&](const MotionInfo& m) {
+            double b = 0;
+            for (int l = 0; l < 2; ++l) {
+                int px, py;
+                mv_pred(x0, y0, l, m.ref[l], px, py);
+                b += mvbits(m.mvx[l] - px, m.mvy[l] - py);
+            }
+            return b;
+        };
+        MotionInfo bm = lf.mi;
+        double bcost = static_cast<double>(me_cost(x0, y0, w, h, bm)) + lsad * bibits(bm);
+        const MotionInfo start = bm;
+        for (int it = 0; it < 2; ++it)
+            for (int l = 1; l >= 0; --l)
+                for (int st = 4; st >= 1; st >>= 1) {
+                    bool moved = true;
+                    for (int rep = 0; rep < 4 && moved; ++rep) {
+                        moved = false;
+                        const MotionInfo c0 = bm;
+                        for (int dy = -st; dy <= st; dy += st)
+                            for (int dx = -st; dx <= st; dx += st) {
+                                if (!dx && !dy) continue;
+                                MotionInfo t = c0;
+                                t.mvx[l] = static_cast<int16_t>(c0.mvx[l] + dx);
+                                t.mvy[l] = static_cast<int16_t>(c0.mvy[l] + dy);
+                                const double c = static_cast<double>(me_cost(x0, y0, w, h, t)) + lsad * bibits(t);
+                                if (c < bcost) { bcost = c; bm = t; moved = true; }
+                            }
+                    }
+                }
+        if (!(bm == start)) { Leaf l2 = lf; l2.mi = bm; cands.push_back(l2); }
     }
 }
 

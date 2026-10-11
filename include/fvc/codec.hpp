@@ -1,6 +1,7 @@
 // FVC: 符号器 / 復号器 (I/P/B/COPY フレーム, ブロック変換 or PQMF 帯域, 図形, 辞書, L2 ロスレス層)
 #pragma once
 #include <cstdint>
+#include <cstdlib>
 #include <istream>
 #include <map>
 #include <memory>
@@ -21,6 +22,7 @@ struct EncoderConfig {
     bool psy = false;         // ノイズ補完/帯域ノイズ置換 (PSNR は下がるが質感保持)
     int ibc = -1;             // -1: プリセット依存, 0/1: 強制
     int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1, rect = -1, tmvp = -1, alf = -1, mts = -1, cdef = -1, gs = -1, firb = -1, line_mv = -1, sr = -1, safe_intra = -1, guide = -1, merge = -1, brest = -1;
+    int tf = -1;  // アンカー (I/P) の時間フィルタ (符号器のみ): 0 = なし, 1..3 = 強さ, -1 = 既定
     int adam = -1;
     double dict_bias = -1;
     int dict_age = -1;        // 学習原子を捨てるまでの未使用根ブロック数。負: 既定    // 辞書の葉の RD 罰則 (ビット)。負: 既定            // 動き探索: 1 = Adam (勾配最適化), 0 = 格子探索, -1 = プリセット依存
@@ -97,6 +99,8 @@ private:
     std::unique_ptr<CodecState> st_;
     int next_poc_ = 0;
     std::vector<std::pair<int, Frame>> pend_;  // 未符号化フレーム (表示順)
+    const Frame* code_src_ = nullptr;           // 符号化に使う入力 (時間フィルタ済み)。統計は元の入力で測る
+    int tf_strength() const { return cfg_.tf >= 0 ? cfg_.tf : (getenv("FVC_TF") ? atoi(getenv("FVC_TF")) : 0); }
     std::vector<uint8_t> flush_pending();
     void encode_b_range(const std::vector<std::pair<int, Frame>>& v, int a, int b, int depth, std::vector<uint8_t>& out);
     std::vector<FrameStats> stats_;

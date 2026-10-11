@@ -1671,8 +1671,10 @@ std::vector<uint8_t> Encoder::sequence_header() const {
     return out;
 }
 
-std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType type, int depth,
+std::vector<uint8_t> Encoder::encode_picture(const Frame& forig, int poc, FrameType type, int depth,
                                              const std::vector<const Frame*>& look) {
+    // 符号化は (あれば) 時間フィルタ済みの入力に対して行い、統計は元の入力で測る
+    const Frame& f = code_src_ ? *code_src_ : forig;
     FrameParams fp = params_from(cfg_);
     fp.dict_add = cfg_.total_frames != 1;
     if (fp.pqmf_log2 > 0) {
@@ -1700,6 +1702,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
         if (type == FrameType::B) fp.ref_poc[1].push_back(fut[0]);
         // QP カスケード: P +1, B は階層深さ d に応じて +1+d
         // QP カスケード (実測で決定: I -5, P -2, B +1+深さ)
+        // 実測 (v17, 17 フレーム): I/P/B の差を縮めても広げても悪化 (-0.1〜-0.4 dB)
         constexpr int kPOff = -2, kBOff = 1;
         if (type == FrameType::P) fp.qp = std::clamp(fp.qp + kPOff, 0, 63);
         if (type == FrameType::B) fp.qp = std::clamp(fp.qp + kBOff + std::max(1, depth), 0, 63);
@@ -1948,8 +1951,8 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& f, int poc, FrameType 
     fs.poc = poc;
     fs.type = type;
     fs.bytes = out.size();
-    for (int p = 0; p < 3; ++p) fs.psnr[p] = plane_psnr(f.p[p], rec.p[p], info_.bit_depth);
-    fs.ssim = plane_ssim(f.p[0], rec.p[0], info_.bit_depth);
+    for (int p = 0; p < 3; ++p) fs.psnr[p] = plane_psnr(forig.p[p], rec.p[p], info_.bit_depth);
+    fs.ssim = plane_ssim(forig.p[0], rec.p[0], info_.bit_depth);
     fs.qp = fp.qp;
     fs.trials = trials;
     fs.usage = usage;
@@ -1978,6 +1981,84 @@ std::vector<uint8_t> Encoder::encode(const Frame& f) {
     return out;
 }
 
+// 時間フィルタ (符号器のみ、ビットストリームに影響しない): アンカー (I/P) の入力を、近傍フレームを
+// 動き補償して重み付き平均した画像に置き換える。静止背景の揺らぎ (雑音・明るさの微変化) が平均で減り、
+// アンカーを参照する多数の B フレームの予測が良くなる。
+//  - 輝度 8x8 ブロックごとに整数 ±R の全探索 (SAD)、色差は輝度の動きを縮小して使う
+//  - ブロックの重み w = strength · exp(-MSE / (c σ²))、σ² は Immerkær 法の雑音分散推定
+//  - 画素ごとに |近傍 - 対象| > 3σ+2 の画素は使わない (動物体の境界でのぼけを防ぐ)
+static Frame temporal_filter(const Frame& t, const std::vector<const Frame*>& nb, const VideoInfo& info, int strength) {
+    Frame o = t;
+    if (nb.empty() || strength <= 0) return o;
+    const Plane& T = t.p[0];
+    const int W = T.w, H = T.h;
+    // 雑音の標準偏差 (Immerkær 1996)
+    double acc = 0;
+    for (int y = 1; y < H - 1; ++y)
+        for (int x = 1; x < W - 1; ++x) {
+            const int v = T.at(x - 1, y - 1) - 2 * T.at(x, y - 1) + T.at(x + 1, y - 1) - 2 * T.at(x - 1, y) + 4 * T.at(x, y) -
+                          2 * T.at(x + 1, y) + T.at(x - 1, y + 1) - 2 * T.at(x, y + 1) + T.at(x + 1, y + 1);
+            acc += std::abs(v);
+        }
+    const double sigma = std::max(0.5, acc * std::sqrt(3.14159265358979 / 2.0) / (6.0 * (W - 2) * (H - 2)));
+    const double s2 = sigma * sigma;
+    const double ks = strength / 2.0;  // 1: 0.5, 2: 1.0, 3: 1.5
+    constexpr int B = 8, R = 12;
+    const int cs = info.chroma == ChromaFormat::C420 ? 1 : 0;
+    const int bw = (W + B - 1) / B, bh = (H + B - 1) / B;
+    std::vector<int> mvx(nb.size() * bw * bh), mvy(nb.size() * bw * bh);
+    std::vector<double> wb(nb.size() * bw * bh);
+    for (size_t k = 0; k < nb.size(); ++k) {
+        const Plane& N = nb[k]->p[0];
+        for (int by = 0; by < bh; ++by)
+            for (int bx = 0; bx < bw; ++bx) {
+                const int x0 = bx * B, y0 = by * B, x1 = std::min(x0 + B, W), y1 = std::min(y0 + B, H);
+                int64_t best = INT64_MAX;
+                int bmx = 0, bmy = 0;
+                for (int dy = -R; dy <= R; ++dy)
+                    for (int dx = -R; dx <= R; ++dx) {
+                        int64_t s = 0;
+                        for (int y = y0; y < y1 && s < best; ++y)
+                            for (int x = x0; x < x1; ++x)
+                                s += std::abs(T.at(x, y) - N.at(std::clamp(x + dx, 0, W - 1), std::clamp(y + dy, 0, H - 1)));
+                        s = s * 8 + std::abs(dx) + std::abs(dy);  // 同点なら小さな動き
+                        if (s < best) { best = s; bmx = dx; bmy = dy; }
+                    }
+                double mse = 0;
+                for (int y = y0; y < y1; ++y)
+                    for (int x = x0; x < x1; ++x) {
+                        const double d = T.at(x, y) - N.at(std::clamp(x + bmx, 0, W - 1), std::clamp(y + bmy, 0, H - 1));
+                        mse += d * d;
+                    }
+                mse /= (x1 - x0) * (y1 - y0);
+                const size_t i = (k * bh + by) * bw + bx;
+                mvx[i] = bmx; mvy[i] = bmy;
+                wb[i] = ks * std::exp(-mse / (4.0 * s2));
+            }
+    }
+    for (int pi = 0; pi < 3; ++pi) {
+        const Plane& P = t.p[pi];
+        const int sh = pi ? cs : 0;
+        const double gate = (3.0 * sigma + 2.0);
+        for (int y = 0; y < P.h; ++y)
+            for (int x = 0; x < P.w; ++x) {
+                const int bx = std::min((x << sh) / B, bw - 1), by = std::min((y << sh) / B, bh - 1);
+                const int32_t c = P.at(x, y);
+                double num = c, den = 1.0;
+                for (size_t k = 0; k < nb.size(); ++k) {
+                    const size_t i = (k * bh + by) * bw + bx;
+                    if (wb[i] < 1e-3) continue;
+                    const Plane& N = nb[k]->p[pi];
+                    const int v = N.at(std::clamp(x + (mvx[i] >> sh), 0, P.w - 1), std::clamp(y + (mvy[i] >> sh), 0, P.h - 1));
+                    if (std::abs(v - c) > gate) continue;
+                    num += wb[i] * v; den += wb[i];
+                }
+                o.p[pi].at(x, y) = static_cast<int32_t>(std::lround(num / den));
+            }
+    }
+    return o;
+}
+
 // 保留フレームを符号化: [I] → 最後をアンカー P → 間を二分の階層 B
 std::vector<uint8_t> Encoder::flush_pending() {
     std::vector<uint8_t> out;
@@ -1992,13 +2073,30 @@ std::vector<uint8_t> Encoder::flush_pending() {
     if (key) {
         std::vector<const Frame*> look;
         for (int i = 1; i < n; ++i) look.push_back(&v[i].second);
+        Frame tfr;
+        if (tf_strength() > 0 && cfg_.lossy_layer && !cfg_.l2_lossless) {
+            std::vector<const Frame*> nb;
+            for (int i = 1; i <= 2 && i < n; ++i) nb.push_back(&v[i].second);
+            tfr = temporal_filter(v[0].second, nb, info_, tf_strength());
+            code_src_ = &tfr;
+        }
         append(encode_picture(v[0].second, v[0].first, FrameType::I, 0, look));
+        code_src_ = nullptr;
         start = 1;
         if (n == 1) return out;
     }
     std::vector<const Frame*> look;
     for (int i = start; i < n - 1; ++i) look.push_back(&v[i].second);
+    Frame tfr;
+    if (tf_strength() > 0 && cfg_.lossy_layer && !cfg_.l2_lossless) {
+        // P アンカー: 直前 2 フレーム (このミニ GOP 内の過去側) で平均する
+        std::vector<const Frame*> nb;
+        for (int i = n - 2; i >= std::max(start, n - 3); --i) nb.push_back(&v[i].second);
+        tfr = temporal_filter(v[n - 1].second, nb, info_, tf_strength());
+        code_src_ = &tfr;
+    }
     append(encode_picture(v[n - 1].second, v[n - 1].first, FrameType::P, 0, look));
+    code_src_ = nullptr;
     encode_b_range(v, start - 1, n - 1, 1, out);
     return out;
 }
