@@ -10,7 +10,7 @@ namespace fvc {
 std::vector<LineSeg> extract_lines(const Plane& ref, int vw, int vh, int bit_depth) {
     std::vector<LineSeg> out;
     const int W = std::min(vw, ref.w), H = std::min(vh, ref.h);
-    // |gx|+|gy| の下限 (平坦なセルには線を置かない)。変わらない線は送らないので、線を増やしても符号量は増えない
+    // |gx|+|gy| の下限 (平坦なセルには線を置かない)。実測: 64 に下げても改善しない (弱いエッジの動き推定が不安定)
     const int32_t thr = 96 << std::max(0, bit_depth - 8);
     auto at = [&](int x, int y) { return ref.at(std::clamp(x, 0, W - 1), std::clamp(y, 0, H - 1)); };
     for (int cy = 0; cy < H; cy += kLineCell)
@@ -83,9 +83,9 @@ void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const P
         const int cx = bx, cy = by;
         for (int dy = -range; dy <= range; ++dy)
             for (int dx = -range; dx <= range; ++dx) test(cx + dx, cy + dy);
-        // 粗い格子 (大きな動き: 歩く人でも 8 フレームで 40 画素ほど動く)。±48 画素を 4 画素刻み
-        for (int dy = -48; dy <= 48; dy += 4)
-            for (int dx = -48; dx <= 48; dx += 4) test(cx + dx, cy + dy);
+        // 粗い格子 (大きな動き)。実測 (v17 特許安全): ±48 画素に広げても改善せず (-0.02 dB)、±4·range に留める
+        for (int dy = -4 * range; dy <= 4 * range; dy += 4)
+            for (int dx = -4 * range; dx <= 4 * range; dx += 4) test(cx + dx, cy + dy);
         if (bx != cx || by != cy) {
             const int ox = bx, oy = by;
             for (int dy = -2; dy <= 2; ++dy)
