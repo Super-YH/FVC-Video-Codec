@@ -96,23 +96,43 @@ void forward_2d(TxType th, TxType tv, const double* in, int w, int h, double* ou
     thread_local std::vector<double> t;
     t.resize(static_cast<size_t>(w) * h);
     for (int y = 0; y < h; ++y) fwd1d(th, Th, w, in + static_cast<size_t>(y) * w, 1, t.data() + static_cast<size_t>(y) * w, 1);
-    for (int x = 0; x < w; ++x) fwd1d(tv, Tv, h, t.data() + x, w, out + x, w);
+    // 列は連続領域に集めてから変換する
+    thread_local std::vector<double> colv, resv;
+    colv.resize(h); resv.resize(h);
+    double* col = colv.data();
+    double* res = resv.data();
+    for (int x = 0; x < w; ++x) {
+        for (int y = 0; y < h; ++y) col[y] = t[static_cast<size_t>(y) * w + x];
+        fwd1d(tv, Tv, h, col, 1, res, 1);
+        for (int y = 0; y < h; ++y) out[static_cast<size_t>(y) * w + x] = res[y];
+    }
 }
 
 // 逆変換は規範として整数演算 (§13.3): 係数を Q8 の整数に丸め、基底は Q14 の整数行列、各段で 14 ビット右シフト (丸め付き)。
 // 浮動小数点の実装差 (FMA, libm, 演算順) で復号結果が変わらないようにする。
 namespace {
+std::vector<int32_t> build_q14(TxType t, int N) {
+    const std::vector<double>& T = tx_matrix(t, N);
+    std::vector<int32_t> q(T.size());
+    for (size_t i = 0; i < T.size(); ++i) q[i] = static_cast<int32_t>(std::lround(T[i] * 16384.0));
+    return q;
+}
 const std::vector<int32_t>& tx_matrix_q14(TxType t, int N) {
+    // 2 冪サイズ (≤ 64) はロックなしの固定表
+    struct Pow2 {
+        std::vector<int32_t> m[4][7];
+        Pow2() { for (int a = 0; a < 4; ++a) for (int l = 0; l <= 6; ++l) m[a][l] = build_q14(static_cast<TxType>(a), 1 << l); }
+    };
+    static Pow2 pw;
+    const int l = log2i(N);
+    if ((1 << l) == N && l <= 6) return pw.m[static_cast<int>(t)][l];
     static std::mutex mu;
     static std::map<std::pair<int, int>, std::vector<int32_t>> cache;
     std::lock_guard<std::mutex> lk(mu);
     auto key = std::make_pair(static_cast<int>(t), N);
     auto it = cache.find(key);
     if (it != cache.end()) return it->second;
-    const std::vector<double>& T = tx_matrix(t, N);
-    std::vector<int32_t> q(T.size());
-    for (size_t i = 0; i < T.size(); ++i) q[i] = static_cast<int32_t>(std::lround(T[i] * 16384.0));
-    return cache.emplace(key, std::move(q)).first->second;
+    return cache.emplace(key, build_q14(t, N)).first->second;
 }
 inline int64_t rshift14(int64_t v) { return (v + (int64_t(1) << 13)) >> 14; }
 }  // namespace
@@ -155,7 +175,22 @@ void inverse_2d(TxType th, TxType tv, const double* in, int w, int h, double* ou
             if (v) { rmax = std::max(rmax, y + 1); cmax = std::max(cmax, x + 1); }
         }
     if (rmax == 0) { std::fill(out, out + n, 0.0); return; }
-    for (int x = 0; x < cmax; ++x) inv1d_q14(tv, Tv, h, c.data() + x, w, t.data() + x, w, tv == TxType::IDTX ? h : rmax);
+    if (tv == TxType::IDTX) {
+        for (int y = 0; y < h; ++y)
+            for (int x = 0; x < cmax; ++x) t[static_cast<size_t>(y) * w + x] = c[static_cast<size_t>(y) * w + x];
+    } else {
+        // 行単位で積和 (整数なので和の順序によらず列ごとの 1D 逆変換と同じ値)
+        for (int y = 0; y < h; ++y) {
+            int64_t* o = &t[static_cast<size_t>(y) * w];
+            for (int k = 0; k < rmax; ++k) {
+                const int64_t tk = Tv[static_cast<size_t>(k) * h + y];
+                if (!tk) continue;
+                const int64_t* ck = &c[static_cast<size_t>(k) * w];
+                for (int x = 0; x < cmax; ++x) o[x] += tk * ck[x];
+            }
+            for (int x = 0; x < cmax; ++x) o[x] = rshift14(o[x]);
+        }
+    }
     for (int y = 0; y < h; ++y)
         inv1d_q14(th, Th, w, t.data() + static_cast<size_t>(y) * w, 1, r.data() + static_cast<size_t>(y) * w, 1, th == TxType::IDTX ? w : cmax);
     for (size_t i = 0; i < n; ++i) out[i] = static_cast<double>(r[i]) / 256.0;

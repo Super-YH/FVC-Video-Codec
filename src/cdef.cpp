@@ -56,14 +56,6 @@ int find_dir(const Plane& p, int x0, int y0, int sh, int& var) {
     return best;
 }
 
-inline int constrain(int diff, int thr, int damping) {
-    if (!thr) return 0;
-    const int shift = std::max(0, damping - ilog2(thr));
-    const int a = std::abs(diff);
-    const int v = std::clamp(thr - (a >> shift), 0, a);
-    return diff < 0 ? -v : v;
-}
-
 // 8x8 ブロックを 1 組の強さでフィルタ (入力 src, 出力 dst)
 void filter_block(const Plane& src, Plane& dst, int x0, int y0, int dir, int var, int pri, int sec, int damping, bool luma,
                   int32_t lo, int32_t hi) {
@@ -73,21 +65,40 @@ void filter_block(const Plane& src, Plane& dst, int x0, int y0, int dir, int var
         ps = var ? (pri * (4 + i) + 8) >> 4 : 0;
     }
     const int pt0 = (ps & 1) ? 3 : 4, pt1 = (ps & 1) ? 3 : 2;
-    auto px = [&](int x, int y) { return src.at(std::clamp(x, 0, src.w - 1), std::clamp(y, 0, src.h - 1)); };
-    for (int y = y0; y < std::min(y0 + 8, src.h); ++y)
-        for (int x = x0; x < std::min(x0 + 8, src.w); ++x) {
-            const int c = src.at(x, y);
+    // 12x12 の窓 (境界はクランプ) に取り出し、内側のループからクランプと ilog2 を除く
+    constexpr int B = 12, O = 2;
+    int32_t win[B * B];
+    for (int y = 0; y < B; ++y) {
+        const int sy = std::clamp(y0 + y - O, 0, src.h - 1);
+        const int32_t* r = &src.v[static_cast<size_t>(sy) * src.w];
+        for (int x = 0; x < B; ++x) win[y * B + x] = r[std::clamp(x0 + x - O, 0, src.w - 1)];
+    }
+    const int psh = ps ? std::max(0, damping - ilog2(ps)) : 0;
+    const int ssh = sec ? std::max(0, damping - 1 - ilog2(sec)) : 0;
+    auto con = [](int diff, int thr, int shift) {
+        const int a = std::abs(diff);
+        const int v = std::clamp(thr - (a >> shift), 0, a);
+        return diff < 0 ? -v : v;
+    };
+    int po[2], so[2][2];
+    for (int k = 0; k < 2; ++k) {
+        po[k] = kDirs[dir][k][0] * B + kDirs[dir][k][1];
+        so[0][k] = kDirs[(dir + 2) & 7][k][0] * B + kDirs[(dir + 2) & 7][k][1];
+        so[1][k] = kDirs[(dir + 6) & 7][k][0] * B + kDirs[(dir + 6) & 7][k][1];
+    }
+    const int ye = std::min(y0 + 8, src.h), xe = std::min(x0 + 8, src.w);
+    for (int y = y0; y < ye; ++y)
+        for (int x = x0; x < xe; ++x) {
+            const int32_t* q = &win[(y - y0 + O) * B + (x - x0 + O)];
+            const int c = q[0];
             int sum = 0, mx = c, mn = c;
             for (int k = 0; k < 2; ++k) {
-                const int dy = kDirs[dir][k][0], dx = kDirs[dir][k][1];
-                const int p0 = px(x + dx, y + dy), p1 = px(x - dx, y - dy);
-                const int t = k ? pt1 : pt0;
-                sum += t * (constrain(p0 - c, ps, damping) + constrain(p1 - c, ps, damping));
+                const int p0 = q[po[k]], p1 = q[-po[k]];
+                if (ps) sum += (k ? pt1 : pt0) * (con(p0 - c, ps, psh) + con(p1 - c, ps, psh));
                 mx = std::max({mx, p0, p1}); mn = std::min({mn, p0, p1});
-                for (int s2 : {(dir + 2) & 7, (dir + 6) & 7}) {
-                    const int sy = kDirs[s2][k][0], sx = kDirs[s2][k][1];
-                    const int s0 = px(x + sx, y + sy), s1 = px(x - sx, y - sy);
-                    sum += (k ? 1 : 2) * (constrain(s0 - c, sec, damping - 1) + constrain(s1 - c, sec, damping - 1));
+                for (int j = 0; j < 2; ++j) {
+                    const int s0 = q[so[j][k]], s1 = q[-so[j][k]];
+                    if (sec) sum += (k ? 1 : 2) * (con(s0 - c, sec, ssh) + con(s1 - c, sec, ssh));
                     mx = std::max({mx, s0, s1}); mn = std::min({mn, s0, s1});
                 }
             }

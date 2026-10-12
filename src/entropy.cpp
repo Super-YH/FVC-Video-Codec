@@ -87,39 +87,36 @@ int RangeBitDecoder::get(uint32_t p1) {
 
 // ---------------- stretch / squash ----------------
 namespace {
-// squash の表 (4095 項目)。値は 4096/(1+exp(-s/256)) の切り捨て (従来の直接計算と同一)。毎回 exp を呼ばない (高速化)
-const std::vector<int16_t>& squash_table() {
-    static const std::vector<int16_t> t = [] {
-        std::vector<int16_t> v(4095);
+// squash の表 (4095 項目)。値は 4096/(1+exp(-s/256)) の切り捨て (従来の直接計算と同一)。stretch はその逆。
+// 名前空間スコープの表にして、呼び出しごとの初期化確認を除く (高速化)
+struct SqTables {
+    int16_t sq[4095];
+    int16_t st[4096];
+    SqTables() {
         for (int s = -2047; s <= 2047; ++s) {
             const double p = 4096.0 / (1.0 + std::exp(-s / 256.0));
-            v[s + 2047] = static_cast<int16_t>(std::clamp(static_cast<int32_t>(p), 1, 4095));
+            sq[s + 2047] = static_cast<int16_t>(std::clamp(static_cast<int32_t>(p), 1, 4095));
         }
-        return v;
-    }();
-    return t;
-}
+        int pi = 0;
+        for (int s = -2047; s <= 2047; ++s) {
+            const int v = sq[s + 2047];
+            for (int j = pi; j <= v; ++j) st[j] = static_cast<int16_t>(s);
+            pi = v + 1;
+        }
+        for (int j = pi; j < 4096; ++j) st[j] = 2047;
+    }
+};
+const SqTables kSq;
 }  // namespace
 
 int32_t squash(int32_t s) {
     if (s > 2047) s = 2047;
     if (s < -2047) s = -2047;
-    return squash_table()[s + 2047];
+    return kSq.sq[s + 2047];
 }
 
 int32_t stretch(int32_t p) {
-    static std::vector<int16_t> table = [] {
-        std::vector<int16_t> t(4096);
-        int pi = 0;
-        for (int s = -2047; s <= 2047; ++s) {
-            const int v = squash(s);
-            for (int j = pi; j <= v; ++j) t[j] = static_cast<int16_t>(s);
-            pi = v + 1;
-        }
-        for (int j = pi; j < 4096; ++j) t[j] = 2047;
-        return t;
-    }();
-    return table[std::clamp(p, 0, 4095)];
+    return kSq.st[std::clamp(p, 0, 4095)];
 }
 
 // ---------------- CM モデル ----------------
@@ -183,7 +180,12 @@ void CMModel::update(int bit) {
 // ---------------- 2値化 ----------------
 void EntropyWriter::bit(CMModel& m, uint32_t node, uint32_t a, uint32_t b, int v) {
     const uint32_t p = m.predict(node, a, b);
-    m.stat_bits[node == 0 ? 0 : node == 1 ? 1 : 2] += -std::log2((v ? p : kProbScale - p) / static_cast<double>(kProbScale));
+    static const std::vector<double> nl = [] {
+        std::vector<double> t(kProbScale + 1, 12.0);
+        for (uint32_t i = 1; i <= kProbScale; ++i) t[i] = -std::log2(i / static_cast<double>(kProbScale));
+        return t;
+    }();
+    m.stat_bits[node == 0 ? 0 : node == 1 ? 1 : 2] += nl[v ? p : kProbScale - p];
     put(v, p);
     m.update(v);
 }

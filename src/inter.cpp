@@ -57,43 +57,77 @@ void motion_compensate(const RefPlane& ref, int x0, int y0, int w, int h, int mv
     // 平滑用に 1 画素マージン
     const int m = psi ? 1 : 0;
     const int W = w + 2 * m, H = h + 2 * m;
-    auto px = [&](int x, int y) { return p.at(std::clamp(x, 0, p.w - 1), std::clamp(y, 0, p.h - 1)); };
-    std::vector<int32_t> tmp(static_cast<size_t>(W) * (H + taps - 1));
-    const int bx = x0 + ix - m, by = y0 + iy - m;
-    const bool inside = bx - half >= 0 && by - half >= 0 && bx + W + taps - half <= p.w && by + H + taps - half <= p.h;
-    for (int y = 0; y < H + taps - 1; ++y) {
+    const int SW = W + taps - 1, SH = H + taps - 1;
+    // 作業領域はスレッドごとに使い回す (割り当てを避ける)
+    thread_local std::vector<int32_t> src, tmp, t2, t3;
+    const int bx = x0 + ix - m - half, by = y0 + iy - m - half;
+    const bool inside = bx >= 0 && by >= 0 && bx + SW <= p.w && by + SH <= p.h;
+    const int32_t* sp;
+    int ss;
+    if (inside) {
+        sp = &p.v[static_cast<size_t>(by) * p.w + bx];
+        ss = p.w;
+    } else {
+        src.resize(static_cast<size_t>(SW) * SH);
+        for (int y = 0; y < SH; ++y) {
+            const int32_t* r = &p.v[static_cast<size_t>(std::clamp(by + y, 0, p.h - 1)) * p.w];
+            int32_t* d = &src[static_cast<size_t>(y) * SW];
+            for (int x = 0; x < SW; ++x) d[x] = r[std::clamp(bx + x, 0, p.w - 1)];
+        }
+        sp = src.data();
+        ss = SW;
+    }
+    // 水平 (×64)
+    tmp.resize(static_cast<size_t>(W) * SH);
+    for (int y = 0; y < SH; ++y) {
+        const int32_t* r = sp + static_cast<size_t>(y) * ss;
         int32_t* t = &tmp[static_cast<size_t>(y) * W];
-        if (inside) {
-            const int32_t* r = &p.v[static_cast<size_t>(by + y - half) * p.w + bx - half];
-            if (fx == 0) { for (int x = 0; x < W; ++x) t[x] = r[x + half] << 6; continue; }
+        if (fx == 0) {
+            for (int x = 0; x < W; ++x) t[x] = r[x + half] << 6;
+        } else if (luma) {
+            const int c0 = cx[0], c1 = cx[1], c2 = cx[2], c3 = cx[3], c4 = cx[4], c5 = cx[5], c6 = cx[6], c7 = cx[7];
             for (int x = 0; x < W; ++x) {
-                int32_t s = 0;
-                for (int k = 0; k < taps; ++k) s += cx[k] * r[x + k];
-                t[x] = s;
+                const int32_t* q = r + x;
+                t[x] = c0 * q[0] + c1 * q[1] + c2 * q[2] + c3 * q[3] + c4 * q[4] + c5 * q[5] + c6 * q[6] + c7 * q[7];
             }
         } else {
+            const int c0 = cx[0], c1 = cx[1], c2 = cx[2], c3 = cx[3];
             for (int x = 0; x < W; ++x) {
-                int32_t s = 0;
-                for (int k = 0; k < taps; ++k) s += cx[k] * px(bx + x + k - half, by + y - half);
-                t[x] = s;  // ×64
+                const int32_t* q = r + x;
+                t[x] = c0 * q[0] + c1 * q[1] + c2 * q[2] + c3 * q[3];
             }
         }
     }
-    std::vector<int32_t> t2(static_cast<size_t>(W) * H);
+    // 垂直 (×64 を保つ)。出力先は平滑なしなら out64 に直接書く
+    std::vector<int32_t>& dst = psi ? t2 : out64;
+    dst.resize(static_cast<size_t>(W) * H);
     if (fy == 0) {
-        for (int y = 0; y < H; ++y)
-            std::copy(&tmp[static_cast<size_t>(y + half) * W], &tmp[static_cast<size_t>(y + half) * W] + W, &t2[static_cast<size_t>(y) * W]);
-    } else
-    for (int y = 0; y < H; ++y)
-        for (int x = 0; x < W; ++x) {
-            int64_t s = 0;
-            for (int k = 0; k < taps; ++k) s += static_cast<int64_t>(cy[k]) * tmp[static_cast<size_t>(y + k) * W + x];
-            t2[static_cast<size_t>(y) * W + x] = static_cast<int32_t>((s + 32) >> 6);  // ×64
+        std::copy(&tmp[static_cast<size_t>(half) * W], &tmp[static_cast<size_t>(half + H) * W], dst.begin());
+    } else {
+        for (int y = 0; y < H; ++y) {
+            int32_t* o = &dst[static_cast<size_t>(y) * W];
+            const int32_t* t = &tmp[static_cast<size_t>(y) * W];
+            if (luma) {
+                const int c0 = cy[0], c1 = cy[1], c2 = cy[2], c3 = cy[3], c4 = cy[4], c5 = cy[5], c6 = cy[6], c7 = cy[7];
+                for (int x = 0; x < W; ++x) {
+                    const int32_t* q = t + x;
+                    const int32_t s = c0 * q[0] + c1 * q[W] + c2 * q[2 * W] + c3 * q[3 * W] + c4 * q[4 * W] +
+                                      c5 * q[5 * W] + c6 * q[6 * W] + c7 * q[7 * W];
+                    o[x] = (s + 32) >> 6;
+                }
+            } else {
+                const int c0 = cy[0], c1 = cy[1], c2 = cy[2], c3 = cy[3];
+                for (int x = 0; x < W; ++x) {
+                    const int32_t* q = t + x;
+                    o[x] = (c0 * q[0] + c1 * q[W] + c2 * q[2 * W] + c3 * q[3 * W] + 32) >> 6;
+                }
+            }
         }
+    }
+    if (!psi) return;
     out64.resize(static_cast<size_t>(w) * h);
-    if (!psi) { out64 = t2; return; }
     const int a = psi;  // a/16
-    std::vector<int32_t> t3(static_cast<size_t>(W) * H);
+    t3.resize(static_cast<size_t>(W) * H);
     for (int y = 0; y < H; ++y)
         for (int x = 0; x < W; ++x) {
             const int xl = std::max(x - 1, 0), xr = std::min(x + 1, W - 1);
