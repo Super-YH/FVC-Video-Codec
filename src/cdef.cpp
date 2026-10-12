@@ -132,17 +132,28 @@ void code_cdef(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, int
             cand.push_back({p, s2});
             sse.push_back(std::move(e));
         };
-        for (int p : {0, 1, 2, 3, 4, 6, 8, 11, 15}) eval(p, 0);
-        std::vector<std::pair<double, int>> tot;
-        for (size_t c = 1; c < cand.size(); ++c) {
-            double t = 0;
-            for (double v : sse[c]) t += v;
-            tot.push_back({t, cand[c].first});
+        // 座標降下 (全候補の評価の代わり): 主強度の格子 {0,1,2,3,4,6,8,11,15} 上で、中央 (4) から総 SSE が
+        // 下がる向きへ 1 段ずつ進む。最良の主強度について副強度 {1,2,4} を評価する (17 → 約 8 回のフィルタ)
+        static constexpr int kPg[9] = {0, 1, 2, 3, 4, 6, 8, 11, 15};
+        auto total_of = [&](size_t c) { double t = 0; for (double v : sse[c]) t += v; return t; };
+        auto find_or_eval = [&](int p, int s2) {
+            for (size_t c = 0; c < cand.size(); ++c) if (cand[c].first == p && cand[c].second == s2) return c;
+            eval(p, s2);
+            return cand.size() - 1;
+        };
+        find_or_eval(0, 0);
+        int gi = 4;
+        double bt = total_of(find_or_eval(kPg[gi], 0));
+        for (int dir : {-1, 1}) {
+            for (;;) {
+                const int ni = gi + dir;
+                if (ni < 1 || ni > 8) break;
+                const double t = total_of(find_or_eval(kPg[ni], 0));
+                if (t < bt) { bt = t; gi = ni; } else break;
+            }
         }
-        std::sort(tot.begin(), tot.end());
-        eval(0, 1); eval(0, 2); eval(0, 4);
-        for (size_t k = 0; k < std::min<size_t>(2, tot.size()); ++k)
-            for (int s2 : {1, 2, 4}) eval(tot[k].second, s2);
+        for (int s2 : {1, 2, 4}) find_or_eval(kPg[gi], s2);
+        find_or_eval(0, 1);
         std::vector<size_t> sel = {0};  // (0,0) = 無効 は常に含める
         auto total = [&](const std::vector<size_t>& s) {
             double t = 0;

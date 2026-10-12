@@ -23,6 +23,7 @@
 #include "loop_filter.hpp"
 #include "shapes.hpp"
 #include "lines.hpp"
+#include "lattice_adam.hpp"
 #include "fvc/quant.hpp"
 
 namespace fvc {
@@ -914,17 +915,22 @@ void coarse_motion(const Plane& cur, const Plane& ref, int w, int h, std::vector
                 s += std::abs(a[static_cast<size_t>(y) * W + x] - b[static_cast<size_t>(std::clamp(y + dy, 0, H - 1)) * W + std::clamp(x + dx, 0, W - 1)]);
         return s;
     };
+    AdamState<2> cst;
     for (int gy = 0; gy < gh; ++gy)
         for (int gx = 0; gx < gw; ++gx) {
             const int bx = gx * 4, by = gy * 4;
             if (bx >= W || by >= H) continue;
-            int64_t best = INT64_MAX;
-            int mx = 0, my = 0;
-            for (int dy = -R; dy <= R; ++dy)
-                for (int dx = -R; dx <= R; ++dx) {
-                    const int64_t s = sad(bx, by, dx, dy, best) * 16 + (std::abs(dx) + std::abs(dy));  // 同点なら小さな動き
-                    if (s < best) { best = s; mx = dx; my = dy; }
-                }
+            // 格子丸め SPSA-Adam (全探索の代わり): 開始点は 0、左・上のセルの結果 (動きは空間的に連続)
+            auto f = [&](const std::array<int, 2>& v) {
+                return static_cast<double>(sad(bx, by, v[0], v[1], INT64_MAX) * 16 + (std::abs(v[0]) + std::abs(v[1])));
+            };
+            std::array<int, 2> starts[3] = {{0, 0}, {0, 0}, {0, 0}};
+            int ns = 1;
+            if (gx > 0) starts[ns++] = {out[(static_cast<size_t>(gy) * gw + gx - 1) * 2] / 4, out[(static_cast<size_t>(gy) * gw + gx - 1) * 2 + 1] / 4};
+            if (gy > 0) starts[ns++] = {out[(static_cast<size_t>(gy - 1) * gw + gx) * 2] / 4, out[(static_cast<size_t>(gy - 1) * gw + gx) * 2 + 1] / 4};
+            const std::array<int, 2> r = lattice_adam<2>(f, starts, ns, {-R, -R}, {R, R}, 4.0, &cst, &cst,
+                                                        static_cast<uint64_t>(gx) * 977 + static_cast<uint64_t>(gy));
+            const int mx = r[0], my = r[1];
             out[(static_cast<size_t>(gy) * gw + gx) * 2] = static_cast<int16_t>(mx * 4);
             out[(static_cast<size_t>(gy) * gw + gx) * 2 + 1] = static_cast<int16_t>(my * 4);
         }
