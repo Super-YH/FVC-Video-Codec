@@ -93,14 +93,15 @@ const std::vector<double>& tx_matrix(TxType t, int N) {
 void forward_2d(TxType th, TxType tv, const double* in, int w, int h, double* out) {
     const double* Th = tx_matrix(th, w).data();
     const double* Tv = tx_matrix(tv, h).data();
-    thread_local std::vector<double> t;
-    t.resize(static_cast<size_t>(w) * h);
-    for (int y = 0; y < h; ++y) fwd1d(th, Th, w, in + static_cast<size_t>(y) * w, 1, t.data() + static_cast<size_t>(y) * w, 1);
+    // 64x64 以下はスタック上の作業領域 (thread_local の確保・参照のコストを避ける)。演算順は従来と同一
+    const size_t n = static_cast<size_t>(w) * h;
+    thread_local std::vector<double> tv_big, colv, resv;
+    double t_small[4096], col_small[1024], res_small[1024];
+    double* t = n <= 4096 ? t_small : (tv_big.resize(n), tv_big.data());
+    double* col = h <= 1024 ? col_small : (colv.resize(h), colv.data());
+    double* res = h <= 1024 ? res_small : (resv.resize(h), resv.data());
+    for (int y = 0; y < h; ++y) fwd1d(th, Th, w, in + static_cast<size_t>(y) * w, 1, t + static_cast<size_t>(y) * w, 1);
     // 列は連続領域に集めてから変換する
-    thread_local std::vector<double> colv, resv;
-    colv.resize(h); resv.resize(h);
-    double* col = colv.data();
-    double* res = resv.data();
     for (int x = 0; x < w; ++x) {
         for (int y = 0; y < h; ++y) col[y] = t[static_cast<size_t>(y) * w + x];
         fwd1d(tv, Tv, h, col, 1, res, 1);
@@ -165,12 +166,21 @@ void inverse_2d(TxType th, TxType tv, const double* in, int w, int h, double* ou
     const int32_t* Th = th == TxType::IDTX ? nullptr : tx_matrix_q14(th, w).data();
     const int32_t* Tv = tv == TxType::IDTX ? nullptr : tx_matrix_q14(tv, h).data();
     const size_t n = static_cast<size_t>(w) * h;
-    thread_local std::vector<int64_t> c, t, r;
-    c.resize(n); t.assign(n, 0); r.resize(n);
+    thread_local std::vector<int64_t> cv, tv2, rv;
+    int64_t cs[4096], ts[4096], rs[4096];
+    int64_t* c = cs;
+    int64_t* t = ts;
+    int64_t* r = rs;
+    if (n > 4096) { cv.resize(n); tv2.resize(n); rv.resize(n); c = cv.data(); t = tv2.data(); r = rv.data(); }
+    std::fill(t, t + n, 0);
     int rmax = 0, cmax = 0;
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
-            const int64_t v = std::llround(in[static_cast<size_t>(y) * w + x] * 256.0);
+            // std::llround と同じ (0.5 は 0 から遠い側へ) を高速に: 切り捨てと差 (|v| < 2^52 で厳密)
+            const double dv = in[static_cast<size_t>(y) * w + x] * 256.0;
+            int64_t v = static_cast<int64_t>(dv);
+            const double fr = dv - static_cast<double>(v);
+            if (fr >= 0.5) ++v; else if (fr <= -0.5) --v;
             c[static_cast<size_t>(y) * w + x] = v;
             if (v) { rmax = std::max(rmax, y + 1); cmax = std::max(cmax, x + 1); }
         }
@@ -192,7 +202,7 @@ void inverse_2d(TxType th, TxType tv, const double* in, int w, int h, double* ou
         }
     }
     for (int y = 0; y < h; ++y)
-        inv1d_q14(th, Th, w, t.data() + static_cast<size_t>(y) * w, 1, r.data() + static_cast<size_t>(y) * w, 1, th == TxType::IDTX ? w : cmax);
+        inv1d_q14(th, Th, w, t + static_cast<size_t>(y) * w, 1, r + static_cast<size_t>(y) * w, 1, th == TxType::IDTX ? w : cmax);
     for (size_t i = 0; i < n; ++i) out[i] = static_cast<double>(r[i]) / 256.0;
 }
 

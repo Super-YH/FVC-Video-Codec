@@ -1,4 +1,5 @@
 #include "alf.hpp"
+#include "parallel.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -65,8 +66,9 @@ void code_alf(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, int 
     const int W = R.w, H = R.h, bw = W / 4, bh = H / 4;
     std::vector<uint8_t> cls(static_cast<size_t>(bw) * bh, 0);
     if (luma)
-        for (int by = 0; by < bh; ++by)
+        parallel_for(bh, [&](int by) {
             for (int bx = 0; bx < bw; ++bx) cls[by * bw + bx] = static_cast<uint8_t>(classify(R, bx * 4, by * 4, bit_depth));
+        });
     auto feat = [&](int x, int y, int k) {
         const int32_t c = R.at(x, y);
         const int x1 = std::clamp(x + kOff[k][0], 0, W - 1), y1 = std::clamp(y + kOff[k][1], 0, H - 1);
@@ -80,19 +82,46 @@ void code_alf(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, int 
         std::vector<std::vector<double>> A(ncls, std::vector<double>(kTaps * kTaps, 0.0)), B(ncls, std::vector<double>(kTaps, 0.0));
         std::vector<double> E0(ncls, 0.0);
         std::vector<int64_t> cnt(ncls, 0);
-        double f[kTaps];
-        for (int y = 0; y < H; ++y)
-            for (int x = 0; x < W; ++x) {
-                const int c = cls[(y / 4) * bw + x / 4];
-                const double t = org->at(x, y) - R.at(x, y);
-                for (int k = 0; k < kTaps; ++k) f[k] = feat(x, y, k);
-                for (int i = 0; i < kTaps; ++i) {
-                    B[c][i] += f[i] * t;
-                    for (int j = 0; j <= i; ++j) A[c][i * kTaps + j] += f[i] * f[j];
+        // 統計は行の区間ごとに並列に整数で積算して合算する (整数の和なので順序によらず従来と同値)
+        const int nck = std::min(H, 64);
+        struct Part { std::vector<int64_t> A, B, E; std::vector<int64_t> n; };
+        std::vector<Part> parts(nck);
+        parallel_for(nck, [&](int k) {
+            Part& P = parts[k];
+            P.A.assign(static_cast<size_t>(ncls) * kTaps * kTaps, 0); P.B.assign(static_cast<size_t>(ncls) * kTaps, 0);
+            P.E.assign(ncls, 0); P.n.assign(ncls, 0);
+            int64_t f[kTaps];
+            for (int y = k * H / nck; y < (k + 1) * H / nck; ++y)
+                for (int x = 0; x < W; ++x) {
+                    const int c = cls[(y / 4) * bw + x / 4];
+                    const int64_t t = org->at(x, y) - R.at(x, y);
+                    for (int q = 0; q < kTaps; ++q) f[q] = feat(x, y, q);
+                    int64_t* a = &P.A[static_cast<size_t>(c) * kTaps * kTaps];
+                    int64_t* b = &P.B[static_cast<size_t>(c) * kTaps];
+                    for (int i = 0; i < kTaps; ++i) {
+                        b[i] += f[i] * t;
+                        for (int j = 0; j <= i; ++j) a[i * kTaps + j] += f[i] * f[j];
+                    }
+                    P.E[c] += t * t;
+                    ++P.n[c];
                 }
-                E0[c] += t * t;
-                ++cnt[c];
+        });
+        for (int c = 0; c < ncls; ++c) {
+            for (int i = 0; i < kTaps * kTaps; ++i) {
+                int64_t v = 0;
+                for (const Part& P : parts) v += P.A[static_cast<size_t>(c) * kTaps * kTaps + i];
+                A[c][i] = static_cast<double>(v);
             }
+            for (int i = 0; i < kTaps; ++i) {
+                int64_t v = 0;
+                for (const Part& P : parts) v += P.B[static_cast<size_t>(c) * kTaps + i];
+                B[c][i] = static_cast<double>(v);
+            }
+            int64_t e = 0, n = 0;
+            for (const Part& P : parts) { e += P.E[c]; n += P.n[c]; }
+            E0[c] = static_cast<double>(e);
+            cnt[c] = n;
+        }
         for (int c = 0; c < ncls; ++c) {
             for (int i = 0; i < kTaps; ++i)
                 for (int j = i + 1; j < kTaps; ++j) A[c][i * kTaps + j] = A[c][j * kTaps + i];
@@ -125,7 +154,7 @@ void code_alf(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, int 
     }
     // フィルタ適用 (全面) → CTU ごとの採否
     Plane F = R;
-    for (int y = 0; y < H; ++y)
+    parallel_for(H, [&](int y) {
         for (int x = 0; x < W; ++x) {
             const int c = cls[(y / 4) * bw + x / 4];
             if (!on[c]) continue;
@@ -133,6 +162,7 @@ void code_alf(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, int 
             for (int k = 0; k < kTaps; ++k) sum += static_cast<int64_t>(coef[c][k]) * feat(x, y, k);
             F.at(x, y) = std::clamp(R.at(x, y) + static_cast<int32_t>((sum + 64) >> 7), lo, hi);
         }
+    });
     const int cw = (W + kCtuA - 1) / kCtuA, ch = (H + kCtuA - 1) / kCtuA;
     int prev = 1;
     for (int cy = 0; cy < ch; ++cy)

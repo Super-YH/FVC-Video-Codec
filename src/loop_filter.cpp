@@ -7,6 +7,7 @@
 #include <map>
 #include <cmath>
 #include <stdexcept>
+#include <thread>
 
 #include "fvc/transform.hpp"
 
@@ -208,71 +209,122 @@ void deblock_plane(Plane& p, const EdgeInfo& e, const MotionField* mf, bool chro
     }
 }
 
-// 複数の μ をまとめて処理する (順変換は共通なので 1 回だけ)。各 μ の結果は単独で呼んだときと同一
-void freq_gain_filter_multi(const Plane& in, Plane* outs, const int* mqs, int nm, double step, int32_t lo, int32_t hi) {
+// 複数の μ をまとめて処理する (順変換は共通なので 1 回だけ)。各 μ の結果は単独で呼んだときと同一。
+// 4 画素行の帯 t には、ブロック行 t (下半分) と t+1 (上半分) がこの順で足し込まれる。帯を連続した区間に分けて
+// 並列に処理し、各区間ではブロック行を 1 つずつ前進させながら計算する (フレーム全体の係数を保持しない: メモリ帯域の削減)
+void freq_gain_filter_multi(const Plane& in, Plane* outs, const int* mqs, int nm, double step, int32_t lo, int32_t hi,
+                            int strip_step = 1) {
     constexpr int N = 8, hop = 4;
     constexpr double kPi = 3.14159265358979323846;
     double w[N];
     for (int n = 0; n < N; ++n) w[n] = std::sin(kPi * (n + 0.5) / N);
     const double sigma2 = step * step / 12.0;
-    const int nby = (in.h + hop - 1) / hop + 1, nbx = (in.w + hop - 1) / hop + 1;
-    const size_t nb = static_cast<size_t>(nby) * nbx;
-    // 窓付きブロックの順変換係数 (行ごとに並列)
-    std::vector<double> coef(nb * N * N);
-    parallel_for(nby, [&](int j) {
+    const int nbx = (in.w + hop - 1) / hop + 1;
+    const int nstrip = (in.h + hop - 1) / hop;
+    for (int q = 0; q < nm; ++q) {
+        outs[q].w = in.w; outs[q].h = in.h;
+        if (mqs[q] <= 0) outs[q].v = in.v;
+        else outs[q].v.resize(in.v.size());
+    }
+    // ブロック行 j の逆変換結果 (μ ごと) を r[q] に作る
+    auto row = [&](int j, std::vector<double>& c, std::vector<std::vector<double>>& r) {
         const int by = -hop + j * hop;
-        double blk[N * N];
+        double blk[N * N], cc[N * N];
         for (int i = 0; i < nbx; ++i) {
             const int bx = -hop + i * hop;
             for (int y = 0; y < N; ++y)
                 for (int x = 0; x < N; ++x)
                     blk[y * N + x] = w[x] * w[y] * in.at(std::clamp(bx + x, 0, in.w - 1), std::clamp(by + y, 0, in.h - 1));
-            forward_2d(TxType::DCT2, TxType::DCT2, blk, N, N, &coef[(static_cast<size_t>(j) * nbx + i) * N * N]);
+            forward_2d(TxType::DCT2, TxType::DCT2, blk, N, N, &c[static_cast<size_t>(i) * N * N]);
+        }
+        for (int q = 0; q < nm; ++q) {
+            if (mqs[q] <= 0) continue;
+            const double mu = mqs[q] / 4.0;
+            for (int i = 0; i < nbx; ++i) {
+                std::copy(&c[static_cast<size_t>(i) * N * N], &c[static_cast<size_t>(i) * N * N] + N * N, cc);
+                for (int k = 1; k < N * N; ++k) {
+                    const double c2 = cc[k] * cc[k];
+                    cc[k] *= c2 > 0 ? std::max(0.0, 1.0 - mu * sigma2 / c2) : 0.0;
+                }
+                inverse_2d(TxType::DCT2, TxType::DCT2, cc, N, N, &r[q][static_cast<size_t>(i) * N * N]);
+            }
+        }
+    };
+    static const int hw = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+    if (strip_step > 1) {
+        // 間引き評価 (符号器の μ 選択用): strip_step 本に 1 本の帯だけを計算する (他の帯は入力のまま)
+        for (int q = 0; q < nm; ++q) if (mqs[q] > 0) outs[q].v = in.v;
+        const int ns = (nstrip + strip_step - 1) / strip_step;
+        parallel_for(ns, [&](int k) {
+            const int t = k * strip_step;
+            const size_t rs = static_cast<size_t>(nbx) * N * N;
+            std::vector<double> c(rs), a(in.w), ws(in.w);
+            std::vector<std::vector<double>> r0(nm, std::vector<double>(rs)), r1(nm, std::vector<double>(rs));
+            row(t, c, r0);
+            row(t + 1, c, r1);
+            for (int q = 0; q < nm; ++q) {
+                if (mqs[q] <= 0) continue;
+                for (int Y = t * hop; Y < std::min(in.h, t * hop + hop); ++Y) {
+                    std::fill(a.begin(), a.end(), 0.0);
+                    std::fill(ws.begin(), ws.end(), 0.0);
+                    for (int half = 0; half < 2; ++half) {
+                        const std::vector<double>& r = half ? r1[q] : r0[q];
+                        const int y = Y - (-hop + (t + half) * hop);
+                        for (int i = 0; i < nbx; ++i) {
+                            const int bx = -hop + i * hop;
+                            const double* rr = &r[static_cast<size_t>(i) * N * N + y * N];
+                            for (int x = 0; x < N; ++x) {
+                                const int X = bx + x;
+                                if (X < 0 || X >= in.w) continue;
+                                a[X] += w[x] * w[y] * rr[x];
+                                ws[X] += w[x] * w[x] * w[y] * w[y];
+                            }
+                        }
+                    }
+                    int32_t* o = &outs[q].v[static_cast<size_t>(Y) * in.w];
+                    for (int X = 0; X < in.w; ++X) o[X] = std::clamp(static_cast<int32_t>(std::lround(a[X] / ws[X])), lo, hi);
+                }
+            }
+        });
+        return;
+    }
+    const int nchunk = std::min(nstrip, hw * 2);
+    parallel_for(nchunk, [&](int ck) {
+        const int t0 = ck * nstrip / nchunk, t1 = (ck + 1) * nstrip / nchunk;
+        if (t0 >= t1) return;
+        const size_t rs = static_cast<size_t>(nbx) * N * N;
+        std::vector<double> c(rs);
+        std::vector<std::vector<double>> prev(nm, std::vector<double>(rs)), cur(nm, std::vector<double>(rs));
+        std::vector<double> a(in.w), ws(in.w);
+        row(t0, c, prev);
+        for (int t = t0; t < t1; ++t) {
+            row(t + 1, c, cur);
+            for (int q = 0; q < nm; ++q) {
+                if (mqs[q] <= 0) continue;
+                for (int Y = t * hop; Y < std::min(in.h, t * hop + hop); ++Y) {
+                    std::fill(a.begin(), a.end(), 0.0);
+                    std::fill(ws.begin(), ws.end(), 0.0);
+                    for (int half = 0; half < 2; ++half) {  // ブロック行 t (prev) → t+1 (cur) の順
+                        const std::vector<double>& r = half ? cur[q] : prev[q];
+                        const int y = Y - (-hop + (t + half) * hop);
+                        for (int i = 0; i < nbx; ++i) {
+                            const int bx = -hop + i * hop;
+                            const double* rr = &r[static_cast<size_t>(i) * N * N + y * N];
+                            for (int x = 0; x < N; ++x) {
+                                const int X = bx + x;
+                                if (X < 0 || X >= in.w) continue;
+                                a[X] += w[x] * w[y] * rr[x];
+                                ws[X] += w[x] * w[x] * w[y] * w[y];
+                            }
+                        }
+                    }
+                    int32_t* o = &outs[q].v[static_cast<size_t>(Y) * in.w];
+                    for (int X = 0; X < in.w; ++X) o[X] = std::clamp(static_cast<int32_t>(std::lround(a[X] / ws[X])), lo, hi);
+                }
+            }
+            std::swap(prev, cur);
         }
     });
-    std::vector<double> rows(nb * N * N), acc(in.v.size()), wsum(in.v.size());
-    for (int q = 0; q < nm; ++q) {
-        Plane& out = outs[q];
-        out = in;
-        if (mqs[q] <= 0) continue;
-        const double mu = mqs[q] / 4.0;
-        // 縮小と逆変換は行ごとに並列、画素への足し込みは従来と同じ順序で直列 (結果は同一)
-        parallel_for(nby, [&](int j) {
-            double c[N * N];
-            for (int i = 0; i < nbx; ++i) {
-                const size_t o = (static_cast<size_t>(j) * nbx + i) * N * N;
-                std::copy(&coef[o], &coef[o] + N * N, c);
-                for (int k = 1; k < N * N; ++k) {
-                    const double c2 = c[k] * c[k];
-                    c[k] *= c2 > 0 ? std::max(0.0, 1.0 - mu * sigma2 / c2) : 0.0;
-                }
-                inverse_2d(TxType::DCT2, TxType::DCT2, c, N, N, &rows[o]);
-            }
-        });
-        // 画素への足し込み: 画素行ごとに並列。各画素への加算順 (ブロック行 j の昇順 → ブロック列 i の昇順) は従来と同じ
-        parallel_for(in.h, [&](int Y) {
-            double* a = &acc[static_cast<size_t>(Y) * in.w];
-            double* ws = &wsum[static_cast<size_t>(Y) * in.w];
-            std::fill(a, a + in.w, 0.0);
-            std::fill(ws, ws + in.w, 0.0);
-            for (int j = 0; j < nby; ++j) {
-                const int y = Y - (-hop + j * hop);
-                if (y < 0 || y >= N) continue;
-                for (int i = 0; i < nbx; ++i) {
-                    const int bx = -hop + i * hop;
-                    const double* r = &rows[(static_cast<size_t>(j) * nbx + i) * N * N + y * N];
-                    for (int x = 0; x < N; ++x) {
-                        const int X = bx + x;
-                        if (X < 0 || X >= in.w) continue;
-                        a[X] += w[x] * w[y] * r[x];
-                        ws[X] += w[x] * w[x] * w[y] * w[y];
-                    }
-                }
-            }
-            int32_t* o = &out.v[static_cast<size_t>(Y) * in.w];
-            for (int X = 0; X < in.w; ++X) o[X] = std::clamp(static_cast<int32_t>(std::lround(a[X] / ws[X])), lo, hi);
-        });
-    }
 }
 
 void freq_gain_filter(const Plane& in, Plane& out, double step, int mu_q, int32_t lo, int32_t hi) {
@@ -357,13 +409,16 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
         if (io.enc) {
             double best = sse(D);
             int bm = 0;
+            // μ の選択は 4 本に 1 本の 4 画素行の帯で測った SSE で行い (帯の外は入力のままなので差は帯の中だけ)、
+            // 選んだ μ だけ全面に適用する
             static constexpr int kMq[4] = {1, 2, 4, 8};
             Plane t[4];
-            freq_gain_filter_multi(D, t, kMq, 4, step, lo, hi);
+            freq_gain_filter_multi(D, t, kMq, 4, step, lo, hi, 4);
             for (int k = 0; k < 4; ++k) {
                 const double s = sse(t[k]);
-                if (s < best) { best = s; bm = kMq[k]; F = std::move(t[k]); }
+                if (s < best) { best = s; bm = kMq[k]; }
             }
+            if (bm) freq_gain_filter(D, F, step, bm, lo, hi);
             lp.mu_q = bm;
         }
         lp.mu_q = static_cast<int>(io.uint(m, 2, 0, static_cast<uint32_t>(lp.mu_q)));
