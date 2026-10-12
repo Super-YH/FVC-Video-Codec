@@ -23,6 +23,7 @@
 #include "loop_filter.hpp"
 #include "shapes.hpp"
 #include "lines.hpp"
+#include "prof.hpp"
 #include "lattice_adam.hpp"
 #include "fvc/quant.hpp"
 
@@ -1129,7 +1130,10 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
     int hint_w = 0, hint_h = 0;
     if (inter && io.w && org && fp.type != FrameType::Copy)
         for (int l = 0; l < 2; ++l)
-            if (!refs[l].empty()) coarse_motion(org->p[0], refs[l][0]->p[0], info.width, info.height, hint[l], hint_w, hint_h);
+            {
+                FVC_PROF("coarse_motion");
+                if (!refs[l].empty()) coarse_motion(org->p[0], refs[l][0]->p[0], info.width, info.height, hint[l], hint_w, hint_h);
+            }
     MotionField mf;
     Plane luma_rec;
     Plane fref;  // 帯域別ゲインを適用した参照 (プレーンごとに作り直す)
@@ -1348,8 +1352,10 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 };
                 const int nth = std::clamp(fp.threads, 1, nt);
                 if (nth <= 1) {
+                    FVC_PROF("tiles");
                     for (int t = 0; t < nt; ++t) run_tile(t);
                 } else {
+                    FVC_PROF("tiles");
                     std::vector<std::thread> pool;
                     std::atomic<int> nextt{0};
                     for (int k = 0; k < nth; ++k)
@@ -1400,10 +1406,12 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                         code_bands_video(io, md, pqmf_cfg(fp), org ? &opad : nullptr, P, R, step, lambda, lo, hi);
                 }
                 if (fp.lf) {
+                    FVC_PROF("loop_filter");
                     code_loop_filter(io, md.lf, R, org ? &opad : nullptr, einfo, inter ? &mf : nullptr, pi > 0, pi ? cs : 0, pqp,
                                      info.bit_depth, step, lambda, fp.lf_freq, fp.lf_map, lo, hi, !fp.no_deblock);
                 }
-                if (fp.cdef) code_cdef(io, md.lf, R, org ? &opad : nullptr, pi == 0, pqp, info.bit_depth, lambda, lo, hi);
+                if (fp.cdef) { FVC_PROF("cdef"); code_cdef(io, md.lf, R, org ? &opad : nullptr, pi == 0, pqp, info.bit_depth, lambda, lo, hi); }
+                FVC_PROF("alf_brest");
                 if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lambda, lo, hi);
                 else if (fp.brest) code_band_restore(io, md.lf, R, org ? &opad : nullptr, pi == 0, step, lambda, lo, hi);
             }
@@ -1858,6 +1866,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& forig, int poc, FrameT
         io.enc = true;
         TileStreams ts;
         usage = BlockUsage{};
+        FVC_PROF("code_frame_total");
         code_frame(io, info_, par, &f, rec, *st_, ts, &usage);
         std::vector<uint8_t> p;
         write_frame_header(p, par);
@@ -2298,6 +2307,7 @@ std::vector<uint8_t> Encoder::encode(const Frame& f) {
 //  - ブロックの重み w = strength · exp(-MSE / (c σ²))、σ² は Immerkær 法の雑音分散推定
 //  - 画素ごとに |近傍 - 対象| > 3σ+2 の画素は使わない (動物体の境界でのぼけを防ぐ)
 static Frame temporal_filter(const Frame& t, const std::vector<const Frame*>& nb, const VideoInfo& info, int strength) {
+    FVC_PROF("temporal_filter");
     Frame o = t;
     if (nb.empty() || strength <= 0) return o;
     const Plane& T = t.p[0];

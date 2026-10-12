@@ -4,6 +4,8 @@
 #include <cmath>
 #include <stdexcept>
 
+#include "parallel.hpp"
+
 namespace fvc {
 
 namespace {
@@ -57,7 +59,7 @@ int find_dir(const Plane& p, int x0, int y0, int sh, int& var) {
 }
 
 // 8x8 ブロックを 1 組の強さでフィルタ (入力 src, 出力 dst)
-void filter_block(const Plane& src, Plane& dst, int x0, int y0, int dir, int var, int pri, int sec, int damping, bool luma,
+void filter_block(const Plane& src, int32_t* dst, int ds, int x0, int y0, int dir, int var, int pri, int sec, int damping, bool luma,
                   int32_t lo, int32_t hi) {
     int ps = pri;
     if (luma && pri) {
@@ -103,7 +105,7 @@ void filter_block(const Plane& src, Plane& dst, int x0, int y0, int dir, int var
                 }
             }
             const int v = c + ((8 + sum - (sum < 0)) >> 4);
-            dst.at(x, y) = std::clamp(std::clamp(v, mn, mx), lo, hi);
+            dst[(y - y0) * ds + (x - x0)] = std::clamp(std::clamp(v, mn, mx), lo, hi);
         }
 }
 }  // namespace
@@ -117,12 +119,6 @@ void code_cdef(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, int
     for (int by = 0; by < bh8; ++by)
         for (int bx = 0; bx < bw8; ++bx) dirs[by * bw8 + bx] = find_dir(R, bx * 8, by * 8, sh, vars[by * bw8 + bx]);
     const int cw = (R.w + kBlk - 1) / kBlk, ch = (R.h + kBlk - 1) / kBlk;
-    auto filt_all = [&](int pri, int sec, Plane& out) {
-        out = R;
-        for (int by = 0; by < bh8; ++by)
-            for (int bx = 0; bx < bw8; ++bx)
-                filter_block(R, out, bx * 8, by * 8, dirs[by * bw8 + bx], vars[by * bw8 + bx], pri << sh, sec << sh, damping, luma, lo, hi);
-    };
     // 符号器: 候補 (主, 副) ごとに 64x64 ブロックの SSE を求め、最大 4 組を貪欲に選ぶ
     std::vector<std::pair<int, int>> presets;
     std::vector<int> choice(static_cast<size_t>(cw) * ch, 0);
@@ -130,16 +126,29 @@ void code_cdef(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, int
         // 2 段探索 (高速化): 主強度を副 0 で評価 → 総 SSE の良い主強度 2 つについて副強度を評価 (36 → 17 回のフィルタ)
         std::vector<std::pair<int, int>> cand;
         std::vector<std::vector<double>> sse;
-        Plane F;
+        // 候補ごとの 64x64 ブロック SSE。8x8 ごとに局所バッファへフィルタして誤差を足す (整数の和なので順序によらず同値)。
+        // 8x8 の行ごとに並列
         auto eval = [&](int p, int s2) {
-            if (p == 0 && s2 == 0) F = R;
-            else filt_all(p, s2, F);
-            std::vector<double> e(choice.size(), 0.0);
-            for (int y = 0; y < R.h; ++y)
-                for (int x = 0; x < R.w; ++x) {
-                    const double d = org->at(x, y) - F.at(x, y);
-                    e[(y / kBlk) * cw + x / kBlk] += d * d;
+            std::vector<std::vector<int64_t>> part(bh8, std::vector<int64_t>(cw, 0));
+            parallel_for(bh8, [&](int by) {
+                int32_t buf[64];
+                const int y0 = by * 8, ye = std::min(y0 + 8, R.h);
+                for (int bx = 0; bx < bw8; ++bx) {
+                    const int x0 = bx * 8, xe = std::min(x0 + 8, R.w);
+                    const bool f = p || s2;
+                    if (f) filter_block(R, buf, 8, x0, y0, dirs[by * bw8 + bx], vars[by * bw8 + bx], p << sh, s2 << sh, damping, luma, lo, hi);
+                    int64_t acc = 0;
+                    for (int y = y0; y < ye; ++y)
+                        for (int x = x0; x < xe; ++x) {
+                            const int64_t d = org->at(x, y) - (f ? buf[(y - y0) * 8 + (x - x0)] : R.at(x, y));
+                            acc += d * d;
+                        }
+                    part[by][x0 / kBlk] += acc;
                 }
+            });
+            std::vector<double> e(choice.size(), 0.0);
+            for (int by = 0; by < bh8; ++by)
+                for (int c = 0; c < cw; ++c) e[(by * 8 / kBlk) * cw + c] += static_cast<double>(part[by][c]);
             cand.push_back({p, s2});
             sse.push_back(std::move(e));
         };
@@ -223,13 +232,14 @@ void code_cdef(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, int
     }
     // 適用 (選択された組で 8x8 単位)
     const Plane src = R;
-    for (int by = 0; by < bh8; ++by)
+    parallel_for(bh8, [&](int by) {
         for (int bx = 0; bx < bw8; ++bx) {
             const int c = choice[((by * 8) / kBlk) * cw + (bx * 8) / kBlk];
             if (!c) continue;
-            filter_block(src, R, bx * 8, by * 8, dirs[by * bw8 + bx], vars[by * bw8 + bx], presets[c].first << sh,
+            filter_block(src, &R.at(bx * 8, by * 8), R.w, bx * 8, by * 8, dirs[by * bw8 + bx], vars[by * bw8 + bx], presets[c].first << sh,
                          presets[c].second << sh, damping, luma, lo, hi);
         }
+    });
     (void)kPri;
 }
 

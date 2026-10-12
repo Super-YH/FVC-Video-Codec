@@ -1,5 +1,7 @@
 #include "loop_filter.hpp"
 #include "lattice_adam.hpp"
+#include "parallel.hpp"
+#include "prof.hpp"
 
 #include <algorithm>
 #include <map>
@@ -154,9 +156,15 @@ void decay_deblock(Plane& p, const EdgeInfo& e, int rq, int thr, int32_t lo, int
 void deblock_plane(Plane& p, const EdgeInfo& e, const MotionField* mf, bool chroma, int chroma_shift, int qp,
                    int bit_depth, int beta_off, int tc_off, int32_t lo, int32_t hi) {
     const int bdsh = bit_depth - 8;
+    // 垂直エッジは 4 行の帯ごと、水平エッジは 4 列の帯ごとに独立 (触る画素が重ならない) なので並列に処理する。
+    // 帯の中の順序は従来どおりなので結果は同一
     for (int dir = 0; dir < 2; ++dir) {  // 0: 垂直エッジ (水平方向にフィルタ), 1: 水平エッジ
-        for (int y = 0; y < p.h; y += 4)
-            for (int x = 0; x < p.w; x += 4) {
+        const int nstrip = dir == 0 ? (p.h + 3) / 4 : (p.w + 3) / 4;
+        parallel_for(nstrip, [&](int sidx) {
+        const int y_beg = dir == 0 ? sidx * 4 : 0, y_end = dir == 0 ? sidx * 4 + 1 : p.h;
+        const int x_beg = dir == 0 ? 0 : sidx * 4, x_end = dir == 0 ? p.w : sidx * 4 + 1;
+        for (int y = y_beg; y < y_end; y += 4)
+            for (int x = x_beg; x < x_end; x += 4) {
                 const int ex = x, ey = y;
                 if (dir == 0 && (ex == 0 || (ex & 7))) continue;
                 if (dir == 1 && (ey == 0 || (ey & 7))) continue;
@@ -196,41 +204,80 @@ void deblock_plane(Plane& p, const EdgeInfo& e, const MotionField* mf, bool chro
                 else
                     filter_luma_segment([&](int k, int i) -> int32_t& { return p.at(ex + k, ey + i); }, beta, tc, lo, hi, nlong);
             }
+        });
     }
 }
 
-void freq_gain_filter(const Plane& in, Plane& out, double step, int mu_q, int32_t lo, int32_t hi) {
-    out = in;
-    if (mu_q <= 0) return;
+// 複数の μ をまとめて処理する (順変換は共通なので 1 回だけ)。各 μ の結果は単独で呼んだときと同一
+void freq_gain_filter_multi(const Plane& in, Plane* outs, const int* mqs, int nm, double step, int32_t lo, int32_t hi) {
     constexpr int N = 8, hop = 4;
     constexpr double kPi = 3.14159265358979323846;
     double w[N];
     for (int n = 0; n < N; ++n) w[n] = std::sin(kPi * (n + 0.5) / N);
-    const double mu = mu_q / 4.0, sigma2 = step * step / 12.0;
-    std::vector<double> acc(in.v.size(), 0.0), wsum(in.v.size(), 0.0);
-    double blk[N * N], c[N * N], r[N * N];
-    for (int by = -hop; by < in.h; by += hop)
-        for (int bx = -hop; bx < in.w; bx += hop) {
+    const double sigma2 = step * step / 12.0;
+    const int nby = (in.h + hop - 1) / hop + 1, nbx = (in.w + hop - 1) / hop + 1;
+    const size_t nb = static_cast<size_t>(nby) * nbx;
+    // 窓付きブロックの順変換係数 (行ごとに並列)
+    std::vector<double> coef(nb * N * N);
+    parallel_for(nby, [&](int j) {
+        const int by = -hop + j * hop;
+        double blk[N * N];
+        for (int i = 0; i < nbx; ++i) {
+            const int bx = -hop + i * hop;
             for (int y = 0; y < N; ++y)
                 for (int x = 0; x < N; ++x)
                     blk[y * N + x] = w[x] * w[y] * in.at(std::clamp(bx + x, 0, in.w - 1), std::clamp(by + y, 0, in.h - 1));
-            forward_2d(TxType::DCT2, TxType::DCT2, blk, N, N, c);
-            for (int i = 1; i < N * N; ++i) {
-                const double c2 = c[i] * c[i];
-                c[i] *= c2 > 0 ? std::max(0.0, 1.0 - mu * sigma2 / c2) : 0.0;
-            }
-            inverse_2d(TxType::DCT2, TxType::DCT2, c, N, N, r);
-            for (int y = 0; y < N; ++y)
-                for (int x = 0; x < N; ++x) {
-                    const int X = bx + x, Y = by + y;
-                    if (X < 0 || Y < 0 || X >= in.w || Y >= in.h) continue;
-                    const size_t i = static_cast<size_t>(Y) * in.w + X;
-                    acc[i] += w[x] * w[y] * r[y * N + x];
-                    wsum[i] += w[x] * w[x] * w[y] * w[y];
-                }
+            forward_2d(TxType::DCT2, TxType::DCT2, blk, N, N, &coef[(static_cast<size_t>(j) * nbx + i) * N * N]);
         }
-    for (size_t i = 0; i < acc.size(); ++i)
-        out.v[i] = std::clamp(static_cast<int32_t>(std::lround(acc[i] / wsum[i])), lo, hi);
+    });
+    std::vector<double> rows(nb * N * N), acc(in.v.size()), wsum(in.v.size());
+    for (int q = 0; q < nm; ++q) {
+        Plane& out = outs[q];
+        out = in;
+        if (mqs[q] <= 0) continue;
+        const double mu = mqs[q] / 4.0;
+        // 縮小と逆変換は行ごとに並列、画素への足し込みは従来と同じ順序で直列 (結果は同一)
+        parallel_for(nby, [&](int j) {
+            double c[N * N];
+            for (int i = 0; i < nbx; ++i) {
+                const size_t o = (static_cast<size_t>(j) * nbx + i) * N * N;
+                std::copy(&coef[o], &coef[o] + N * N, c);
+                for (int k = 1; k < N * N; ++k) {
+                    const double c2 = c[k] * c[k];
+                    c[k] *= c2 > 0 ? std::max(0.0, 1.0 - mu * sigma2 / c2) : 0.0;
+                }
+                inverse_2d(TxType::DCT2, TxType::DCT2, c, N, N, &rows[o]);
+            }
+        });
+        // 画素への足し込み: 画素行ごとに並列。各画素への加算順 (ブロック行 j の昇順 → ブロック列 i の昇順) は従来と同じ
+        parallel_for(in.h, [&](int Y) {
+            double* a = &acc[static_cast<size_t>(Y) * in.w];
+            double* ws = &wsum[static_cast<size_t>(Y) * in.w];
+            std::fill(a, a + in.w, 0.0);
+            std::fill(ws, ws + in.w, 0.0);
+            for (int j = 0; j < nby; ++j) {
+                const int y = Y - (-hop + j * hop);
+                if (y < 0 || y >= N) continue;
+                for (int i = 0; i < nbx; ++i) {
+                    const int bx = -hop + i * hop;
+                    const double* r = &rows[(static_cast<size_t>(j) * nbx + i) * N * N + y * N];
+                    for (int x = 0; x < N; ++x) {
+                        const int X = bx + x;
+                        if (X < 0 || X >= in.w) continue;
+                        a[X] += w[x] * w[y] * r[x];
+                        ws[X] += w[x] * w[x] * w[y] * w[y];
+                    }
+                }
+            }
+            int32_t* o = &out.v[static_cast<size_t>(Y) * in.w];
+            for (int X = 0; X < in.w; ++X) o[X] = std::clamp(static_cast<int32_t>(std::lround(a[X] / ws[X])), lo, hi);
+        });
+    }
+}
+
+void freq_gain_filter(const Plane& in, Plane& out, double step, int mu_q, int32_t lo, int32_t hi) {
+    if (mu_q <= 0) { out = in; return; }
+    freq_gain_filter_multi(in, &out, &mu_q, 1, step, lo, hi);
 }
 
 void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const EdgeInfo& e, const MotionField* mf,
@@ -245,6 +292,7 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
         return s;
     };
     if (deblock) {
+        FVC_PROF("lf_deblock");
         // 9.1 デブロック: 符号器は強さオフセット (β, tc) を候補から最小 SSE で選ぶ
         if (io.enc && org) {
             // 座標降下: (β, tc) オフセットを 1 変数ずつ、良くなる方向へ 2 刻みで動かす (全 20 通りの代わり)
@@ -305,14 +353,16 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
     // 9.2 周波数ゲイン: 符号器は μ 候補から最小 SSE を選ぶ
     Plane F;
     if (allow_freq) {
+        FVC_PROF("lf_freq");
         if (io.enc) {
             double best = sse(D);
             int bm = 0;
-            for (int mq : {1, 2, 4, 8}) {
-                Plane t;
-                freq_gain_filter(D, t, step, mq, lo, hi);
-                const double s = sse(t);
-                if (s < best) { best = s; bm = mq; F = std::move(t); }
+            static constexpr int kMq[4] = {1, 2, 4, 8};
+            Plane t[4];
+            freq_gain_filter_multi(D, t, kMq, 4, step, lo, hi);
+            for (int k = 0; k < 4; ++k) {
+                const double s = sse(t[k]);
+                if (s < best) { best = s; bm = kMq[k]; F = std::move(t[k]); }
             }
             lp.mu_q = bm;
         }
