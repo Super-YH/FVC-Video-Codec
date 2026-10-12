@@ -1021,12 +1021,22 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
                 for (int dy = -1; dy <= 1; ++dy)
                     for (int dx = -1; dx <= 1; ++dx) test_int(fx + dx, fy + dy);
             } else if (R >= 8) {
-                // 粗探索 (ステップ 2) → 中心近傍の全探索
-                for (int dy = -R; dy <= R; dy += 2)
-                    for (int dx = -R; dx <= R; dx += 2) test_int(cx + dx, cy + dy);
+                // 格子丸め SPSA-Adam (近傍継承): 最良の開始点から、直前のブロックの (m, v) を引き継いで探索する
+                // (全探索・ダイヤモンド探索の代わり)。仕上げに 1 画素の 8 近傍を確認する
+                const std::array<int, 2> st0[2] = {{bx, by}, {(px + 2) >> 2, (py + 2) >> 2}};
+                const std::array<int, 2> lo{cx - 2 * R, cy - 2 * R}, hi{cx + 2 * R, cy + 2 * R};
+                auto f = [&](const std::array<int, 2>& v) {
+                    const double c = static_cast<double>(isad(v[0], v[1], INT64_MAX)) + lsad * mvbits(v[0] * 4 - px, v[1] * 4 - py);
+                    if (c < bc) { bc = c; bx = v[0]; by = v[1]; }
+                    return c;
+                };
+                // 目標値: 平均絶対誤差 2 未満なら十分 (それ以上探しても改善は量子化に埋もれる)
+                const double target = 2.0 * w * h;
+                lattice_adam<2>(f, st0, 2, lo, hi, 4.0, &me_adam_[list], &me_adam_[list],
+                                static_cast<uint64_t>(x0) * 131 + static_cast<uint64_t>(y0) * 7 + static_cast<uint64_t>(list), 24, target);
                 const int fx = bx, fy = by;
-                for (int dy = -2; dy <= 2; ++dy)
-                    for (int dx = -2; dx <= 2; ++dx) test_int(fx + dx, fy + dy);
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx) test_int(fx + dx, fy + dy);
             } else {
                 // 小ダイヤモンド反復
                 for (int it = 0; it < R * 4; ++it) {
@@ -1712,13 +1722,32 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             for (int d = 0; d < kNumLine; ++d) modes.push_back(kModeLine0 + d);
         }
         Leaf t;
-        for (int m : modes) {
+        auto sad_of = [&](int m) {
             t.mode = m;
             predict(t, x0, y0, l, pred.data());
             int64_t sad = 0;
             for (int y = 0; y < s; ++y)
                 for (int x = 0; x < s; ++x) sad += std::abs(org_->at(x0 + x, y0 + y) - pred[y * s + x]);
-            sads.push_back({sad, m});
+            return sad;
+        };
+        if (tools_.safe_intra) {
+            // 座標降下: DC・平面と 4 方向おきの線方向を評価し、良い 2 方向の周り (±2, ±1) だけを詳しく見る
+            std::vector<char> done(kNumLine, 0);
+            for (int m : {kModeDC, kModePlanar}) sads.push_back({sad_of(m), m});
+            std::vector<std::pair<int64_t, int>> dirs;
+            for (int d = 0; d < kNumLine; d += 4) { dirs.push_back({sad_of(kModeLine0 + d), d}); done[d] = 1; }
+            std::sort(dirs.begin(), dirs.end());
+            for (size_t k = 0; k < std::min<size_t>(2, dirs.size()); ++k)
+                for (int st : {2, 1}) {
+                    const int c0 = dirs[k].second;
+                    for (int dd : {-st, st}) {
+                        const int d = (c0 + dd + kNumLine) % kNumLine;
+                        if (!done[d]) { done[d] = 1; dirs.push_back({sad_of(kModeLine0 + d), d}); }
+                    }
+                }
+            for (const auto& dv : dirs) sads.push_back({dv.first, kModeLine0 + dv.second});
+        } else {
+            for (int m : modes) sads.push_back({sad_of(m), m});
         }
         std::sort(sads.begin(), sads.end());
         int m0, m1;
@@ -1815,6 +1844,25 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             for (size_t i = 0; i < cands.size(); ++i) if (cands[i].pt == 2) idx.push_back(i);
             keep_only(idx);
         }
+    }
+    // 逐次半減 (Successive Halving / median stopping): 安価な指標 (SATD + λ·ビット推定) で並べ、最良の
+    // prune_ratio 倍以内の候補 (最低 3 個) だけを本評価する (固定の上位 K より品質を保ちやすい)
+    if (search_.prune_ratio > 0 && cands.size() > 3) {
+        std::vector<std::pair<double, size_t>> rank;
+        std::vector<int32_t> res(static_cast<size_t>(n));
+        const double lsad = std::sqrt(lambda_);
+        for (size_t i = 0; i < cands.size(); ++i) {
+            for (int y = 0; y < s; ++y)
+                for (int x = 0; x < s; ++x) res[y * s + x] = org_->at(x0 + x, y0 + y) - preds[i][y * s + x];
+            Leaf t = cands[i];
+            t.last = -1;
+            rank.push_back({static_cast<double>(satd4(res.data(), s)) + lsad * leaf_bits(t, x0, y0, l), i});
+        }
+        std::stable_sort(rank.begin(), rank.end());
+        std::vector<size_t> idx;
+        for (size_t k = 0; k < rank.size(); ++k)
+            if (k < 3 || rank[k].first <= rank[0].first * search_.prune_ratio) idx.push_back(rank[k].second);
+        keep_only(idx);
     }
     // 高速化: SATD 上位 K 候補のみ RD 評価
     if (search_.max_rd_cands > 0 && static_cast<int>(cands.size()) > search_.max_rd_cands) {
@@ -1996,7 +2044,11 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     fill_mf(best_leaf, x0, y0, s);
     set_modes4(x0, y0, s, best_leaf.pt ? kModePlanar : best_leaf.mode);
     if (l <= min_log2_) return best;
-    if (best < lambda_ * 4.0 || (search_.skip_split_on_skip && best_leaf.pt == 2 && best_leaf.last < 0)) {
+    // 早期打ち切り: 残差なしのインター葉で、予測誤差が量子化雑音 (Δ²/12) の kSkipNoise 倍以下なら分割を試さない
+    constexpr double kSkipNoise = 0.6;
+    const bool quiet_skip = best_leaf.pt == 2 && best_leaf.last < 0 && best_leaf.rd_dist >= 0 &&
+                            best_leaf.rd_dist <= kSkipNoise * step_ * step_ / 12.0 * n;
+    if (best < lambda_ * 4.0 || (search_.skip_split_on_skip && (search_.max_rd_cands > 0 ? best_leaf.pt == 2 && best_leaf.last < 0 : quiet_skip))) {
         split_at(x0, y0, l) = 0;
         return best;
     }

@@ -1,6 +1,7 @@
 #include "loop_filter.hpp"
 
 #include <algorithm>
+#include <map>
 #include <cmath>
 #include <stdexcept>
 
@@ -245,14 +246,31 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
     if (deblock) {
         // 9.1 デブロック: 符号器は強さオフセット (β, tc) を候補から最小 SSE で選ぶ
         if (io.enc && org) {
-            double best = 1e300;
-            for (int bo : {0, 2, 4, 6})
-                for (int to : {-2, 0, 2, 4, 6}) {
-                    Plane t = R;
-                    deblock_plane(t, e, mf, chroma, chroma_shift, qp, bit_depth, bo, to, lo, hi);
-                    const double s = sse(t);
-                    if (s < best) { best = s; lp.beta_off = bo; lp.tc_off = to; D = std::move(t); }
+            // 座標降下: (β, tc) オフセットを 1 変数ずつ、良くなる方向へ 2 刻みで動かす (全 20 通りの代わり)
+            std::map<std::pair<int, int>, double> memo;
+            auto eval = [&](int bo, int to) {
+                const auto k = std::make_pair(bo, to);
+                auto it = memo.find(k);
+                if (it != memo.end()) return it->second;
+                Plane t = R;
+                deblock_plane(t, e, mf, chroma, chroma_shift, qp, bit_depth, bo, to, lo, hi);
+                const double s = sse(t);
+                memo[k] = s;
+                return s;
+            };
+            int bo = 2, to = 2;
+            double best = eval(bo, to);
+            for (bool moved = true; moved;) {
+                moved = false;
+                for (const auto& d : {std::pair<int, int>{2, 0}, {-2, 0}, {0, 2}, {0, -2}}) {
+                    const int nb = bo + d.first, nt = to + d.second;
+                    if (nb < 0 || nb > 6 || nt < -2 || nt > 6) continue;
+                    const double s = eval(nb, nt);
+                    if (s < best) { best = s; bo = nb; to = nt; moved = true; }
                 }
+            }
+            lp.beta_off = bo; lp.tc_off = to;
+            deblock_plane(D, e, mf, chroma, chroma_shift, qp, bit_depth, bo, to, lo, hi);
         }
         lp.beta_off = io.sint(m, 0, 0, lp.beta_off);
         lp.tc_off = io.sint(m, 1, 0, lp.tc_off);

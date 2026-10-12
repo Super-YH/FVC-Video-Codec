@@ -12,6 +12,7 @@
 #include "fvc/transform.hpp"
 #include "inter.hpp"
 #include "gs_coder.hpp"
+#include "lattice_adam.hpp"
 #include "fvc/codec.hpp"
 
 namespace fvc { class Dictionary; }
@@ -165,6 +166,7 @@ struct Search {
     bool qpel = true;              // 1/4 画素精密化 (false: 1/2 まで)
     bool inter_skip_intra = false; // インター候補が十分よければイントラを評価しない
     int max_rd_cands = 0;          // >0: SAD 上位 K 候補のみ RD 評価
+    double prune_ratio = 0;        // >0: 逐次半減 (安価な指標が最良の prune_ratio 倍以内の候補だけ本評価)
     bool requant = false;          // 符号化時に再量子化する (従来動作、比較用)
     int dict_age = 48;             // 学習原子をこの根ブロック数使われなければ捨てる (符号器の方針、実測で 4〜48 は誤差内)
     double dict_bias = 64.0;       // 辞書を使う葉の RD 罰則 (ビット)
@@ -303,6 +305,8 @@ private:
     void code_discard(SymIO& io, Models& md);  // 根ブロックごとの「捨てる」指示 (いつでも立てられる)
 
     void obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const;
+    // 動き探索の Adam 状態 (リストごと、直前に探索したブロックから継承する)
+    mutable AdamState<2> me_adam_[2];
     // 線の動き場: 輝度位置 (x, y) の動き (L0 先頭参照)
     MotionInfo line_mi(int x, int y) const {
         MotionInfo m;

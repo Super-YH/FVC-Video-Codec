@@ -1520,7 +1520,7 @@ FrameParams params_from(const EncoderConfig& c) {
     case Preset::Medium:
         fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 3; s.me_range = 8;
         fp.band_tools = true; fp.lf_freq = fp.lf_map = true;
-        s.rdoq = true;
+        s.rdoq = true; s.approx_subpel = true; s.skip_split_on_skip = true; s.prune_ratio = 1.5;
         break;
     case Preset::Slow:
         fp.min_log2 = 2; fp.max_log2 = 6; s.rd_modes = 6; s.me_range = 16;
@@ -1601,7 +1601,8 @@ FrameParams params_from(const EncoderConfig& c) {
     }
     // タイル: 既定は placebo 以外 2x2 (並列化のため)。threads は符号化結果に影響しない
     // 実測: 2x2 は 1x1 より 4-7% 効率が落ちるため、medium 以上は 1x1 (速度より効率)
-    const int dt = c.preset >= Preset::Medium ? 1 : 2;
+    // 速度優先: 既定はすべてのプリセットで 2x2 タイル (4 コアで並列)。実測の効率低下は数 % (以前の計測 4-7%)
+    const int dt = c.preset >= Preset::Placebo ? 1 : 2;
     fp.tile_cols = std::clamp(c.tile_cols > 0 ? c.tile_cols : dt, 1, 16);
     fp.tile_rows = std::clamp(c.tile_rows > 0 ? c.tile_rows : dt, 1, 16);
     fp.threads = c.threads > 0 ? c.threads : static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
@@ -2096,14 +2097,29 @@ static Frame temporal_filter(const Frame& t, const std::vector<const Frame*>& nb
                 const int x0 = bx * B, y0 = by * B, x1 = std::min(x0 + B, W), y1 = std::min(y0 + B, H);
                 int64_t best = INT64_MAX;
                 int bmx = 0, bmy = 0;
-                for (int dy = -R; dy <= R; ++dy)
-                    for (int dx = -R; dx <= R; ++dx) {
-                        int64_t s = 0;
-                        for (int y = y0; y < y1 && s < best; ++y)
-                            for (int x = x0; x < x1; ++x)
-                                s += std::abs(T.at(x, y) - N.at(std::clamp(x + dx, 0, W - 1), std::clamp(y + dy, 0, H - 1)));
-                        s = s * 8 + std::abs(dx) + std::abs(dy);  // 同点なら小さな動き
-                        if (s < best) { best = s; bmx = dx; bmy = dy; }
+                auto cost = [&](int dx, int dy) {
+                    int64_t s = 0;
+                    for (int y = y0; y < y1 && s < best; ++y)
+                        for (int x = x0; x < x1; ++x)
+                            s += std::abs(T.at(x, y) - N.at(std::clamp(x + dx, 0, W - 1), std::clamp(y + dy, 0, H - 1)));
+                    return s * 8 + std::abs(dx) + std::abs(dy);  // 同点なら小さな動き
+                };
+                // 座標降下: 開始点 (0 と左・上のブロックの結果) から歩幅 4, 2, 1 のダイヤモンドを辿る (全探索の代わり)
+                auto test = [&](int dx, int dy) {
+                    if (std::abs(dx) > R || std::abs(dy) > R) return;
+                    const int64_t s = cost(dx, dy);
+                    if (s < best) { best = s; bmx = dx; bmy = dy; }
+                };
+                test(0, 0);
+                const size_t base = k * bh * bw;
+                if (bx > 0) test(mvx[base + by * bw + bx - 1], mvy[base + by * bw + bx - 1]);
+                if (by > 0) test(mvx[base + (by - 1) * bw + bx], mvy[base + (by - 1) * bw + bx]);
+                for (int st = 4; st >= 1; st >>= 1)
+                    for (int it = 0; it < 8; ++it) {
+                        const int ox = bmx, oy = bmy;
+                        for (const auto& d : {std::pair<int, int>{st, 0}, {-st, 0}, {0, st}, {0, -st}, {st, st}, {-st, -st}, {st, -st}, {-st, st}})
+                            test(ox + d.first, oy + d.second);
+                        if (ox == bmx && oy == bmy) break;
                     }
                 double mse = 0;
                 for (int y = y0; y < y1; ++y)
