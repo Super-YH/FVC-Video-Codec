@@ -11,7 +11,7 @@ std::vector<LineSeg> extract_lines(const Plane& ref, int vw, int vh, int bit_dep
     std::vector<LineSeg> out;
     const int W = std::min(vw, ref.w), H = std::min(vh, ref.h);
     // |gx|+|gy| の下限 (平坦なセルには線を置かない)。変わらない線は送らないので、線を増やしても符号量は増えない
-    const int32_t thr = 64 << std::max(0, bit_depth - 8);
+    const int32_t thr = 96 << std::max(0, bit_depth - 8);
     auto at = [&](int x, int y) { return ref.at(std::clamp(x, 0, W - 1), std::clamp(y, 0, H - 1)); };
     for (int cy = 0; cy < H; cy += kLineCell)
         for (int cx = 0; cx < W; cx += kLineCell) {
