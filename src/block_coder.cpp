@@ -1759,6 +1759,34 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             };
             lattice_adam<1>(f, st, ns, {0}, {kNumLine - 1}, 3.0, &intra_adam_, &intra_adam_,
                             static_cast<uint64_t>(x0) * 7 + static_cast<uint64_t>(y0) * 3 + static_cast<uint64_t>(l), 10);
+        } else if (tools_.all_angular && search_.rd_modes < kNumIntra - 3) {
+            // 角度モード (2..34) の SPSA-Adam (33 方向の総当たりの代わり)。開始点は左・上の角度と 5 方向
+            // (2, 10, 18, 26, 34)。評価した角度はすべて候補にし、角度以外のモードは直接評価する
+            for (int m : modes) if (m < 2 || m > 34) sads.push_back({sad_of(m), m});
+            const int gw = rec_->w / 4;
+            const int lm = x0 > tx0_ ? modes4_[(y0 / 4) * gw + (x0 / 4 - 1)] : -1;
+            const int am = y0 > ty0_ ? modes4_[(y0 / 4 - 1) * gw + (x0 / 4)] : -1;
+            std::array<int, 1> st[7];
+            int ns = 0;
+            for (int m : {lm, am}) if (m >= 2 && m <= 34) st[ns++] = {m - 2};
+            for (int d : {0, 8, 16, 24, 32}) st[ns++] = {d};
+            bool done[33] = {};
+            auto f = [&](const std::array<int, 1>& v) {
+                const int64_t sd = sad_of(2 + v[0]);
+                if (!done[v[0]]) { done[v[0]] = true; sads.push_back({sd, 2 + v[0]}); }
+                return static_cast<double>(sd);
+            };
+            lattice_adam<1>(f, st, ns, {0}, {32}, 3.0, &intra_adam_, &intra_adam_,
+                            static_cast<uint64_t>(x0) * 7 + static_cast<uint64_t>(y0) * 3 + static_cast<uint64_t>(l), 10);
+            // 仕上げ: 角度の上位 2 つの ±1 を確認する (SPSA の雑音で隣を取りこぼさない)
+            std::vector<std::pair<int64_t, int>> ang;
+            for (const auto& e : sads) if (e.second >= 2 && e.second <= 34) ang.push_back(e);
+            std::sort(ang.begin(), ang.end());
+            for (size_t k = 0; k < std::min<size_t>(2, ang.size()); ++k)
+                for (int d : {-1, 1}) {
+                    const int v = ang[k].second - 2 + d;
+                    if (v >= 0 && v <= 32 && !done[v]) f({v});
+                }
         } else {
             for (int m : modes) sads.push_back({sad_of(m), m});
         }
