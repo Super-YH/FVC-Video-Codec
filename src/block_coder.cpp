@@ -2080,10 +2080,9 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     const int sbx = bv_px_, sby = bv_py_;
     const int h = s / 2;
     double js = lambda_ * split_rate(x0, y0, l, 1);
-    js += rd_node(x0, y0, l - 1);
-    js += rd_node(x0 + h, y0, l - 1);
-    js += rd_node(x0, y0 + h, l - 1);
-    js += rd_node(x0 + h, y0 + h, l - 1);
+    // 早期打ち切り (無損失): 子の J は非負なので、途中までの和が分割しない J を超えたら残りの子を評価しない
+    const int cx[4] = {x0, x0 + h, x0, x0 + h}, cy[4] = {y0, y0, y0 + h, y0 + h};
+    for (int k = 0; k < 4 && js < best; ++k) js += rd_node(cx[k], cy[k], l - 1);
     if (best <= js) {
         split_at(x0, y0, l) = 0;
         restore(x0, y0, s, best_rec);
