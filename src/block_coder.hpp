@@ -87,7 +87,7 @@ struct SymIO {
 
 struct Models {
     CMModel split, mode, cbf, last, coef_y, coef_c, band_ll, band_hi, lossless, l2, ibc, cfl, tns, e8, nf;
-    CMModel inter, mvd, dict, shape, global, band_mode, lf, aqp, gs, line, line1;
+    CMModel inter, mvd, dict, shape, global, band_mode, lf, aqp, gs, line, line1, bline;
 };
 
 const std::vector<int>& diag_scan(int log2s);
@@ -115,6 +115,7 @@ struct Tools {
     bool no_sp = false;       // Smooth/Paeth イントラを使わない (特許安全モード)
     bool line_mv = false;     // 線に基づく動き場のモード (lines.hpp)
     bool safe_intra = false;  // 特許安全イントラ: DC / 最小二乗平面 / 32 方向の両側線補間 (モードは近傍を文脈にして直接符号化)
+    bool bline = false;       // 帯域画像の線予測 (静止画の帯域方式で高域を線のエッジモデルから予測)
     bool guide = false;       // 輝度誘導の色差予測 (特許安全モードの CfL 代替): 色差モード kModeCfl の意味を置き換える
     bool sr = false;          // ブロック超解像: 残差を 1/2 解像度で符号化し予測に導かれた補間で戻す
     bool mts = false;         // 複数変換選択 (DCT2/DST7/DCT8)

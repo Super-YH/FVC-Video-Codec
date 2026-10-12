@@ -28,8 +28,14 @@ struct LineSeg {
 
 constexpr int kLineCell = 16;
 
-// 参照輝度から線を抽出する (符号器・復号器で同一の整数演算)
-std::vector<LineSeg> extract_lines(const Plane& ref, int vw, int vh, int bit_depth);
+// 参照輝度から線を抽出する (符号器・復号器で同一の整数演算)。thr8: 8 ビット換算の |gx|+|gy| 下限
+std::vector<LineSeg> extract_lines(const Plane& ref, int vw, int vh, int bit_depth, int thr8 = 96);
+
+// 帯域画像の線予測 (静止画の帯域方式): LL だけから合成した画像 y0 (W x H, 値 - off) の線を、線ごとに
+// 「位置の補正 (1/4 画素) と鋭さ」を伝送した理想エッジで置き換えた画像 y1 を作る。y1 を帯域分解した高域を
+// 高域帯域の予測に使う。線は y0 から両側で抽出するので形は送らない
+void code_band_lines(SymIO& io, CMModel& m, const std::vector<double>& y0, int W, int H, const Plane* org, double off,
+                     double lambda, int bit_depth, std::vector<double>& y1);
 // 符号器: 線ごとの動きを推定し、変わったかを RD で決める
 void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const Plane& ref, const GlobalModel& gm,
                           double lambda, int range);

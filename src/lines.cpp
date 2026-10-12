@@ -7,11 +7,11 @@
 
 namespace fvc {
 
-std::vector<LineSeg> extract_lines(const Plane& ref, int vw, int vh, int bit_depth) {
+std::vector<LineSeg> extract_lines(const Plane& ref, int vw, int vh, int bit_depth, int thr8) {
     std::vector<LineSeg> out;
     const int W = std::min(vw, ref.w), H = std::min(vh, ref.h);
     // |gx|+|gy| の下限 (平坦なセルには線を置かない)。実測: 64 に下げても改善しない (弱いエッジの動き推定が不安定)
-    const int32_t thr = 96 << std::max(0, bit_depth - 8);
+    const int32_t thr = thr8 << std::max(0, bit_depth - 8);
     auto at = [&](int x, int y) { return ref.at(std::clamp(x, 0, W - 1), std::clamp(y, 0, H - 1)); };
     for (int cy = 0; cy < H; cy += kLineCell)
         for (int cx = 0; cx < W; cx += kLineCell) {
@@ -228,6 +228,74 @@ void build_line_field(const std::vector<LineSeg>& lines, const GlobalModel& gm, 
             field[(static_cast<size_t>(by) * w4 + bx) * 2] = static_cast<int16_t>(std::clamp<int64_t>(rdiv(sx, ws), -16000, 16000));
             field[(static_cast<size_t>(by) * w4 + bx) * 2 + 1] = static_cast<int16_t>(std::clamp<int64_t>(rdiv(sy, ws), -16000, 16000));
         }
+}
+
+// ---------------- 帯域画像の線予測 ----------------
+namespace {
+constexpr double kEdgeW[4] = {0.35, 0.7, 1.2, 2.0};  // 理想エッジの傾斜の幅 (画素)
+constexpr int kBlT = 8, kBlN = 6;                       // 線の影響範囲: 接線方向 ±8, 法線方向 ±6
+
+// 線 L を (位置補正 dq/4 画素, 鋭さ s) で y に適用する (または適用した場合の値を f に渡す)
+template <class F>
+void band_line_apply(const std::vector<double>& y, int W, int H, const LineSeg& L, int dq, int s, F&& f) {
+    const double gn = std::hypot(static_cast<double>(L.gx), static_cast<double>(L.gy));
+    if (gn <= 0) return;
+    const double nx = L.gx / gn, ny = L.gy / gn, tx = -ny, ty = nx;
+    auto smp = [&](double x, double yy) {
+        x = std::clamp(x, 0.0, W - 1.0); yy = std::clamp(yy, 0.0, H - 1.0);
+        const int x0 = static_cast<int>(x), y0 = static_cast<int>(yy);
+        const int x1 = std::min(x0 + 1, W - 1), y1 = std::min(y0 + 1, H - 1);
+        const double fx = x - x0, fy = yy - y0;
+        return (y[y0 * W + x0] * (1 - fx) + y[y0 * W + x1] * fx) * (1 - fy) + (y[y1 * W + x0] * (1 - fx) + y[y1 * W + x1] * fx) * fy;
+    };
+    const double a = smp(L.x - 4 * nx, L.y - 4 * ny), b = smp(L.x + 4 * nx, L.y + 4 * ny);
+    const double mid = 0.5 * (a + b), half = 0.5 * (b - a), w = kEdgeW[s], d0 = dq / 4.0;
+    for (int yy = L.y - kBlT - 1; yy <= L.y + kBlT + 1; ++yy)
+        for (int xx = L.x - kBlT - 1; xx <= L.x + kBlT + 1; ++xx) {
+            if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+            const double ex = xx - L.x, ey = yy - L.y;
+            const double dt = ex * tx + ey * ty, dn = ex * nx + ey * ny;
+            if (std::abs(dt) > kBlT || std::abs(dn) > kBlN) continue;
+            const double om = (1.0 - std::abs(dt) / (kBlT + 1)) * (std::abs(dn) <= kBlN / 2 ? 1.0 : (kBlN - std::abs(dn)) / (kBlN / 2.0));
+            const double T = mid + half * std::clamp((dn - d0) / w, -1.0, 1.0);
+            const size_t i = static_cast<size_t>(yy) * W + xx;
+            f(i, y[i] + om * (T - y[i]));
+        }
+}
+}  // namespace
+
+void code_band_lines(SymIO& io, CMModel& m, const std::vector<double>& y0, int W, int H, const Plane* org, double off,
+                     double lambda, int bit_depth, std::vector<double>& y1) {
+    y1 = y0;
+    Plane tmp(W, H);
+    for (size_t i = 0; i < y0.size(); ++i) tmp.v[i] = static_cast<int32_t>(std::lround(y0[i] + off));
+    // ぼけた LL 合成画像のエッジは弱いので下限を下げる
+    std::vector<LineSeg> lines = extract_lines(tmp, W, H, bit_depth, 32);
+    int prev = 0;
+    for (const LineSeg& L : lines) {
+        int on = 0, dq = 0, s = 1;
+        if (io.enc && org) {
+            // 線の近傍の SSE (原画との差) を、適用しない場合と各 (dq, s) で比べる
+            double base = 0;
+            band_line_apply(y1, W, H, L, 0, 1, [&](size_t i, double) { const double e = y1[i] + off - org->v[i]; base += e * e; });
+            double best = base - lambda * 7.0;  // 位置・鋭さ・フラグの符号量 (約 7 ビット) に見合う改善だけ採る
+            for (int s2 = 0; s2 < 4; ++s2)
+                for (int d2 = -4; d2 <= 4; ++d2) {
+                    double e2 = 0;
+                    band_line_apply(y1, W, H, L, d2, s2, [&](size_t i, double v) { const double e = v + off - org->v[i]; e2 += e * e; });
+                    if (e2 < best) { best = e2; on = 1; dq = d2; s = s2; }
+                }
+        }
+        on = io.bit(m, 20, static_cast<uint32_t>(prev), 0, on);
+        prev = on;
+        if (!on) continue;
+        dq = io.sint(m, 21, 0, dq);
+        s = static_cast<int>(io.uint(m, 22, 0, static_cast<uint32_t>(s)));
+        if (std::abs(dq) > 8 || s > 3) throw std::runtime_error("corrupt stream: band line");
+        std::vector<std::pair<size_t, double>> upd;
+        band_line_apply(y1, W, H, L, dq, s, [&](size_t i, double v) { upd.push_back({i, v}); });
+        for (const auto& u : upd) y1[u.first] = u.second;
+    }
 }
 
 }  // namespace fvc

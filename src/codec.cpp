@@ -346,7 +346,7 @@ void code_bands_video(SymIO& io, Models& md, const PqmfCfg& pq, const Plane* org
 // 帯域ごとの残差 X_k - P_k を符号化する。帯域ごとに量子化ステップを高域ほど粗くする。
 void code_bands_blocks(SymIO& io, Models& md, const PqmfCfg& pq, const Plane* org, const Plane* P, Plane& rec, double step,
                        double lambda, int32_t lo, int32_t hi, int plane, const Tools& tools, const Search& search,
-                       int min_log2, int max_log2, bool band_ns, uint64_t seed) {
+                       int min_log2, int max_log2, bool band_ns, uint64_t seed, bool top_level) {
     const int Mx = 1 << pq.lx, My = 1 << pq.ly, W = rec.w, H = rec.h, bw = W / Mx, bh = H / My;
     const int BW = (bw + kCtu - 1) / kCtu * kCtu, BH = (bh + kCtu - 1) / kCtu * kCtu;
     Pqmf2D fb(Mx, My, kPqmfFilters[pq.filter].m, kPqmfFilters[pq.filter].beta);
@@ -372,7 +372,9 @@ void code_bands_blocks(SymIO& io, Models& md, const PqmfCfg& pq, const Plane* or
     Plane tp0, chg;                               // LL 帯域の時間方向予測と変化マスク
     // 帯域の超解像 (イントラ): LL だけから合成した画像を、局所範囲に制限した鮮鋭化で「超解像」し、
     // それを再び帯域分解した高域帯域を各高域帯域の予測 (ゲイン 1..5 / 4) に使う
-    const bool band_sr = tools.sr && !P && Mx * My > 1;
+    // 線予測は輝度の最上位の分解だけ (部分木分解の下位では行わない)
+    const bool use_bline = tools.bline && plane == 0 && !P && Mx * My > 1 && top_level;
+    const bool band_sr = (tools.sr || use_bline) && !P && Mx * My > 1;
     std::vector<std::vector<double>> srb;
     for (int ky = 0; ky < My; ++ky)
         for (int kx = 0; kx < Mx; ++kx) {
@@ -436,7 +438,7 @@ void code_bands_blocks(SymIO& io, Models& md, const PqmfCfg& pq, const Plane* or
                 sub.lx = sub.ly = 1;
                 sub.filter = pq.filter;
                 code_bands_blocks(io, md, sub, io.enc ? &llo : nullptr, P ? &llp : nullptr, llr, bstep, lambda, -range, range, plane,
-                                  tools, search, min_log2, max_log2, false, seed * 31 + 7);
+                                  tools, search, min_log2, max_log2, false, seed * 31 + 7, false);
                 for (int y = 0; y < BH; ++y)
                     for (int x = 0; x < BW; ++x) R.at(x, y) = llr.at(std::min(x, bw - 1), std::min(y, bh - 1));
             } else {
@@ -454,19 +456,25 @@ void code_bands_blocks(SymIO& io, Models& md, const PqmfCfg& pq, const Plane* or
                 std::vector<double> y0, y1;
                 fb.synthesize(lb, W, H, y0);
                 y1.resize(y0.size());
-                auto at = [&](int x, int y) { return y0[static_cast<size_t>(std::clamp(y, 0, H - 1)) * W + std::clamp(x, 0, W - 1)]; };
-                for (int y = 0; y < H; ++y)
-                    for (int x = 0; x < W; ++x) {
-                        double bl = 0, mn = 1e300, mx = -1e300;
-                        for (int dy = -1; dy <= 1; ++dy)
-                            for (int dx = -1; dx <= 1; ++dx) {
-                                const double v = at(x + dx, y + dy);
-                                bl += v * ((dx ? 1 : 2) * (dy ? 1 : 2));
-                                mn = std::min(mn, v); mx = std::max(mx, v);
-                            }
-                        const double v0 = at(x, y);
-                        y1[static_cast<size_t>(y) * W + x] = std::clamp(v0 + (v0 - bl / 16.0), mn, mx);
-                    }
+                if (use_bline) {
+                    int bd = 8;
+                    while ((1 << bd) - 1 < hi && bd < 16) ++bd;
+                    code_band_lines(io, md.bline, y0, W, H, org, static_cast<double>(off), lambda, bd, y1);
+                } else {
+                    auto at = [&](int x, int y) { return y0[static_cast<size_t>(std::clamp(y, 0, H - 1)) * W + std::clamp(x, 0, W - 1)]; };
+                    for (int y = 0; y < H; ++y)
+                        for (int x = 0; x < W; ++x) {
+                            double bl = 0, mn = 1e300, mx = -1e300;
+                            for (int dy = -1; dy <= 1; ++dy)
+                                for (int dx = -1; dx <= 1; ++dx) {
+                                    const double v = at(x + dx, y + dy);
+                                    bl += v * ((dx ? 1 : 2) * (dy ? 1 : 2));
+                                    mn = std::min(mn, v); mx = std::max(mx, v);
+                                }
+                            const double v0 = at(x, y);
+                            y1[static_cast<size_t>(y) * W + x] = std::clamp(v0 + (v0 - bl / 16.0), mn, mx);
+                        }
+                }
                 fb.analyze(y1, W, H, srb);
             }
             if (k == 0 && P) {
@@ -1186,7 +1194,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             if (bands && !inter && fp.band_blocks) {
                 const double lam = 0.57 * std::pow(2.0, (pqp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
                 code_bands_blocks(io, md, pqmf_cfg(fp, ll_split), org ? &opad : nullptr, nullptr, R, step, lam, lo, hi, pi, fp.tools,
-                                  fp.search, fp.min_log2, fp.max_log2, false, 0);
+                                  fp.search, fp.min_log2, fp.max_log2, false, 0, true);
                 if (fp.alf) code_alf(io, md.lf, R, org ? &opad : nullptr, pi == 0, info.bit_depth, lam, lo, hi);
                 else if (fp.brest) code_band_restore(io, md.lf, R, org ? &opad : nullptr, pi == 0, step, lam, lo, hi);
             } else if (bands && !inter) {
@@ -1361,7 +1369,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     if (fp.band_blocks)
                         code_bands_blocks(io, md, pqmf_cfg(fp, ll_split), org ? &opad : nullptr, &P, R, step, lambda, lo, hi, pi, fp.tools,
                                           fp.search, fp.min_log2, fp.max_log2, fp.band_ns && allow_ns,
-                                          static_cast<uint64_t>(fp.poc) * 3 + static_cast<uint64_t>(pi));
+                                          static_cast<uint64_t>(fp.poc) * 3 + static_cast<uint64_t>(pi), true);
                     else
                         code_bands_video(io, md, pqmf_cfg(fp), org ? &opad : nullptr, P, R, step, lambda, lo, hi);
                 }
@@ -1579,6 +1587,7 @@ FrameParams params_from(const EncoderConfig& c) {
     t.sr = c.sr >= 0 ? c.sr != 0 : false;
     if (c.safe_intra >= 0) t.safe_intra = c.safe_intra != 0;
     if (c.merge >= 0) t.no_merge = c.merge == 0;
+    if (c.bline >= 0) t.bline = c.bline != 0;
     if (c.brest >= 0) { fp.brest = c.brest != 0; if (fp.brest) fp.alf = false; }
     if (c.guide >= 0) { t.guide = c.guide != 0; if (t.guide) t.cfl = false; }
     if (c.safe & 8) {
@@ -1610,7 +1619,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
     put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u) |
                   (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u) | (fp.tools.firb ? 128u : 0u));
-    put_u8(p, (fp.tools.guide ? 1u : 0u) | (fp.brest ? 2u : 0u));
+    put_u8(p, (fp.tools.guide ? 1u : 0u) | (fp.brest ? 2u : 0u) | (fp.tools.bline ? 8u : 0u));
     put_u8(p, (fp.tools.no_merge ? 1u : 0u) | (fp.no_deblock ? 2u : 0u) | (fp.range_coder ? 4u : 0u) |
                   (fp.tools.no_obmc ? 8u : 0u) | (fp.tools.no_sp ? 16u : 0u) | (fp.tools.line_mv ? 32u : 0u) |
                   (fp.tools.sr ? 64u : 0u) | (fp.tools.safe_intra ? 128u : 0u));
@@ -1653,7 +1662,8 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.tools.gs = (f3 >> 6) & 1;
     fp.tools.firb = (f3 >> 7) & 1;
     const uint32_t f5 = br.u8();
-    if (f5 > 3) return false;
+    if (f5 > 15) return false;
+    fp.tools.bline = (f5 >> 3) & 1;
     fp.tools.guide = f5 & 1;
     fp.brest = (f5 >> 1) & 1;
     const uint32_t f4 = br.u8();
