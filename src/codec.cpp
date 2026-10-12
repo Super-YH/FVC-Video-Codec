@@ -2094,21 +2094,36 @@ int64_t small_mc_sad(const Plane& T, const Plane& R, const Plane* R2 = nullptr) 
                 s += std::abs(T.at(x, y) - P.at(std::clamp(x + dx, 0, P.w - 1), std::clamp(y + dy, 0, P.h - 1)));
         return s;
     };
+    // 縮小画素 ±16 (原寸 ±64) を歩幅 8, 4, 2, 1 の降下で探す。左のブロックの動きも開始点にする
+    int lmx = 0, lmy = 0;
     auto best_mv = [&](const Plane& P, int x0, int y0, int& bx, int& by) {
         bx = by = 0;
         int64_t b = bsad(P, x0, y0, 0, 0);
-        for (int st : {2, 1})
+        if (lmx || lmy) { const int64_t s = bsad(P, x0, y0, lmx, lmy); if (s < b) { b = s; bx = lmx; by = lmy; } }
+        for (int st : {8, 4, 2, 1})
             for (bool moved = true; moved;) {
                 moved = false;
                 const int ox = bx, oy = by;
-                for (const auto& d : {std::pair<int, int>{st, 0}, {-st, 0}, {0, st}, {0, -st}}) {
+                for (const auto& d : {std::pair<int, int>{st, 0}, {-st, 0}, {0, st}, {0, -st}, {st, st}, {-st, -st}, {st, -st}, {-st, st}}) {
                     const int nx = ox + d.first, ny = oy + d.second;
-                    if (std::abs(nx) > 4 || std::abs(ny) > 4) continue;
+                    if (std::abs(nx) > 16 || std::abs(ny) > 16) continue;
                     const int64_t s = bsad(P, x0, y0, nx, ny);
                     if (s < b) { b = s; bx = nx; by = ny; moved = true; }
                 }
             }
         return b;
+    };
+    // イントラ費用の目安 (ブロック平均からの絶対差)。動き補償がこれより悪いブロックはイントラで符号化されるとみなす
+    auto bintra = [&](int x0, int y0) {
+        int64_t s = 0;
+        int n = 0;
+        for (int y = y0; y < std::min(y0 + 8, T.h); ++y)
+            for (int x = x0; x < std::min(x0 + 8, T.w); ++x) { s += T.at(x, y); ++n; }
+        const int m = static_cast<int>(s / std::max(1, n));
+        int64_t e = 0;
+        for (int y = y0; y < std::min(y0 + 8, T.h); ++y)
+            for (int x = x0; x < std::min(x0 + 8, T.w); ++x) e += std::abs(T.at(x, y) - m);
+        return e * 2;  // イントラは残差が大きく符号量も多い
     };
     for (int y0 = 0; y0 < T.h; y0 += 8)
         for (int x0 = 0; x0 < T.w; x0 += 8) {
@@ -2125,7 +2140,8 @@ int64_t small_mc_sad(const Plane& T, const Plane& R, const Plane* R2 = nullptr) 
                     }
                 b = std::min({b, b2, bi});
             }
-            tot += b;
+            lmx = ax; lmy = ay;
+            tot += std::min(b, bintra(x0, y0));
         }
     return tot;
 }
@@ -2224,13 +2240,16 @@ std::vector<uint8_t> Encoder::flush_adaptive(bool final) {
             memo[g] = c;
             return c;
         };
-        AdamState<1> st;
-        st.m[0] = gop_m_; st.v[0] = gop_v_; st.valid = gop_v_ > 0;
-        auto f = [&](const std::array<int, 1>& v) { return cost(v[0]); };
-        const std::array<int, 1> starts[3] = {{std::clamp(last_gop_, 1, gmax)}, {std::min(8, gmax)}, {gmax}};
-        int g = lattice_adam<1>(f, starts, 3, {1}, {gmax}, 3.0, &st, &st, static_cast<uint64_t>(pend_[0].first), 10)[0];
-        gop_m_ = st.m[0]; gop_v_ = st.v[0];
-        if (!final && g == gmax && cut < 0) g = gmax;  // 先読みが足りない場合も最大長で進める
+        // GOP 長の候補は {4, 8, 16} (場面転換・先読みの長さで制限)。既定の 8 から変えるのは、費用が 1 割以上下がるときだけ
+        int g = std::min(8, gmax);
+        const double c8 = cost(g);
+        double bcost = c8;
+        for (int cand : {4, 16}) {
+            const int gc = std::min(cand, gmax);
+            if (gc == g) continue;
+            const double cc = cost(gc);
+            if (cc < bcost && cc < 0.9 * c8) { bcost = cc; g = gc; }
+        }
         last_gop_ = g;
         std::vector<std::pair<int, Frame>> v(pend_.begin(), pend_.begin() + g);
         anchor_small_ = pend_small_[g - 1];
