@@ -214,7 +214,7 @@ void deblock_plane(Plane& p, const EdgeInfo& e, const MotionField* mf, bool chro
 // 並列に処理し、各区間ではブロック行を 1 つずつ前進させながら計算する (フレーム全体の係数を保持しない: メモリ帯域の削減)
 void freq_gain_filter_multi(const Plane& in, Plane* outs, const int* mqs, int nm, double step, int32_t lo, int32_t hi,
                             int strip_step = 1) {
-    constexpr int N = 8, hop = 4;
+    static constexpr int N = 8, hop = 4;
     constexpr double kPi = 3.14159265358979323846;
     double w[N];
     for (int n = 0; n < N; ++n) w[n] = std::sin(kPi * (n + 0.5) / N);
@@ -484,7 +484,7 @@ inline int br_band(int u, int v) {
 template <class F>
 void br_apply(const Plane& in, Plane& out, int ncls, double sigma2, F&& gain, int32_t lo, int32_t hi,
               std::vector<double>* num = nullptr, std::vector<double>* den = nullptr, const Plane* org = nullptr) {
-    constexpr int N = 8, hop = 4;
+    static constexpr int N = 8, hop = 4;
     constexpr double kPi = 3.14159265358979323846;
     double w[N];
     for (int n = 0; n < N; ++n) w[n] = std::sin(kPi * (n + 0.5) / N);

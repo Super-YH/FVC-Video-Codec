@@ -908,7 +908,7 @@ void coarse_motion(const Plane& cur, const Plane& ref, int w, int h, std::vector
     const std::vector<int32_t> a = down(cur), b = down(ref);
     gw = (w + 15) / 16; gh = (h + 15) / 16;
     out.assign(static_cast<size_t>(gw) * gh * 2, 0);
-    constexpr int R = 24;  // 縮小画素 (原寸 ±96)
+    static constexpr int R = 24;  // 縮小画素 (原寸 ±96)
     // 窓はセル (縮小 4x4) を中心に縮小 8x8 (原寸 32x32): 平坦な領域でもエッジを含みやすくする
     auto sad = [&](int bx, int by, int dx, int dy, int64_t bound) {
         int64_t s = 0;
@@ -2323,7 +2323,7 @@ static Frame temporal_filter(const Frame& t, const std::vector<const Frame*>& nb
     const double sigma = std::max(0.5, acc * std::sqrt(3.14159265358979 / 2.0) / (6.0 * (W - 2) * (H - 2)));
     const double s2 = sigma * sigma;
     const double ks = strength / 2.0;  // 1: 0.5, 2: 1.0, 3: 1.5
-    constexpr int B = 8, R = 12;
+    static constexpr int B = 8, R = 12;
     const int cs = info.chroma == ChromaFormat::C420 ? 1 : 0;
     const int bw = (W + B - 1) / B, bh = (H + B - 1) / B;
     std::vector<int> mvx(nb.size() * bw * bh), mvy(nb.size() * bw * bh);

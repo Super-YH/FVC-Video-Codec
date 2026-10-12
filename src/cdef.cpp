@@ -68,7 +68,7 @@ void filter_block(const Plane& src, int32_t* dst, int ds, int x0, int y0, int di
     }
     const int pt0 = (ps & 1) ? 3 : 4, pt1 = (ps & 1) ? 3 : 2;
     // 12x12 の窓 (境界はクランプ) に取り出し、内側のループからクランプと ilog2 を除く
-    constexpr int B = 12, O = 2;
+    static constexpr int B = 12, O = 2;
     int32_t win[B * B];
     for (int y = 0; y < B; ++y) {
         const int sy = std::clamp(y0 + y - O, 0, src.h - 1);
