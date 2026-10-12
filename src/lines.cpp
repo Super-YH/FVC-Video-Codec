@@ -264,6 +264,36 @@ void band_line_apply(const std::vector<double>& y, int W, int H, const LineSeg& 
 }
 }  // namespace
 
+void edge_sharpen_block(int32_t* pred, int s, int sh, int dq, int32_t lo, int32_t hi, int bit_depth) {
+    std::vector<double> y(static_cast<size_t>(s) * s);
+    for (int i = 0; i < s * s; ++i) y[i] = pred[i];
+    Plane tmp(s, s);
+    for (int i = 0; i < s * s; ++i) tmp.v[i] = pred[i];
+    // 8x8 区画ごとに最強エッジを 1 本 (ブロック内だけで完結、端 1 画素は除く)
+    const int32_t thr = 64 << std::max(0, bit_depth - 8);
+    auto at = [&](int x, int yy) { return tmp.at(std::clamp(x, 0, s - 1), std::clamp(yy, 0, s - 1)); };
+    std::vector<LineSeg> lines;
+    for (int cy = 0; cy < s; cy += 8)
+        for (int cx = 0; cx < s; cx += 8) {
+            LineSeg best;
+            int32_t bm = thr - 1;
+            for (int yy = cy + 1; yy < std::min(cy + 7, s - 1); ++yy)
+                for (int x = cx + 1; x < std::min(cx + 7, s - 1); ++x) {
+                    const int32_t gx = (at(x + 1, yy - 1) + 2 * at(x + 1, yy) + at(x + 1, yy + 1)) - (at(x - 1, yy - 1) + 2 * at(x - 1, yy) + at(x - 1, yy + 1));
+                    const int32_t gy = (at(x - 1, yy + 1) + 2 * at(x, yy + 1) + at(x + 1, yy + 1)) - (at(x - 1, yy - 1) + 2 * at(x, yy - 1) + at(x + 1, yy - 1));
+                    const int32_t mg = std::abs(gx) + std::abs(gy);
+                    if (mg > bm) { bm = mg; best.x = x; best.y = yy; best.gx = gx; best.gy = gy; }
+                }
+            if (bm >= thr) lines.push_back(best);
+        }
+    for (const LineSeg& L : lines) {
+        std::vector<std::pair<size_t, double>> upd;
+        band_line_apply(y, s, s, L, dq, sh, [&](size_t i, double v) { upd.push_back({i, v}); });
+        for (const auto& u : upd) y[u.first] = u.second;
+    }
+    for (int i = 0; i < s * s; ++i) pred[i] = std::clamp(static_cast<int32_t>(std::lround(y[i])), lo, hi);
+}
+
 void code_band_lines(SymIO& io, CMModel& m, const std::vector<double>& y0, int W, int H, const Plane* org, double off,
                      double lambda, int bit_depth, std::vector<double>& y1) {
     y1 = y0;

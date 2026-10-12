@@ -1,4 +1,5 @@
 #include "block_coder.hpp"
+#include "lines.hpp"
 
 #include <algorithm>
 #include <array>
@@ -696,6 +697,11 @@ bool BlockCoder::dict_best_atom(int x0, int y0, int s, const int32_t* pred, int&
 
 void BlockCoder::predict(const Leaf& lf, int x0, int y0, int l, int32_t* pred) const {
     predict_base(lf, x0, y0, l, pred);
+    if (lf.edge) {
+        int bd = 8;
+        while ((1 << bd) - 1 < hi_ && bd < 16) ++bd;
+        edge_sharpen_block(pred, 1 << l, (lf.edge - 1) / 9, (lf.edge - 1) % 9 - 4, lo_, hi_, bd);
+    }
     if (lf.dres >= 0 && dict_) {
         const int s = 1 << l;
         const auto& d = dict_atom(lf.dres, s);
@@ -1571,6 +1577,7 @@ double BlockCoder::leaf_bits(const Leaf& lf, int x0, int y0, int l) const {
             b += (lf.mode == m0 || lf.mode == m1) ? 2.0 : 3.0;
         }
     }
+    if (tools_.edge && (1 << l) >= 8) b += lf.edge ? 5.0 : 0.3;
     if (lf.last < 0) return b;
     if (tools_.e8) b += 1.0;
     if (lf.tns_on) b += 2.0 + 4.0 * lf.tns.order;
@@ -1910,6 +1917,44 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             for (int sm = 1; sm <= 2; ++sm) eval_sr(ci, sm);
         }
     }
+    // エッジモード: 1 段目の上位候補に、予測誤差が最小の (鋭さ, 位置補正) のエッジを加えた変種を試す
+    if (tools_.edge && s >= 8 && !tools_.pred_only) {
+        std::vector<std::pair<double, size_t>> srt = j1;
+        std::sort(srt.begin(), srt.end());
+        const size_t top = std::min<size_t>(srt.size(), static_cast<size_t>(std::max(1, search_.refine_top)));
+        int bd = 8;
+        while ((1 << bd) - 1 < hi_ && bd < 16) ++bd;
+        for (size_t t = 0; t < top; ++t) {
+            const size_t ci = srt[t].second;
+            if (cands[ci].pt == 3 || cands[ci].dres >= 0 || cands[ci].edge) continue;
+            auto pse = [&](const int32_t* p) {
+                double e = 0;
+                for (int y = 0; y < s; ++y)
+                    for (int x = 0; x < s; ++x) { const double d = org_->at(x0 + x, y0 + y) - p[y * s + x]; e += d * d; }
+                return e;
+            };
+            double be = pse(preds[ci].data()) - lambda_ * 6.0;
+            int bed = 0;
+            std::vector<int32_t> tp(static_cast<size_t>(n));
+            for (int sh = 0; sh < 4; ++sh)
+                for (int dq = -4; dq <= 4; dq += 2) {
+                    std::copy(preds[ci].begin(), preds[ci].end(), tp.begin());
+                    edge_sharpen_block(tp.data(), s, sh, dq, lo_, hi_, bd);
+                    const double e = pse(tp.data());
+                    if (e < be) { be = e; bed = 1 + sh * 9 + dq + 4; }
+                }
+            if (!bed) continue;
+            Leaf v = cands[ci];
+            v.edge = bed;
+            std::vector<int32_t> pv(static_cast<size_t>(n));
+            predict(v, x0, y0, l, pv.data());
+            cands.push_back(v);
+            preds.push_back(std::move(pv));
+            double jb = 1e300;
+            for (int tn = 0; tn <= ntn; ++tn) jb = std::min(jb, eval(cands.size() - 1, 0, 0, tn));
+            j1.push_back({jb, cands.size() - 1});
+        }
+    }
     // 残差の辞書原子: 1 段目の上位候補に、残差に最も合う原子を加えた変種を追加して評価
     if (tools_.dict && !tools_.pred_only) {
         std::vector<std::pair<double, size_t>> srt = j1;
@@ -2158,6 +2203,20 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
         }
     } else {
         lf.dres = -1; lf.dres_g = 0;
+    }
+    // エッジモード (辞書の葉以外の 8x8 以上)
+    if (tools_.edge && s >= 8 && lf.pt != 3 && lf.dres < 0) {
+        const int on = io.bit(md.mode, 100, L, static_cast<uint32_t>(lf.pt), lf.edge != 0);
+        if (on) {
+            const int sh = static_cast<int>(io.uint(md.mode, 101, L, static_cast<uint32_t>(std::max(lf.edge - 1, 0) / 9)));
+            const int dq = io.sint(md.mode, 102, L, lf.edge ? (lf.edge - 1) % 9 - 4 : 0);
+            if (sh > 3 || std::abs(dq) > 4) throw std::runtime_error("corrupt stream: edge mode");
+            lf.edge = 1 + sh * 9 + dq + 4;
+        } else {
+            lf.edge = 0;
+        }
+    } else {
+        lf.edge = 0;
     }
     const uint32_t cbc = cb_ctx(x0, y0, s);
     const bool dict_leaf = lf.pt == 3 || lf.dres >= 0;  // 辞書の葉はパラメトリックのみ (残差なし、cbf を送らない)

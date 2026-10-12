@@ -34,6 +34,10 @@ std::vector<LineSeg> extract_lines(const Plane& ref, int vw, int vh, int bit_dep
 // 帯域画像の線予測 (静止画の帯域方式): LL だけから合成した画像 y0 (W x H, 値 - off) の線を、線ごとに
 // 「位置の補正 (1/4 画素) と鋭さ」を伝送した理想エッジで置き換えた画像 y1 を作る。y1 を帯域分解した高域を
 // 高域帯域の予測に使う。線は y0 から両側で抽出するので形は送らない
+// ブロックのエッジモード: 予測ブロック pred (s x s) の中の線 (8x8 区画ごとの最強エッジ) を、鋭さ sh (0..3) と
+// 位置補正 dq/4 画素の理想エッジで置き換える。線は予測そのものから抽出するので形は送らない
+void edge_sharpen_block(int32_t* pred, int s, int sh, int dq, int32_t lo, int32_t hi, int bit_depth);
+
 void code_band_lines(SymIO& io, CMModel& m, const std::vector<double>& y0, int W, int H, const Plane* org, double off,
                      double lambda, int bit_depth, std::vector<double>& y1);
 // 符号器: 線ごとの動きを推定し、変わったかを RD で決める

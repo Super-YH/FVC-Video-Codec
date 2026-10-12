@@ -1588,6 +1588,7 @@ FrameParams params_from(const EncoderConfig& c) {
     if (c.safe_intra >= 0) t.safe_intra = c.safe_intra != 0;
     if (c.merge >= 0) t.no_merge = c.merge == 0;
     if (c.bline >= 0) t.bline = c.bline != 0;
+    if (c.edge >= 0) t.edge = c.edge != 0;
     if (c.brest >= 0) { fp.brest = c.brest != 0; if (fp.brest) fp.alf = false; }
     if (c.guide >= 0) { t.guide = c.guide != 0; if (t.guide) t.cfl = false; }
     if (c.safe & 8) {
@@ -1619,7 +1620,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
     put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u) |
                   (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u) | (fp.tools.firb ? 128u : 0u));
-    put_u8(p, (fp.tools.guide ? 1u : 0u) | (fp.brest ? 2u : 0u) | (fp.tools.bline ? 8u : 0u));
+    put_u8(p, (fp.tools.guide ? 1u : 0u) | (fp.brest ? 2u : 0u) | (fp.tools.bline ? 8u : 0u) | (fp.tools.edge ? 16u : 0u));
     put_u8(p, (fp.tools.no_merge ? 1u : 0u) | (fp.no_deblock ? 2u : 0u) | (fp.range_coder ? 4u : 0u) |
                   (fp.tools.no_obmc ? 8u : 0u) | (fp.tools.no_sp ? 16u : 0u) | (fp.tools.line_mv ? 32u : 0u) |
                   (fp.tools.sr ? 64u : 0u) | (fp.tools.safe_intra ? 128u : 0u));
@@ -1662,7 +1663,8 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.tools.gs = (f3 >> 6) & 1;
     fp.tools.firb = (f3 >> 7) & 1;
     const uint32_t f5 = br.u8();
-    if (f5 > 15) return false;
+    if (f5 > 31) return false;
+    fp.tools.edge = (f5 >> 4) & 1;
     fp.tools.bline = (f5 >> 3) & 1;
     fp.tools.guide = f5 & 1;
     fp.brest = (f5 >> 1) & 1;

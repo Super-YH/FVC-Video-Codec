@@ -211,6 +211,7 @@ static void test_codec() {
         {"line-sr", true, false, 0, 28, Preset::Slow, 7, 1, 0, false, 1},
         {"pqmf-sr", true, false, 2, 26, Preset::Medium, 2, 0, 0, false},
         {"pqmf-bline", true, false, 1, 24, Preset::Medium, 1, 0, 0, false},
+        {"edge-PB", true, false, 0, 30, Preset::Medium, 5, 1, 0, false},
     };
     for (const Case& c : cases) {
         EncoderConfig cfg;
@@ -219,6 +220,7 @@ static void test_codec() {
         if (std::string(c.name) == "ssim-target") cfg.target_ssim = 0.97;
         if (std::string(c.name).find("sr") != std::string::npos) cfg.sr = 1;
         if (std::string(c.name) == "pqmf-bline") cfg.bline = 1;
+        if (std::string(c.name) == "edge-PB") cfg.edge = 1;
         Encoder enc(info, cfg);
         auto s = enc.sequence_header();
         std::vector<Frame> src;
