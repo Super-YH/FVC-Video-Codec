@@ -1,4 +1,5 @@
 #include "block_coder.hpp"
+#include "prof.hpp"
 #include "lines.hpp"
 
 #include <algorithm>
@@ -925,22 +926,45 @@ void BlockCoder::mv_pred(int x0, int y0, int list, int ref, int& px, int& py) co
 }
 
 int64_t BlockCoder::me_cost(int x0, int y0, int w, int h, const MotionInfo& mi) const {
-    if (search_.approx_subpel && mi.psi == 0 && (mi.dir == 1 || mi.dir == 2)) {
-        // 探索用近似: 1/4 画素位置を双線形補間で評価 (8 タップより大幅に軽い)
-        const int l = mi.dir == 2 ? 1 : 0;
-        const RefPlane& rp = (l ? inter_.l1 : inter_.l0)[mi.ref[l]];
-        const Plane& p = *rp.p;
-        const int ix = mi.mvx[l] >> 2, iy = mi.mvy[l] >> 2, fx = mi.mvx[l] & 3, fy = mi.mvy[l] & 3;
-        const int w00 = (4 - fx) * (4 - fy), w10 = fx * (4 - fy), w01 = (4 - fx) * fy, w11 = fx * fy;
+    if (search_.approx_subpel && mi.psi == 0 && mi.dir >= 1 && mi.dir <= 3) {
+        // 探索用近似: 1/4 画素位置を双線形補間で評価 (8 タップより大幅に軽い)。双予測は 2 つの平均
+        thread_local std::vector<int32_t> acc;
+        acc.resize(static_cast<size_t>(w) * h);
+        int nl = 0;
+        for (int l = 0; l < 2; ++l) {
+            if (!((mi.dir >> l) & 1)) continue;
+            const RefPlane& rp = (l ? inter_.l1 : inter_.l0)[mi.ref[l]];
+            const Plane& p = *rp.p;
+            const int ix = mi.mvx[l] >> 2, iy = mi.mvy[l] >> 2, fx = mi.mvx[l] & 3, fy = mi.mvy[l] & 3;
+            const int w00 = (4 - fx) * (4 - fy), w10 = fx * (4 - fy), w01 = (4 - fx) * fy, w11 = fx * fy;
+            const bool inside = x0 + ix >= 0 && y0 + iy >= 0 && x0 + ix + w + 1 <= p.w && y0 + iy + h + 1 <= p.h;
+            for (int y = 0; y < h; ++y) {
+                int32_t* o = &acc[static_cast<size_t>(y) * w];
+                if (inside) {
+                    const int32_t* r0 = &p.v[static_cast<size_t>(y0 + y + iy) * p.w + x0 + ix];
+                    const int32_t* r1 = r0 + p.w;
+                    for (int x = 0; x < w; ++x) {
+                        int32_t v = (w00 * r0[x] + w10 * r0[x + 1] + w01 * r1[x] + w11 * r1[x + 1] + 8) >> 4;
+                        v = ((v * rp.gain_q + 32) >> 6) + rp.off;
+                        o[x] = nl ? (o[x] + v + 1) >> 1 : v;
+                    }
+                } else {
+                    const int ry0 = std::clamp(y0 + y + iy, 0, p.h - 1), ry1 = std::clamp(y0 + y + iy + 1, 0, p.h - 1);
+                    for (int x = 0; x < w; ++x) {
+                        const int rx0 = std::clamp(x0 + x + ix, 0, p.w - 1), rx1 = std::clamp(x0 + x + ix + 1, 0, p.w - 1);
+                        int32_t v = (w00 * p.at(rx0, ry0) + w10 * p.at(rx1, ry0) + w01 * p.at(rx0, ry1) + w11 * p.at(rx1, ry1) + 8) >> 4;
+                        v = ((v * rp.gain_q + 32) >> 6) + rp.off;
+                        o[x] = nl ? (o[x] + v + 1) >> 1 : v;
+                    }
+                }
+            }
+            ++nl;
+        }
         int64_t sad = 0;
         for (int y = 0; y < h; ++y) {
-            const int ry0 = std::clamp(y0 + y + iy, 0, p.h - 1), ry1 = std::clamp(y0 + y + iy + 1, 0, p.h - 1);
-            for (int x = 0; x < w; ++x) {
-                const int rx0 = std::clamp(x0 + x + ix, 0, p.w - 1), rx1 = std::clamp(x0 + x + ix + 1, 0, p.w - 1);
-                int32_t v = (w00 * p.at(rx0, ry0) + w10 * p.at(rx1, ry0) + w01 * p.at(rx0, ry1) + w11 * p.at(rx1, ry1) + 8) >> 4;
-                v = ((v * rp.gain_q + 32) >> 6) + rp.off;
-                sad += std::abs(org_->at(x0 + x, y0 + y) - v);
-            }
+            const int32_t* og = &org_->v[static_cast<size_t>(y0 + y) * org_->w + x0];
+            const int32_t* o = &acc[static_cast<size_t>(y) * w];
+            for (int x = 0; x < w; ++x) sad += std::abs(og[x] - o[x]);
         }
         return sad;
     }
@@ -971,10 +995,16 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
             // 整数探索 (SAD、参照はクランプ)
             auto isad = [&](int ix, int iy, int64_t bound) {
                 int64_t sad = 0;
+                const bool inside = x0 + ix >= 0 && y0 + iy >= 0 && x0 + ix + w <= rp.w && y0 + iy + h <= rp.h;
                 for (int y = 0; y < h && sad < bound; ++y) {
-                    const int ry = std::clamp(y0 + y + iy, 0, rp.h - 1);
-                    for (int x = 0; x < w; ++x)
-                        sad += std::abs(org_->at(x0 + x, y0 + y) - rp.at(std::clamp(x0 + x + ix, 0, rp.w - 1), ry));
+                    const int32_t* og = &org_->v[static_cast<size_t>(y0 + y) * org_->w + x0];
+                    if (inside) {
+                        const int32_t* r = &rp.v[static_cast<size_t>(y0 + y + iy) * rp.w + x0 + ix];
+                        for (int x = 0; x < w; ++x) sad += std::abs(og[x] - r[x]);
+                    } else {
+                        const int ry = std::clamp(y0 + y + iy, 0, rp.h - 1);
+                        for (int x = 0; x < w; ++x) sad += std::abs(og[x] - rp.at(std::clamp(x0 + x + ix, 0, rp.w - 1), ry));
+                    }
                 }
                 return sad;
             };
@@ -1105,8 +1135,8 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
         lf.mi.mvx[1] = best_uni[1].mvx[1];
         lf.mi.mvy[1] = best_uni[1].mvy[1];
         cands.push_back(lf);
-        // 双予測の反復精密化: 一方のリストを固定し、他方を双予測の誤差 (SAD) で 1, 1/2, 1/4 画素の
-        // 8 近傍探索する。これを交互に 2 回。片方向の最良の組合せより良い双予測が見つかる
+        // 双予測の精密化: 2 つの動き (4 変数, 1/4 画素) を同時に SPSA-Adam で最適化する
+        // (一方を固定して他方を 8 近傍探索する交互反復の代わり)。仕上げに各変数の ±1 を確認する
         auto bibits = [&](const MotionInfo& m) {
             double b = 0;
             for (int l = 0; l < 2; ++l) {
@@ -1117,26 +1147,32 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
             return b;
         };
         MotionInfo bm = lf.mi;
-        double bcost = static_cast<double>(me_cost(x0, y0, w, h, bm)) + lsad * bibits(bm);
         const MotionInfo start = bm;
-        for (int it = 0; it < 2; ++it)
-            for (int l = 1; l >= 0; --l)
-                for (int st = 4; st >= 1; st >>= 1) {
-                    bool moved = true;
-                    for (int rep = 0; rep < 4 && moved; ++rep) {
-                        moved = false;
-                        const MotionInfo c0 = bm;
-                        for (int dy = -st; dy <= st; dy += st)
-                            for (int dx = -st; dx <= st; dx += st) {
-                                if (!dx && !dy) continue;
-                                MotionInfo t = c0;
-                                t.mvx[l] = static_cast<int16_t>(c0.mvx[l] + dx);
-                                t.mvy[l] = static_cast<int16_t>(c0.mvy[l] + dy);
-                                const double c = static_cast<double>(me_cost(x0, y0, w, h, t)) + lsad * bibits(t);
-                                if (c < bcost) { bcost = c; bm = t; moved = true; }
-                            }
-                    }
-                }
+        auto to_mi = [&](const std::array<int, 4>& v) {
+            MotionInfo t = start;
+            t.mvx[0] = static_cast<int16_t>(v[0]); t.mvy[0] = static_cast<int16_t>(v[1]);
+            t.mvx[1] = static_cast<int16_t>(v[2]); t.mvy[1] = static_cast<int16_t>(v[3]);
+            return t;
+        };
+        double bcost = 1e300;
+        auto f = [&](const std::array<int, 4>& v) {
+            const MotionInfo t = to_mi(v);
+            const double c = static_cast<double>(me_cost(x0, y0, w, h, t)) + lsad * bibits(t);
+            if (c < bcost) { bcost = c; bm = t; }
+            return c;
+        };
+        const std::array<int, 4> v0{start.mvx[0], start.mvy[0], start.mvx[1], start.mvy[1]};
+        std::array<int, 4> lo4, hi4;
+        for (int i = 0; i < 4; ++i) { lo4[i] = v0[i] - 8; hi4[i] = v0[i] + 8; }
+        lattice_adam<4>(f, &v0, 1, lo4, hi4, 2.0, &bi_adam_, &bi_adam_,
+                        static_cast<uint64_t>(x0) * 17 + static_cast<uint64_t>(y0) * 5 + 3, 12);
+        const std::array<int, 4> vb{bm.mvx[0], bm.mvy[0], bm.mvx[1], bm.mvy[1]};
+        for (int i = 0; i < 4; ++i)
+            for (int d : {-1, 1}) {
+                std::array<int, 4> v = vb;
+                v[i] += d;
+                f(v);
+            }
         if (!(bm == start)) { Leaf l2 = lf; l2.mi = bm; cands.push_back(l2); }
     }
 }
@@ -1723,6 +1759,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     // 候補生成: 予測 SAD で絞り込み
     std::vector<Leaf> cands;
     {
+        FVC_PROF("rd_intra_sad");
         std::vector<std::pair<int64_t, int>> sads;
         std::vector<int> modes;
         if (tools_.all_angular) for (int m = 0; m < kNumIntra; ++m) { if (m != kModeCfl && !(tools_.no_sp && m >= kModeSmooth)) modes.push_back(m); }
@@ -1803,6 +1840,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         if (inter_.enabled) {
             if (is_luma()) {
                 const size_t c0 = cands.size();
+                FVC_PROF("rd_motion");
                 motion_search(x0, y0, s, s, cands);
                 // FIR 動き基底: 各インター候補 (2Nx2N) に最小二乗の ψ を付けた変種を追加
                 if (tools_.firb && s >= 16) {
@@ -1860,6 +1898,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     // 候補ごとの予測を一度だけ計算して以降で再利用
     std::vector<std::vector<int32_t>> preds(cands.size());
     for (size_t i = 0; i < cands.size(); ++i) {
+        FVC_PROF("rd_preds");
         preds[i].resize(static_cast<size_t>(n));
         predict(cands[i], x0, y0, l, preds[i].data());
     }
@@ -1889,6 +1928,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     // 逐次半減 (Successive Halving / median stopping): 安価な指標 (SATD + λ·ビット推定) で並べ、最良の
     // prune_ratio 倍以内の候補 (最低 3 個) だけを本評価する (固定の上位 K より品質を保ちやすい)
     if (search_.prune_ratio > 0 && cands.size() > 3) {
+        FVC_PROF("rd_rank");
         std::vector<std::pair<double, size_t>> rank;
         std::vector<int32_t> res(static_cast<size_t>(n));
         const double lsad = std::sqrt(lambda_);
@@ -1991,6 +2031,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     const int ntn = tools_.tns && search_.try_tns && s >= 8 ? 1 : 0;
     std::vector<std::pair<double, size_t>> j1;
     for (size_t ci = 0; ci < cands.size(); ++ci) {
+        FVC_PROF("rd_eval1");
         double jb = 1e300;
         for (int tn = 0; tn <= ntn; ++tn) jb = std::min(jb, eval(ci, 0, 0, tn));
         j1.push_back({jb, ci});
@@ -2077,6 +2118,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     const int nmts = (tools_.mts && search_.try_mts && is_luma() && s <= 32) ? (s <= 16 ? 9 : 5) : 1;
     const bool try_e8 = tools_.e8 && search_.try_e8, try_gs = tools_.gs && md_ && !tools_.pred_only;
     if ((nmts > 1 || try_e8 || try_gs) && bandit_[3][l].should_try()) {
+        FVC_PROF("rd_refine");
         const double b0 = best;
         std::sort(j1.begin(), j1.end());
         const size_t top = std::min<size_t>(j1.size(), static_cast<size_t>(std::max(1, search_.refine_top)));
@@ -2620,6 +2662,7 @@ void BlockCoder::enable_aqp(int base_qp, int bit_depth, int (*fn)(void*, int, in
 }
 
 void BlockCoder::code_ctu(SymIO& io, Models& md, int cx, int cy, int ctu) {
+    FVC_PROF("code_ctu");
     cx_ = cx; cy_ = cy; ctu_ = ctu;
     md_ = &md;
     if (aqp_) {
