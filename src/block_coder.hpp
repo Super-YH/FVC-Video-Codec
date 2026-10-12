@@ -309,6 +309,8 @@ private:
     mutable AdamState<2> me_adam_[2], sub_adam_[2];
     mutable AdamState<1> intra_adam_;
     mutable AdamState<2> edge_adam_;
+    // 道具ごと・ブロックサイズごとの Adam バンディット (0: 超解像, 1: エッジ, 2: 残差原子, 3: 変換/量子化の精密化)
+    mutable ToolBandit bandit_[4][8];
     // 線の動き場: 輝度位置 (x, y) の動き (L0 先頭参照)
     MotionInfo line_mi(int x, int y) const {
         MotionInfo m;

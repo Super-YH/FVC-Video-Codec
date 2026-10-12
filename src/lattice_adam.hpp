@@ -145,4 +145,23 @@ std::array<int, D> lattice_adam(F&& f, const std::array<int, D>* starts, int n, 
     return x;
 }
 
+// ツールの Adam バンディット (符号器のみ): 任意ツール (エッジ・超解像・残差原子・変換/量子化の精密化) を
+// ブロックで試したときの RD の相対改善 g = (J_before − J_after) / J_before について、Adam と同じ指数移動の
+// 1 次・2 次モーメント (m, v) を持つ。m + √v (楽観的な上側推定) が閾値を下回る道具は試さない
+// (ただし 8 ブロックに 1 回は探索として試す、最初の 16 回は必ず試す)
+struct ToolBandit {
+    double m = 0, v = 0;
+    int n = 0, k = 0;
+    bool should_try() {
+        ++k;
+        if (n < 16 || (k & 7) == 0) return true;
+        return m + std::sqrt(v) > 0.002;
+    }
+    void update(double g) {
+        ++n;
+        m = 0.9 * m + 0.1 * g;
+        v = 0.95 * v + 0.05 * (g - m) * (g - m);
+    }
+};
+
 }  // namespace fvc

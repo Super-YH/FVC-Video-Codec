@@ -1968,7 +1968,8 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         j1.push_back({jb, ci});
     }
     // 超解像: 1 段目の上位候補に、残差を 1/2 解像度で符号化する変種を試す
-    if (tools_.sr && s >= 8 && s <= 64 && !tools_.pred_only) {
+    if (tools_.sr && s >= 8 && s <= 64 && !tools_.pred_only && bandit_[0][l].should_try()) {
+        const double b0 = best;
         std::vector<std::pair<double, size_t>> srt = j1;
         std::sort(srt.begin(), srt.end());
         const size_t top = std::min<size_t>(srt.size(), static_cast<size_t>(std::max(1, search_.refine_top)));
@@ -1977,9 +1978,11 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             if (cands[ci].pt == 3 || cands[ci].dres >= 0) continue;
             for (int sm = 1; sm <= 2; ++sm) eval_sr(ci, sm);
         }
+        bandit_[0][l].update(b0 > 0 ? (b0 - best) / b0 : 0.0);
     }
     // エッジモード: 1 段目の上位候補に、予測誤差が最小の (鋭さ, 位置補正) のエッジを加えた変種を試す
-    if (tools_.edge && s >= 8 && !tools_.pred_only) {
+    if (tools_.edge && s >= 8 && !tools_.pred_only && bandit_[1][l].should_try()) {
+        const double b0 = best;
         std::vector<std::pair<double, size_t>> srt = j1;
         std::sort(srt.begin(), srt.end());
         const size_t top = std::min<size_t>(srt.size(), static_cast<size_t>(std::max(1, search_.refine_top)));
@@ -2018,9 +2021,11 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             for (int tn = 0; tn <= ntn; ++tn) jb = std::min(jb, eval(cands.size() - 1, 0, 0, tn));
             j1.push_back({jb, cands.size() - 1});
         }
+        bandit_[1][l].update(b0 > 0 ? (b0 - best) / b0 : 0.0);
     }
     // 残差の辞書原子: 1 段目の上位候補に、残差に最も合う原子を加えた変種を追加して評価
-    if (tools_.dict && !tools_.pred_only) {
+    if (tools_.dict && !tools_.pred_only && bandit_[2][l].should_try()) {
+        const double b0 = best;
         std::vector<std::pair<double, size_t>> srt = j1;
         std::sort(srt.begin(), srt.end());
         const size_t top = std::min<size_t>(srt.size(), static_cast<size_t>(std::max(1, search_.refine_top)));
@@ -2039,10 +2044,12 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             for (int tn = 0; tn <= ntn; ++tn) jb = std::min(jb, eval(cands.size() - 1, 0, 0, tn));
             j1.push_back({jb, cands.size() - 1});
         }
+        bandit_[2][l].update(b0 > 0 ? (b0 - best) / b0 : 0.0);
     }
     const int nmts = (tools_.mts && search_.try_mts && is_luma() && s <= 32) ? (s <= 16 ? 9 : 5) : 1;
     const bool try_e8 = tools_.e8 && search_.try_e8, try_gs = tools_.gs && md_ && !tools_.pred_only;
-    if (nmts > 1 || try_e8 || try_gs) {
+    if ((nmts > 1 || try_e8 || try_gs) && bandit_[3][l].should_try()) {
+        const double b0 = best;
         std::sort(j1.begin(), j1.end());
         const size_t top = std::min<size_t>(j1.size(), static_cast<size_t>(std::max(1, search_.refine_top)));
         for (size_t k = 0; k < top; ++k) {
@@ -2054,6 +2061,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
                 if (try_gs) eval(ci, mt, 2, 0);
             }
         }
+        bandit_[3][l].update(b0 > 0 ? (b0 - best) / b0 : 0.0);
     }
     leaf_at(x0, y0, l) = best_leaf;
     restore(x0, y0, s, best_rec);
