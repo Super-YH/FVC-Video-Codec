@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <stdexcept>
 
+#include "lattice_adam.hpp"
+
 namespace fvc {
 
 std::vector<LineSeg> extract_lines(const Plane& ref, int vw, int vh, int bit_depth, int thr8) {
@@ -70,6 +72,7 @@ double mv_bits(int dx, int dy) { return 2.0 + 2.0 * std::log2(1.0 + std::abs(dx)
 void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const Plane& ref, const GlobalModel& gm,
                           double lambda, int range) {
     const double lsad = std::sqrt(lambda);
+    AdamState<2> adam;
     for (LineSeg& L : lines) {
         const int px = L.bx, py = L.by;
         const double c0 = static_cast<double>(window_sad(cur, ref, L, px, py, INT64_MAX)) + lsad * 1.0;
@@ -80,18 +83,20 @@ void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const P
                              lsad * mv_bits(ix * 4 - px, iy * 4 - py);
             if (c < bc) { bc = c; bx = ix; by = iy; }
         };
-        const int cx = bx, cy = by;
-        for (int dy = -range; dy <= range; ++dy)
-            for (int dx = -range; dx <= range; ++dx) test(cx + dx, cy + dy);
-        // 粗い格子 (大きな動き)。実測 (v17 特許安全): ±48 画素に広げても改善せず (-0.02 dB)、±4·range に留める
-        for (int dy = -4 * range; dy <= 4 * range; dy += 4)
-            for (int dx = -4 * range; dx <= 4 * range; dx += 4) test(cx + dx, cy + dy);
-        if (bx != cx || by != cy) {
-            const int ox = bx, oy = by;
-            for (int dy = -2; dy <= 2; ++dy)
-                for (int dx = -2; dx <= 2; ++dx) test(ox + dx, oy + dy);
+        // 整数探索: SPSA-Adam (近傍の線から継承)。開始点は基準の動きと 0
+        {
+            const int cx = bx, cy = by;
+            const std::array<int, 2> st[2] = {{cx, cy}, {0, 0}};
+            auto f = [&](const std::array<int, 2>& v) { test(v[0], v[1]); return bc; };
+            auto g = [&](const std::array<int, 2>& v) {
+                const double c = static_cast<double>(window_sad(cur, ref, L, v[0] * 4, v[1] * 4, INT64_MAX)) + lsad * mv_bits(v[0] * 4 - px, v[1] * 4 - py);
+                if (c < bc) { bc = c; bx = v[0]; by = v[1]; }
+                return c;
+            };
+            (void)f;
+            lattice_adam<2>(g, st, 2, {cx - 4 * range, cy - 4 * range}, {cx + 4 * range, cy + 4 * range}, 4.0, &adam, &adam,
+                            static_cast<uint64_t>(L.x) * 131 + static_cast<uint64_t>(L.y), 16);
         }
-        test(0, 0);
         int mx = bx * 4, my = by * 4;
         double sc = static_cast<double>(window_sad(cur, ref, L, mx, my, INT64_MAX)) + lsad * mv_bits(mx - px, my - py);
         for (int st = 2; st >= 1; st >>= 1) {

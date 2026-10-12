@@ -2096,6 +2096,7 @@ static Frame temporal_filter(const Frame& t, const std::vector<const Frame*>& nb
     const int bw = (W + B - 1) / B, bh = (H + B - 1) / B;
     std::vector<int> mvx(nb.size() * bw * bh), mvy(nb.size() * bw * bh);
     std::vector<double> wb(nb.size() * bw * bh);
+    AdamState<2> tfa;
     for (size_t k = 0; k < nb.size(); ++k) {
         const Plane& N = nb[k]->p[0];
         for (int by = 0; by < bh; ++by)
@@ -2116,17 +2117,14 @@ static Frame temporal_filter(const Frame& t, const std::vector<const Frame*>& nb
                     const int64_t s = cost(dx, dy);
                     if (s < best) { best = s; bmx = dx; bmy = dy; }
                 };
-                test(0, 0);
+                // SPSA-Adam (近傍継承): 開始点は 0 と左・上のブロックの結果
                 const size_t base = k * bh * bw;
-                if (bx > 0) test(mvx[base + by * bw + bx - 1], mvy[base + by * bw + bx - 1]);
-                if (by > 0) test(mvx[base + (by - 1) * bw + bx], mvy[base + (by - 1) * bw + bx]);
-                for (int st = 4; st >= 1; st >>= 1)
-                    for (int it = 0; it < 8; ++it) {
-                        const int ox = bmx, oy = bmy;
-                        for (const auto& d : {std::pair<int, int>{st, 0}, {-st, 0}, {0, st}, {0, -st}, {st, st}, {-st, -st}, {st, -st}, {-st, st}})
-                            test(ox + d.first, oy + d.second);
-                        if (ox == bmx && oy == bmy) break;
-                    }
+                std::array<int, 2> st[3] = {{0, 0}, {0, 0}, {0, 0}};
+                int ns = 1;
+                if (bx > 0) st[ns++] = {mvx[base + by * bw + bx - 1], mvy[base + by * bw + bx - 1]};
+                if (by > 0) st[ns++] = {mvx[base + (by - 1) * bw + bx], mvy[base + (by - 1) * bw + bx]};
+                auto f = [&](const std::array<int, 2>& v) { test(v[0], v[1]); return static_cast<double>(cost(v[0], v[1])); };
+                lattice_adam<2>(f, st, ns, {-R, -R}, {R, R}, 3.0, &tfa, &tfa, static_cast<uint64_t>(bx) * 41 + static_cast<uint64_t>(by), 12);
                 double mse = 0;
                 for (int y = y0; y < y1; ++y)
                     for (int x = x0; x < x1; ++x) {

@@ -1,4 +1,5 @@
 #include "loop_filter.hpp"
+#include "lattice_adam.hpp"
 
 #include <algorithm>
 #include <map>
@@ -258,17 +259,16 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
                 memo[k] = s;
                 return s;
             };
+            // SPSA-Adam (2 刻みの格子: v = (bo/2, (to+2)/2))
             int bo = 2, to = 2;
-            double best = eval(bo, to);
-            for (bool moved = true; moved;) {
-                moved = false;
-                for (const auto& d : {std::pair<int, int>{2, 0}, {-2, 0}, {0, 2}, {0, -2}}) {
-                    const int nb = bo + d.first, nt = to + d.second;
-                    if (nb < 0 || nb > 6 || nt < -2 || nt > 6) continue;
-                    const double s = eval(nb, nt);
-                    if (s < best) { best = s; bo = nb; to = nt; moved = true; }
-                }
-            }
+            double best = 1e300;
+            auto f = [&](const std::array<int, 2>& v) {
+                const double s = eval(v[0] * 2, v[1] * 2 - 2);
+                if (s < best) { best = s; bo = v[0] * 2; to = v[1] * 2 - 2; }
+                return s;
+            };
+            const std::array<int, 2> st[1] = {{1, 2}};
+            lattice_adam<2>(f, st, 1, {0, 0}, {3, 4}, 1.5, nullptr, nullptr, 7, 8);
             lp.beta_off = bo; lp.tc_off = to;
             deblock_plane(D, e, mf, chroma, chroma_shift, qp, bit_depth, bo, to, lo, hi);
         }
@@ -281,14 +281,18 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
         int rq = 0, tq = 0;
         auto thr_of = [&](int t) { return std::max(1, static_cast<int>(std::lround(step * t * 0.5))); };
         if (io.enc && org) {
+            // (減衰率, 閾値) の SPSA-Adam (42 通りの評価の代わり)
+            static constexpr int kR[6] = {6, 9, 11, 13, 14, 15}, kT[7] = {1, 2, 3, 4, 6, 8, 12};
             double best = sse(D);
-            for (int r : {6, 9, 11, 13, 14, 15})
-                for (int t : {1, 2, 3, 4, 6, 8, 12}) {
-                    Plane t2 = R;
-                    decay_deblock(t2, e, r, thr_of(t), lo, hi);
-                    const double s = sse(t2);
-                    if (s < best) { best = s; rq = r; tq = t; D = std::move(t2); }
-                }
+            auto f = [&](const std::array<int, 2>& v) {
+                Plane t2 = R;
+                decay_deblock(t2, e, kR[v[0]], thr_of(kT[v[1]]), lo, hi);
+                const double s = sse(t2);
+                if (s < best) { best = s; rq = kR[v[0]]; tq = kT[v[1]]; D = std::move(t2); }
+                return s;
+            };
+            const std::array<int, 2> st[1] = {{3, 2}};
+            lattice_adam<2>(f, st, 1, {0, 0}, {5, 6}, 1.5, nullptr, nullptr, 11, 8);
         }
         rq = static_cast<int>(io.uint(m, 6, 0, static_cast<uint32_t>(rq)));
         if (rq > 15) throw std::runtime_error("corrupt stream: decay deblock");
