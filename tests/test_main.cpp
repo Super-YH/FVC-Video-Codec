@@ -222,6 +222,7 @@ static void test_codec() {
         if (std::string(c.name).find("sr") != std::string::npos) cfg.sr = 1;
         if (std::string(c.name) == "pqmf-bline") cfg.bline = 1;
         if (std::string(c.name) == "edge-PB") cfg.edge = 1;
+        if (std::string(c.name) == "adaptive-gop") cfg.agop = 1;
         Encoder enc(info, cfg);
         auto s = enc.sequence_header();
         std::vector<Frame> src;

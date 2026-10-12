@@ -2149,7 +2149,9 @@ int64_t small_intra_cost(const Plane& T) {
 static Frame temporal_filter(const Frame& t, const std::vector<const Frame*>& nb, const VideoInfo& info, int strength);
 
 bool Encoder::adaptive_gop() const {
-    return cfg_.bframes < 0 && cfg_.lossy_layer && cfg_.preset >= Preset::Fast && cfg_.target_ssim <= 0;
+    // 実測: v17 で ±0、疑似アニメ (速い動き) で -7 dB。縮小画像での費用の見積もりが遠い予測の失敗を
+    // 十分に表せないため、見積もりを改良するまでは明示指定 (--agop=1) のときだけ使う
+    return cfg_.agop > 0 && cfg_.bframes < 0 && cfg_.lossy_layer && cfg_.preset >= Preset::Fast && cfg_.target_ssim <= 0;
 }
 
 // アンカーの手前までを 1 つのミニ GOP として符号化 (v.back() が P アンカー、間は階層 B)

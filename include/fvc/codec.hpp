@@ -22,6 +22,7 @@ struct EncoderConfig {
     bool psy = false;         // ノイズ補完/帯域ノイズ置換 (PSNR は下がるが質感保持)
     int ibc = -1;             // -1: プリセット依存, 0/1: 強制
     int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1, rect = -1, tmvp = -1, alf = -1, mts = -1, cdef = -1, gs = -1, firb = -1, line_mv = -1, sr = -1, safe_intra = -1, guide = -1, merge = -1, brest = -1, bline = -1, edge = -1, interp = -1;
+    int agop = 0;  // 1: 適応 GOP (Adam による GOP 長の選択と場面転換の I)
     int tf = -1;  // アンカー (I/P) の時間フィルタ (符号器のみ): 0 = なし, 1..3 = 強さ, -1 = 既定
     int adam = -1;
     double dict_bias = -1;
