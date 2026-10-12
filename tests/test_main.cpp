@@ -212,6 +212,7 @@ static void test_codec() {
         {"pqmf-sr", true, false, 2, 26, Preset::Medium, 2, 0, 0, false},
         {"pqmf-bline", true, false, 1, 24, Preset::Medium, 1, 0, 0, false},
         {"edge-PB", true, false, 0, 30, Preset::Medium, 5, 1, 0, false},
+        {"adaptive-gop", true, false, 0, 30, Preset::Medium, 20, -1, 0, false},
     };
     for (const Case& c : cases) {
         EncoderConfig cfg;

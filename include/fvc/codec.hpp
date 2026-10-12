@@ -102,6 +102,16 @@ private:
     const Frame* code_src_ = nullptr;           // 符号化に使う入力 (時間フィルタ済み)。統計は元の入力で測る
     int tf_strength() const { return cfg_.tf >= 0 ? cfg_.tf : (cfg_.preset >= Preset::Medium ? 3 : 0); }  // 実測 v17: 強さ 3 で +0.08 dB
     std::vector<uint8_t> flush_pending();
+    // 適応 GOP (符号器のみ): 先読みした 1/4 縮小輝度で GOP 長 (次の P アンカーまでの距離) を SPSA-Adam で選び、
+    // 場面転換には I を置く。フレーム種別・参照・QP はフレームごとに伝送しているのでビットストリームは変わらない
+    bool adaptive_gop() const;
+    std::vector<uint8_t> flush_adaptive(bool final);
+    void encode_minigop(std::vector<std::pair<int, Frame>> v, std::vector<uint8_t>& out);
+    std::vector<Plane> pend_small_;   // pend_ と同じ並びの 1/4 縮小輝度
+    Plane anchor_small_;              // 直前のアンカー (I/P) の 1/4 縮小輝度
+    bool have_anchor_ = false;
+    double gop_m_ = 0, gop_v_ = 0;    // GOP 長探索の Adam 状態 (前の GOP から継承)
+    int last_gop_ = 8;
     void encode_b_range(const std::vector<std::pair<int, Frame>>& v, int a, int b, int depth, std::vector<uint8_t>& out);
     std::vector<FrameStats> stats_;
     std::map<int, Frame> recon_;

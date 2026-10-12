@@ -2071,7 +2071,186 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& forig, int poc, FrameT
     return out;
 }
 
+namespace {
+// 1/4 縮小輝度 (4x4 平均)
+Plane small_luma(const Plane& p) {
+    const int w = std::max(1, p.w / 4), h = std::max(1, p.h / 4);
+    Plane o(w, h);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            int32_t s = 0;
+            for (int k = 0; k < 16; ++k) s += p.at(std::min(4 * x + (k & 3), p.w - 1), std::min(4 * y + (k >> 2), p.h - 1));
+            o.at(x, y) = s >> 4;
+        }
+    return o;
+}
+// 縮小画像どうしの動き補償 SAD (8x8 ブロック、±4 の 2 段降下)。pred2 があれば 2 枚の平均 (双予測) も試す
+int64_t small_mc_sad(const Plane& T, const Plane& R, const Plane* R2 = nullptr) {
+    int64_t tot = 0;
+    auto bsad = [&](const Plane& P, int x0, int y0, int dx, int dy) {
+        int64_t s = 0;
+        for (int y = y0; y < std::min(y0 + 8, T.h); ++y)
+            for (int x = x0; x < std::min(x0 + 8, T.w); ++x)
+                s += std::abs(T.at(x, y) - P.at(std::clamp(x + dx, 0, P.w - 1), std::clamp(y + dy, 0, P.h - 1)));
+        return s;
+    };
+    auto best_mv = [&](const Plane& P, int x0, int y0, int& bx, int& by) {
+        bx = by = 0;
+        int64_t b = bsad(P, x0, y0, 0, 0);
+        for (int st : {2, 1})
+            for (bool moved = true; moved;) {
+                moved = false;
+                const int ox = bx, oy = by;
+                for (const auto& d : {std::pair<int, int>{st, 0}, {-st, 0}, {0, st}, {0, -st}}) {
+                    const int nx = ox + d.first, ny = oy + d.second;
+                    if (std::abs(nx) > 4 || std::abs(ny) > 4) continue;
+                    const int64_t s = bsad(P, x0, y0, nx, ny);
+                    if (s < b) { b = s; bx = nx; by = ny; moved = true; }
+                }
+            }
+        return b;
+    };
+    for (int y0 = 0; y0 < T.h; y0 += 8)
+        for (int x0 = 0; x0 < T.w; x0 += 8) {
+            int ax, ay, bx2 = 0, by2 = 0;
+            int64_t b = best_mv(R, x0, y0, ax, ay);
+            if (R2) {
+                const int64_t b2 = best_mv(*R2, x0, y0, bx2, by2);
+                int64_t bi = 0;
+                for (int y = y0; y < std::min(y0 + 8, T.h); ++y)
+                    for (int x = x0; x < std::min(x0 + 8, T.w); ++x) {
+                        const int p = (R.at(std::clamp(x + ax, 0, R.w - 1), std::clamp(y + ay, 0, R.h - 1)) +
+                                       R2->at(std::clamp(x + bx2, 0, R2->w - 1), std::clamp(y + by2, 0, R2->h - 1)) + 1) >> 1;
+                        bi += std::abs(T.at(x, y) - p);
+                    }
+                b = std::min({b, b2, bi});
+            }
+            tot += b;
+        }
+    return tot;
+}
+// 縮小画像のイントラ費用の目安: 8x8 ブロックの平均値からの絶対差の和
+int64_t small_intra_cost(const Plane& T) {
+    int64_t tot = 0;
+    for (int y0 = 0; y0 < T.h; y0 += 8)
+        for (int x0 = 0; x0 < T.w; x0 += 8) {
+            int64_t s = 0;
+            int n = 0;
+            for (int y = y0; y < std::min(y0 + 8, T.h); ++y)
+                for (int x = x0; x < std::min(x0 + 8, T.w); ++x) { s += T.at(x, y); ++n; }
+            const int m = static_cast<int>(s / std::max(1, n));
+            for (int y = y0; y < std::min(y0 + 8, T.h); ++y)
+                for (int x = x0; x < std::min(x0 + 8, T.w); ++x) tot += std::abs(T.at(x, y) - m);
+        }
+    return tot;
+}
+}  // namespace
+
+static Frame temporal_filter(const Frame& t, const std::vector<const Frame*>& nb, const VideoInfo& info, int strength);
+
+bool Encoder::adaptive_gop() const {
+    return cfg_.bframes < 0 && cfg_.lossy_layer && cfg_.preset >= Preset::Fast && cfg_.target_ssim <= 0;
+}
+
+// アンカーの手前までを 1 つのミニ GOP として符号化 (v.back() が P アンカー、間は階層 B)
+void Encoder::encode_minigop(std::vector<std::pair<int, Frame>> v, std::vector<uint8_t>& out) {
+    const int n = static_cast<int>(v.size());
+    std::vector<const Frame*> look;
+    for (int i = 0; i < n - 1; ++i) look.push_back(&v[i].second);
+    Frame tfr;
+    if (tf_strength() > 0 && !cfg_.l2_lossless) {
+        std::vector<const Frame*> nb;
+        for (int i = n - 2; i >= std::max(0, n - 3); --i) nb.push_back(&v[i].second);
+        tfr = temporal_filter(v[n - 1].second, nb, info_, tf_strength());
+        code_src_ = &tfr;
+    }
+    const auto u = encode_picture(v[n - 1].second, v[n - 1].first, FrameType::P, 0, look);
+    code_src_ = nullptr;
+    out.insert(out.end(), u.begin(), u.end());
+    encode_b_range(v, -1, n - 1, 1, out);
+}
+
+std::vector<uint8_t> Encoder::flush_adaptive(bool final) {
+    std::vector<uint8_t> out;
+    constexpr int kMaxGop = 16;
+    auto pop_front = [&](int k) {
+        pend_.erase(pend_.begin(), pend_.begin() + k);
+        pend_small_.erase(pend_small_.begin(), pend_small_.begin() + k);
+    };
+    for (;;) {
+        if (pend_.empty()) break;
+        if (key_pending_) {
+            // I フレーム (先読みは後続のフレーム)
+            std::vector<const Frame*> look;
+            for (size_t i = 1; i < pend_.size(); ++i) look.push_back(&pend_[i].second);
+            Frame tfr;
+            if (tf_strength() > 0 && !cfg_.l2_lossless) {
+                std::vector<const Frame*> nb;
+                for (size_t i = 1; i <= 2 && i < pend_.size(); ++i) nb.push_back(&pend_[i].second);
+                tfr = temporal_filter(pend_[0].second, nb, info_, tf_strength());
+                code_src_ = &tfr;
+            }
+            const auto u = encode_picture(pend_[0].second, pend_[0].first, FrameType::I, 0, look);
+            code_src_ = nullptr;
+            out.insert(out.end(), u.begin(), u.end());
+            anchor_small_ = pend_small_[0];
+            have_anchor_ = true;
+            key_pending_ = false;
+            pop_front(1);
+            continue;
+        }
+        if (!final && static_cast<int>(pend_.size()) < kMaxGop) break;
+        const int nmax = std::min(static_cast<int>(pend_.size()), kMaxGop);
+        // 場面転換: 直前のフレーム (先頭は直前のアンカー) からの動き補償誤差がイントラ費用の目安を大きく超えるフレーム
+        int cut = -1;
+        for (int i = 0; i < nmax && cut < 0; ++i) {
+            const Plane& prev = i ? pend_small_[i - 1] : anchor_small_;
+            const int64_t inter = small_mc_sad(pend_small_[i], prev), intra = small_intra_cost(pend_small_[i]);
+            if (inter > intra * 3 / 2 && inter > static_cast<int64_t>(pend_small_[i].v.size()) * 6) cut = i;
+        }
+        if (cut == 0) { key_pending_ = true; continue; }
+        const int gmax = cut > 0 ? cut : nmax;
+        // GOP 長 g の費用 (1 フレームあたり): P アンカー (重み 2) と、その間の B (両側の最良) の縮小動き補償誤差
+        std::map<int, double> memo;
+        auto cost = [&](int g) {
+            auto it = memo.find(g);
+            if (it != memo.end()) return it->second;
+            const Plane& P = pend_small_[g - 1];
+            double c = 2.0 * static_cast<double>(small_mc_sad(P, anchor_small_));
+            for (int j = 0; j < g - 1; ++j) c += 0.7 * static_cast<double>(small_mc_sad(pend_small_[j], anchor_small_, &P));
+            c = c / g + 0.02 * static_cast<double>(P.v.size()) * 16.0 / g;  // アンカー 1 枚あたりの固定費 (ヘッダ等)
+            memo[g] = c;
+            return c;
+        };
+        AdamState<1> st;
+        st.m[0] = gop_m_; st.v[0] = gop_v_; st.valid = gop_v_ > 0;
+        auto f = [&](const std::array<int, 1>& v) { return cost(v[0]); };
+        const std::array<int, 1> starts[3] = {{std::clamp(last_gop_, 1, gmax)}, {std::min(8, gmax)}, {gmax}};
+        int g = lattice_adam<1>(f, starts, 3, {1}, {gmax}, 3.0, &st, &st, static_cast<uint64_t>(pend_[0].first), 10)[0];
+        gop_m_ = st.m[0]; gop_v_ = st.v[0];
+        if (!final && g == gmax && cut < 0) g = gmax;  // 先読みが足りない場合も最大長で進める
+        last_gop_ = g;
+        std::vector<std::pair<int, Frame>> v(pend_.begin(), pend_.begin() + g);
+        anchor_small_ = pend_small_[g - 1];
+        pop_front(g);
+        encode_minigop(std::move(v), out);
+        if (cut > 0 && cut == g) key_pending_ = true;
+    }
+    return out;
+}
+
 std::vector<uint8_t> Encoder::encode(const Frame& f) {
+    if (adaptive_gop()) {
+        const int poc = next_poc_++;
+        const bool key = poc == 0 || (cfg_.keyint > 0 && poc % cfg_.keyint == 0);
+        std::vector<uint8_t> out;
+        if (key) { out = flush_adaptive(true); key_pending_ = true; }
+        pend_.push_back({poc, f});
+        pend_small_.push_back(small_luma(f.p[0]));
+        const auto u = flush_adaptive(false);
+        out.insert(out.end(), u.begin(), u.end());
+        return out;
+    }
     const int poc = next_poc_++;
     const bool key = poc == 0 || (cfg_.keyint > 0 && poc % cfg_.keyint == 0);
     int bf = cfg_.bframes >= 0 ? cfg_.bframes : (cfg_.preset == Preset::Faster ? 3 : 7);
@@ -2234,7 +2413,7 @@ void Encoder::encode_b_range(const std::vector<std::pair<int, Frame>>& v, int a,
 }
 
 std::vector<uint8_t> Encoder::flush() {
-    std::vector<uint8_t> out = flush_pending();
+    std::vector<uint8_t> out = adaptive_gop() ? flush_adaptive(true) : flush_pending();
     put_unit(out, UnitType::Eos, {});
     return out;
 }
