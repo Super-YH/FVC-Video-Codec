@@ -308,7 +308,6 @@ private:
     // 動き探索の Adam 状態 (リストごと、直前に探索したブロックから継承する)
     mutable AdamState<2> me_adam_[2], sub_adam_[2];
     mutable AdamState<4> bi_adam_;  // 双予測の 4 変数の精密化
-    mutable bool rdoq_off_ = false; // RD の 1 段目では RDOQ を省く
     mutable AdamState<1> intra_adam_;
     mutable AdamState<2> edge_adam_;
     // 道具ごと・ブロックサイズごとの Adam バンディット (0: 超解像, 1: エッジ, 2: 残差原子, 3: 変換/量子化の精密化)

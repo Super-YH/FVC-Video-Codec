@@ -1466,7 +1466,7 @@ void BlockCoder::quantize(Leaf& lf, int x0, int y0, int l, const int32_t* pred, 
             lf.q[scan[i]] = v;
             if (v) lf.last = i;
         }
-        if (search_.rdoq && !rdoq_off_ && md_ && !lf.tns_on && lf.last >= 0) rdoq(lf, l, e, xb_ctx(x0, y0, s), cb_ctx(x0, y0, s));
+        if (search_.rdoq && md_ && !lf.tns_on && lf.last >= 0) rdoq(lf, l, e, xb_ctx(x0, y0, s), cb_ctx(x0, y0, s));
         if (tools_.nf && lf.last + 1 < n) {
             double en = 0;
             for (int i = lf.last + 1; i < n; ++i) en += e[i] * e[i];
@@ -2030,23 +2030,11 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
     };
     const int ntn = tools_.tns && search_.try_tns && s >= 8 ? 1 : 0;
     std::vector<std::pair<double, size_t>> j1;
-    // 1 段目は RDOQ なしで全候補を評価し、J の上位 2 候補だけ RDOQ 付きで評価し直す (逐次半減と同じ考え方)
-    rdoq_off_ = search_.rdoq && cands.size() > 2;
     for (size_t ci = 0; ci < cands.size(); ++ci) {
         FVC_PROF("rd_eval1");
         double jb = 1e300;
         for (int tn = 0; tn <= ntn; ++tn) jb = std::min(jb, eval(ci, 0, 0, tn));
         j1.push_back({jb, ci});
-    }
-    if (rdoq_off_) {
-        rdoq_off_ = false;
-        std::vector<std::pair<double, size_t>> srt = j1;
-        std::sort(srt.begin(), srt.end());
-        for (size_t k = 0; k < std::min<size_t>(2, srt.size()); ++k) {
-            const size_t ci = srt[k].second;
-            const double jr = eval(ci, 0, 0, 0);
-            for (auto& e : j1) if (e.second == ci) e.first = std::min(e.first, jr);
-        }
     }
     // 超解像: 1 段目の上位候補に、残差を 1/2 解像度で符号化する変種を試す
     if (tools_.sr && s >= 8 && s <= 64 && !tools_.pred_only && bandit_[0][l].should_try()) {
