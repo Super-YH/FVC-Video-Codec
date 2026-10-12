@@ -579,7 +579,8 @@ struct FrameParams {
     int threads = 1;                                   // 符号器/復号器のスレッド数 (ビットストリームに影響しない)
     // 符号器: グローバルパラメータのキャッシュ (COPY 判定と本符号化で共有)
     mutable bool gm_valid = false;
-    mutable bool lines_valid[2] = {false, false};  // 符号器: 線の動きの推定結果のキャッシュ (L0 / L1)
+    mutable bool lines_valid[2] = {false, false};
+    mutable bool lines_off = false;                // 符号器: このフレームでは線を使わない (ヘッダの線ビットを 0 にする)  // 符号器: 線の動きの推定結果のキャッシュ (L0 / L1)
     mutable std::vector<LineSeg> lines_cache[2];
     mutable int gm_x = 0, gm_y = 0, gm_gain[3] = {64, 64, 64}, gm_off[3] = {0, 0, 0};
     mutable GlobalModel gm_model;
@@ -936,6 +937,8 @@ void coarse_motion(const Plane& cur, const Plane& ref, int w, int h, std::vector
         }
 }
 
+constexpr int kMinChangedLines = 16;  // これ未満しか線が変わらないフレームでは線を使わない
+
 // フレームのペイロード (rANS) を符号化/復号。org==nullptr なら復号。
 void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const Frame* org, Frame& rec, CodecState& st,
                 TileStreams& ts, BlockUsage* usage = nullptr) {
@@ -1061,6 +1064,9 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
     if (inter && fp.tools.line_mv && fp.type != FrameType::Copy) {
         lf_w4 = (info.width + kCtu - 1) / kCtu * kCtu / 4;
         lf_h4 = (info.height + kCtu - 1) / kCtu * kCtu / 4;
+        std::vector<LineSeg> lines_l[2];
+        GlobalModel pg_l[2];
+        bool have_l[2] = {false, false};
         for (int l = 0; l < 2; ++l) {
             if (refs[l].empty() || (l == 1 && fp.type != FrameType::B)) continue;
             const Plane& rref = refs[l][0]->p[0];
@@ -1100,9 +1106,23 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                     fp.lines_valid[l] = true;
                 }
             }
-            code_line_motion(io, l ? md.line1 : md.line, lines, pg);
-            build_line_field(lines, pg, lf_w4, lf_h4, lfield[l]);
+            lines_l[l] = std::move(lines);
+            pg_l[l] = pg;
+            have_l[l] = true;
         }
+        // 符号器: 変わった線が少ないフレームでは線を使わない (二重符号化による RD 判定の代わりの早期判定)。
+        // 線の有無はフレームヘッダ (このあとに書く) で伝える
+        if (io.w) {
+            int nch = 0;
+            for (int l = 0; l < 2; ++l) if (have_l[l]) for (const LineSeg& L : lines_l[l]) nch += L.changed ? 1 : 0;
+            fp.lines_off = nch < kMinChangedLines;
+        }
+        if (!fp.lines_off)
+            for (int l = 0; l < 2; ++l) {
+                if (!have_l[l]) continue;
+                code_line_motion(io, l ? md.line1 : md.line, lines_l[l], pg_l[l]);
+                build_line_field(lines_l[l], pg_l[l], lf_w4, lf_h4, lfield[l]);
+            }
     }
     // 符号器: 粗い動き推定 (各リストの先頭参照)
     std::vector<int16_t> hint[2];
@@ -1146,7 +1166,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             ic.chroma_shift = pi ? cs : 0;
             ic.gmv_x = gmv_x; ic.gmv_y = gmv_y;
             ic.gm = gm;
-            if (!lfield[0].empty()) { ic.lfield = &lfield[0]; ic.lf_w4 = lf_w4; ic.lf_h4 = lf_h4; }
+            if (!fp.lines_off && !lfield[0].empty()) { ic.lfield = &lfield[0]; ic.lf_w4 = lf_w4; ic.lf_h4 = lf_h4; }
             if (!lfield[1].empty() && ic.nref[1] > 0) ic.lfield1 = &lfield[1];
             ic.cur_poc = fp.poc;
             if (pi == 0 && hint_w > 0) {
@@ -1590,7 +1610,8 @@ FrameParams params_from(const EncoderConfig& c) {
     }
     if (c.safe & 4) fp.range_coder = true;
     // 線の動き場: 既定は特許安全モード (マージ/TMVP を外す区分 1) で有効
-    t.line_mv = c.line_mv >= 0 ? c.line_mv != 0 : (c.safe & 1) != 0;
+    // medium 以下は速度優先で既定オフ (二重符号化の RD 判定なしでは q32 で +1.7% と損になるため)
+    t.line_mv = c.line_mv >= 0 ? c.line_mv != 0 : ((c.safe & 1) != 0 && c.preset >= Preset::Slow);
     t.sr = c.sr >= 0 ? c.sr != 0 : false;
     if (c.safe_intra >= 0) t.safe_intra = c.safe_intra != 0;
     if (c.merge >= 0) t.no_merge = c.merge == 0;
@@ -1632,7 +1653,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
                   (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u) | (fp.tools.firb ? 128u : 0u));
     put_u8(p, (fp.tools.guide ? 1u : 0u) | (fp.brest ? 2u : 0u) | (fp.tools.bline ? 8u : 0u) | (fp.tools.edge ? 16u : 0u) | (fp.tools.own_interp ? 32u : 0u));
     put_u8(p, (fp.tools.no_merge ? 1u : 0u) | (fp.no_deblock ? 2u : 0u) | (fp.range_coder ? 4u : 0u) |
-                  (fp.tools.no_obmc ? 8u : 0u) | (fp.tools.no_sp ? 16u : 0u) | (fp.tools.line_mv ? 32u : 0u) |
+                  (fp.tools.no_obmc ? 8u : 0u) | (fp.tools.no_sp ? 16u : 0u) | (fp.tools.line_mv && !fp.lines_off ? 32u : 0u) |
                   (fp.tools.sr ? 64u : 0u) | (fp.tools.safe_intra ? 128u : 0u));
     for (int l = 0; l < 2; ++l) {
         put_u8(p, static_cast<uint32_t>(fp.ref_poc[l].size()));
@@ -1995,7 +2016,8 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& forig, int poc, FrameT
         }
         done = true;
     }
-    if (!done && type != FrameType::I && fp.tools.line_mv && cfg_.lossy_layer && !cfg_.l2_lossless) {
+    // 二重符号化による線の RD 判定は slow 以上 (それ以外は code_frame 内の早期判定: 変わった線の数)
+    if (!done && type != FrameType::I && fp.tools.line_mv && cfg_.preset >= Preset::Slow && cfg_.lossy_layer && !cfg_.l2_lossless) {
         // 線の動き場のフレーム単位 RD: 線の構文 (フレームあたり数十バイト) が予測の改善に見合わないフレームでは
         // 線を使わない符号化を採る (D + λR が小さい方)。線が損になるフレームを無くす
         const Dictionary dict0 = st_->dict;
