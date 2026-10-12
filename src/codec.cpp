@@ -1588,7 +1588,8 @@ FrameParams params_from(const EncoderConfig& c) {
     if (c.safe_intra >= 0) t.safe_intra = c.safe_intra != 0;
     if (c.merge >= 0) t.no_merge = c.merge == 0;
     if (c.bline >= 0) t.bline = c.bline != 0;
-    if (c.edge >= 0) t.edge = c.edge != 0;
+    // エッジモード: 実測 (lena slow) 特許安全版 +0.022 dB / 全機能版 +0.025 dB。符号器の試行が増えるため slow 以上で既定オン
+    t.edge = c.edge >= 0 ? c.edge != 0 : c.preset >= Preset::Slow;
     if (c.brest >= 0) { fp.brest = c.brest != 0; if (fp.brest) fp.alf = false; }
     if (c.guide >= 0) { t.guide = c.guide != 0; if (t.guide) t.cfl = false; }
     if (c.safe & 8) {
