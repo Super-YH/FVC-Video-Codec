@@ -709,16 +709,17 @@ void BlockCoder::predict_base(const Leaf& lf, int x0, int y0, int l, int32_t* pr
     if (lf.pt == 2) {
         if (is_luma()) {
             if (lf.lmode) {
-                // 線の動き場: 4x4 ごとに動き場の動きで補償 (同じ動きが続く行はまとめて補償)
-                std::vector<int32_t> sub(static_cast<size_t>(s) * 4);
-                for (int by = 0; by < s; by += 4)
+                // 線の動き場: 2x2 ごとに双線形補間した動きで補償 (同じ動きが続く行はまとめて補償)
+                constexpr int g = 2;
+                std::vector<int32_t> sub(static_cast<size_t>(s) * g);
+                for (int by = 0; by < s; by += g)
                     for (int bx = 0; bx < s;) {
-                        const MotionInfo m = line_mi(x0 + bx, y0 + by);
-                        int ex = bx + 4;
-                        while (ex < s && line_mi(x0 + ex, y0 + by) == m) ex += 4;
+                        const MotionInfo m = line_mi2(x0 + bx, y0 + by);
+                        int ex = bx + g;
+                        while (ex < s && line_mi2(x0 + ex, y0 + by) == m) ex += g;
                         const int bw = ex - bx;
-                        inter_predict(m, inter_.l0, inter_.l1, x0 + bx, y0 + by, bw, 4, 0, lo_, hi_, sub.data());
-                        for (int y = 0; y < 4; ++y)
+                        inter_predict(m, inter_.l0, inter_.l1, x0 + bx, y0 + by, bw, g, 0, lo_, hi_, sub.data());
+                        for (int y = 0; y < g; ++y)
                             for (int x = 0; x < bw; ++x) pred[(by + y) * s + bx + x] = sub[y * bw + x];
                         bx = ex;
                     }

@@ -1058,6 +1058,27 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                 lines = fp.lines_cache[l];
             } else {
                 lines = extract_lines(rref, info.width, info.height, info.bit_depth);
+                // 基準の動き: 参照ピクチャ自身の動き (その参照への動き) を時間距離で伸縮したもの
+                // (等速の仮定: 動いている物は次も同じように動く)。参照がイントラの位置や情報がなければ大域動き
+                set_line_base(lines, pg);
+                if (const Picture* rp = st.find_pic(fp.ref_poc[l][0]))
+                    if (rp->mf && rp->mf->w4 > 0) {
+                        const int tb = fp.ref_poc[l][0] - fp.poc;  // 現在 → 参照 R の時間差
+                        for (LineSeg& L : lines) {
+                            const MotionInfo& m = rp->mf->at(std::min(L.x, rp->mf->w4 * 4 - 1), std::min(L.y, rp->mf->h4 * 4 - 1));
+                            const int ll = (m.dir & 1) ? 0 : ((m.dir & 2) ? 1 : -1);
+                            if (ll < 0 || m.ref[ll] >= static_cast<int>(rp->ref_poc[ll].size())) continue;
+                            const int td = rp->ref_poc[ll][m.ref[ll]] - fp.ref_poc[l][0];  // R → R の参照 の時間差
+                            if (td == 0) continue;
+                            // R の動き mv_R = pos(R') - pos(R)。現在の動き = pos(R) - pos(cur) = mv_R · (poc_R - poc_cur) / (poc_R' - poc_R)
+                            auto sc = [&](int v) {
+                                const int64_t num = static_cast<int64_t>(v) * tb;
+                                const int64_t r = num >= 0 ? (num + std::abs(td) / 2) / td : -((-num + std::abs(td) / 2) / td);
+                                return static_cast<int>(std::clamp<int64_t>(r, -4000, 4000));
+                            };
+                            L.bx = sc(m.mvx[ll]); L.by = sc(m.mvy[ll]);
+                        }
+                    }
                 if (io.w) {
                     const double lam = 0.57 * std::pow(2.0, (fp.qp - 12) / 3.0) * std::pow(4.0, info.bit_depth - 8);
                     estimate_line_motion(lines, org->p[0], rref, pg, lam, 5);

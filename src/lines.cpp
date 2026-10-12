@@ -70,8 +70,7 @@ void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const P
                           double lambda, int range) {
     const double lsad = std::sqrt(lambda);
     for (LineSeg& L : lines) {
-        int px, py;
-        gm.mv_at(L.x, L.y, px, py);
+        const int px = L.bx, py = L.by;
         const double c0 = static_cast<double>(window_sad(cur, ref, L, px, py, INT64_MAX)) + lsad * 1.0;
         int bx = (px + 2) >> 2, by = (py + 2) >> 2;
         double bc = 1e300;
@@ -104,8 +103,9 @@ void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const P
                     if (c < sc) { sc = c; mx = ox + dx; my = oy + dy; }
                 }
         }
-        // 動き場は周囲のブロックにも効くため、変更には窓の SAD 改善が 1 割以上あることも求める
-        L.changed = (mx != px || my != py) && sc + lsad * 1.0 < c0 * 0.9;
+        // 動き場は周囲のブロックにも効くため、変更には窓の SAD 改善が 25% 以上あることも求める
+        // (遮蔽が解けた背景などの一貫しない動きを送らない)
+        L.changed = (mx != px || my != py) && sc + lsad * 1.0 < c0 * 0.75;
         L.mvx = L.changed ? mx : px;
         L.mvy = L.changed ? my : py;
         L.side = 2;
@@ -117,6 +117,27 @@ void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const P
             L.side = pos && !neg ? 1 : (neg && !pos ? 0 : 2);
         }
     }
+    // 孤立した変化を落とす: 24 画素以内に、似た動き (差 2 画素以内) で変わった別の線がない線は雑音とみなす
+    std::vector<char> keep(lines.size(), 0);
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (!lines[i].changed) continue;
+        for (size_t j = 0; j < lines.size() && !keep[i]; ++j) {
+            if (j == i || !lines[j].changed) continue;
+            const int dx = lines[i].x - lines[j].x, dy = lines[i].y - lines[j].y;
+            if (dx * dx + dy * dy > 24 * 24) continue;
+            keep[i] = std::abs(lines[i].mvx - lines[j].mvx) <= 8 && std::abs(lines[i].mvy - lines[j].mvy) <= 8;
+        }
+    }
+    for (size_t i = 0; i < lines.size(); ++i)
+        if (lines[i].changed && !keep[i]) {
+            lines[i].changed = false;
+            lines[i].mvx = lines[i].bx; lines[i].mvy = lines[i].by;
+            lines[i].side = 2;
+        }
+}
+
+void set_line_base(std::vector<LineSeg>& lines, const GlobalModel& gm) {
+    for (LineSeg& L : lines) gm.mv_at(L.x, L.y, L.bx, L.by);
 }
 
 void code_line_motion(SymIO& io, CMModel& m, std::vector<LineSeg>& lines, const GlobalModel& gm) {
@@ -142,8 +163,7 @@ void code_line_motion(SymIO& io, CMModel& m, std::vector<LineSeg>& lines, const 
         LineSeg& L = lines[static_cast<size_t>(idx)];
         L.changed = true;
         chg[static_cast<size_t>(idx)] = 1;
-        int px, py;
-        gm.mv_at(L.x, L.y, px, py);
+        const int px = L.bx, py = L.by;
         const int dx = pdx + io.sint(m, 1, 0, L.mvx - px - pdx);
         const int dy = pdy + io.sint(m, 2, 0, L.mvy - py - pdy);
         if (std::abs(dx) > 4096 || std::abs(dy) > 4096) throw std::runtime_error("corrupt stream: line motion");
@@ -157,7 +177,7 @@ void code_line_motion(SymIO& io, CMModel& m, std::vector<LineSeg>& lines, const 
         if (!chg[i]) {
             LineSeg& L = lines[i];
             L.changed = false;
-            gm.mv_at(L.x, L.y, L.mvx, L.mvy);
+            L.mvx = L.bx; L.mvy = L.by;
             L.side = 2;
         }
 }
@@ -171,8 +191,8 @@ void build_line_field(const std::vector<LineSeg>& lines, const GlobalModel& gm, 
     std::vector<int> lx(lines.size()), ly(lines.size());
     auto fdiv4 = [](int v) { return v >= 0 ? v / 4 : -((-v + 3) / 4); };
     for (size_t i = 0; i < lines.size(); ++i) {
-        lx[i] = lines[i].changed ? lines[i].x - fdiv4(lines[i].mvx) : lines[i].x;
-        ly[i] = lines[i].changed ? lines[i].y - fdiv4(lines[i].mvy) : lines[i].y;
+        lx[i] = lines[i].x - fdiv4(lines[i].mvx);
+        ly[i] = lines[i].y - fdiv4(lines[i].mvy);
         const int cx = std::clamp(lx[i] / kLineCell, 0, cw - 1), cy = std::clamp(ly[i] / kLineCell, 0, ch - 1);
         cell[static_cast<size_t>(cy) * cw + cx].push_back(static_cast<int>(i));
     }

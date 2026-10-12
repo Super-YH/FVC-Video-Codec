@@ -22,6 +22,8 @@ struct LineSeg {
     int mvx = 0, mvy = 0;   // 動き (1/4 画素)
     bool changed = false;   // 大域動きから変わったか
     int side = 2;           // 動く側: 0 = 法線の − 側, 1 = + 側, 2 = 両側
+    int bx = 0, by = 0;     // 基準の動き (1/4 画素): 参照ピクチャの動きの時間伸縮、なければ大域動き。
+                            // 変わらない線はこの動きで動き、変わった線はこれからの差分を送る
 };
 
 constexpr int kLineCell = 16;
@@ -31,7 +33,9 @@ std::vector<LineSeg> extract_lines(const Plane& ref, int vw, int vh, int bit_dep
 // 符号器: 線ごとの動きを推定し、変わったかを RD で決める
 void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const Plane& ref, const GlobalModel& gm,
                           double lambda, int range);
-// 線の動きの構文 (符号器/復号器共通)。変わらない線の動きは大域動きになる
+// 線ごとの基準の動き (bx, by) を大域動きで初期化する
+void set_line_base(std::vector<LineSeg>& lines, const GlobalModel& gm);
+// 線の動きの構文 (符号器/復号器共通)。変わらない線の動きは基準の動き (bx, by) になる
 void code_line_motion(SymIO& io, CMModel& m, std::vector<LineSeg>& lines, const GlobalModel& gm);
 // 4x4 単位の動き場 (mvx, mvy の組, 1/4 画素) を作る
 void build_line_field(const std::vector<LineSeg>& lines, const GlobalModel& gm, int w4, int h4, std::vector<int16_t>& field);

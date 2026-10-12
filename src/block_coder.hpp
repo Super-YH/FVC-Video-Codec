@@ -314,6 +314,25 @@ private:
         }
         return m;
     }
+    // 2x2 単位の動き: 4x4 の中心 (4k+2) の動きを双線形補間 (線の動き場をなめらかにして、エッジ付近の段差を減らす)
+    MotionInfo line_mi2(int x, int y) const {
+        const int fx = x - 2, fy = y - 2;  // 中心格子での位置 (4 で 1 セル)
+        const int cx = fx >= 0 ? fx / 4 : -1, cy = fy >= 0 ? fy / 4 : -1;
+        const int ax = fx - cx * 4, ay = fy - cy * 4;  // 0..3
+        const MotionInfo m00 = line_mi(cx * 4, cy * 4), m10 = line_mi(cx * 4 + 4, cy * 4);
+        const MotionInfo m01 = line_mi(cx * 4, cy * 4 + 4), m11 = line_mi(cx * 4 + 4, cy * 4 + 4);
+        MotionInfo m = m00;
+        for (int l = 0; l < 2; ++l) {
+            if (!((m.dir >> l) & 1)) continue;
+            auto bl = [&](int a, int b, int c, int d) {
+                const int v = (a * (4 - ax) + b * ax) * (4 - ay) + (c * (4 - ax) + d * ax) * ay;  // ×16
+                return static_cast<int16_t>(v >= 0 ? (v + 8) >> 4 : -((-v + 8) >> 4));
+            };
+            m.mvx[l] = bl(m00.mvx[l], m10.mvx[l], m01.mvx[l], m11.mvx[l]);
+            m.mvy[l] = bl(m00.mvy[l], m10.mvy[l], m01.mvy[l], m11.mvy[l]);
+        }
+        return m;
+    }
     bool line_ok() const { return tools_.line_mv && inter_.lfield && is_luma(); }
     // 超解像: 1/2 解像度の残差 rl (h x h) を予測 pred (s x s) に導かれた補間で s x s に戻す
     void sr_upsample(int mode, const double* rl, const int32_t* pred, int s, double* r) const;
