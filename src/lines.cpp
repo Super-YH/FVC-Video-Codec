@@ -69,56 +69,54 @@ double mv_bits(int dx, int dy) { return 2.0 + 2.0 * std::log2(1.0 + std::abs(dx)
 
 void estimate_line_motion(std::vector<LineSeg>& lines, const Plane& cur, const Plane& ref, const GlobalModel& gm,
                           double lambda, int range) {
-    (void)gm;
     const double lsad = std::sqrt(lambda);
     for (LineSeg& L : lines) {
         const int px = L.bx, py = L.by;
-        // 窓 (half: 0 = 全体, 1 = 法線の + 側, -1 = − 側) ごとに動きを探索し、その窓での改善率を返す。
-        // 輪郭の線では物体側の半窓だけで測るので、背景に引きずられずに変化を判定できる
-        struct Res { int mx, my; double ratio; };
-        auto search = [&](int half) -> Res {
-            const double c0 = static_cast<double>(window_sad(cur, ref, L, px, py, INT64_MAX, half)) + lsad * 1.0;
-            int bx = (px + 2) >> 2, by = (py + 2) >> 2;
-            double bc = 1e300;
-            auto test = [&](int ix, int iy) {
-                const double c = static_cast<double>(window_sad(cur, ref, L, ix * 4, iy * 4, static_cast<int64_t>(std::min(bc, 1e15)) + 1, half)) +
-                                 lsad * mv_bits(ix * 4 - px, iy * 4 - py);
-                if (c < bc) { bc = c; bx = ix; by = iy; }
-            };
-            const int cx = bx, cy = by;
-            for (int dy = -range; dy <= range; ++dy)
-                for (int dx = -range; dx <= range; ++dx) test(cx + dx, cy + dy);
-            for (int dy = -4 * range; dy <= 4 * range; dy += 4)
-                for (int dx = -4 * range; dx <= 4 * range; dx += 4) test(cx + dx, cy + dy);
-            if (bx != cx || by != cy) {
-                const int ox = bx, oy = by;
-                for (int dy = -2; dy <= 2; ++dy)
-                    for (int dx = -2; dx <= 2; ++dx) test(ox + dx, oy + dy);
-            }
-            test(0, 0);
-            int mx = bx * 4, my = by * 4;
-            double sc = static_cast<double>(window_sad(cur, ref, L, mx, my, INT64_MAX, half)) + lsad * mv_bits(mx - px, my - py);
-            for (int st = 2; st >= 1; st >>= 1) {
-                const int ox = mx, oy = my;
-                for (int dy = -st; dy <= st; dy += st)
-                    for (int dx = -st; dx <= st; dx += st) {
-                        if (!dx && !dy) continue;
-                        const double c = static_cast<double>(window_sad(cur, ref, L, ox + dx, oy + dy, INT64_MAX, half)) +
-                                         lsad * mv_bits(ox + dx - px, oy + dy - py);
-                        if (c < sc) { sc = c; mx = ox + dx; my = oy + dy; }
-                    }
-            }
-            const double ratio = (mx == px && my == py) ? 1.0 : (sc + lsad * (half ? 2.0 : 1.0)) / std::max(c0, 1.0);
-            return {mx, my, ratio};
+        const double c0 = static_cast<double>(window_sad(cur, ref, L, px, py, INT64_MAX)) + lsad * 1.0;
+        int bx = (px + 2) >> 2, by = (py + 2) >> 2;
+        double bc = 1e300;
+        auto test = [&](int ix, int iy) {
+            const double c = static_cast<double>(window_sad(cur, ref, L, ix * 4, iy * 4, static_cast<int64_t>(std::min(bc, 1e15)) + 1)) +
+                             lsad * mv_bits(ix * 4 - px, iy * 4 - py);
+            if (c < bc) { bc = c; bx = ix; by = iy; }
         };
-        const Res r[3] = {search(0), search(1), search(-1)};
-        int bi = 0;
-        for (int k = 1; k < 3; ++k) if (r[k].ratio < r[bi].ratio) bi = k;
-        // 変更には (その窓での) SAD 改善が 25% 以上あることを求める (遮蔽が解けた背景などの一貫しない動きを送らない)
-        L.changed = r[bi].ratio < 0.75;
-        L.mvx = L.changed ? r[bi].mx : px;
-        L.mvy = L.changed ? r[bi].my : py;
-        L.side = !L.changed ? 2 : (bi == 0 ? 2 : (bi == 1 ? 1 : 0));
+        const int cx = bx, cy = by;
+        for (int dy = -range; dy <= range; ++dy)
+            for (int dx = -range; dx <= range; ++dx) test(cx + dx, cy + dy);
+        // 粗い格子 (大きな動き)。実測 (v17 特許安全): ±48 画素に広げても改善せず (-0.02 dB)、±4·range に留める
+        for (int dy = -4 * range; dy <= 4 * range; dy += 4)
+            for (int dx = -4 * range; dx <= 4 * range; dx += 4) test(cx + dx, cy + dy);
+        if (bx != cx || by != cy) {
+            const int ox = bx, oy = by;
+            for (int dy = -2; dy <= 2; ++dy)
+                for (int dx = -2; dx <= 2; ++dx) test(ox + dx, oy + dy);
+        }
+        test(0, 0);
+        int mx = bx * 4, my = by * 4;
+        double sc = static_cast<double>(window_sad(cur, ref, L, mx, my, INT64_MAX)) + lsad * mv_bits(mx - px, my - py);
+        for (int st = 2; st >= 1; st >>= 1) {
+            const int ox = mx, oy = my;
+            for (int dy = -st; dy <= st; dy += st)
+                for (int dx = -st; dx <= st; dx += st) {
+                    if (!dx && !dy) continue;
+                    const double c = static_cast<double>(window_sad(cur, ref, L, ox + dx, oy + dy, INT64_MAX)) +
+                                     lsad * mv_bits(ox + dx - px, oy + dy - py);
+                    if (c < sc) { sc = c; mx = ox + dx; my = oy + dy; }
+                }
+        }
+        // 動き場は周囲のブロックにも効くため、変更には窓の SAD 改善が 25% 以上あることも求める
+        // (遮蔽が解けた背景などの一貫しない動きを送らない)
+        L.changed = (mx != px || my != py) && sc + lsad * 1.0 < c0 * 0.75;
+        L.mvx = L.changed ? mx : px;
+        L.mvy = L.changed ? my : py;
+        L.side = 2;
+        if (L.changed) {
+            // どちら側が動いたか: 半窓ごとに、線の動きと大域動きの SAD を比べる
+            const int64_t pm = window_sad(cur, ref, L, mx, my, INT64_MAX, 1), pg = window_sad(cur, ref, L, px, py, INT64_MAX, 1);
+            const int64_t nm = window_sad(cur, ref, L, mx, my, INT64_MAX, -1), ng = window_sad(cur, ref, L, px, py, INT64_MAX, -1);
+            const bool pos = pm * 10 < pg * 9, neg = nm * 10 < ng * 9;
+            L.side = pos && !neg ? 1 : (neg && !pos ? 0 : 2);
+        }
     }
     // 孤立した変化を落とす: 24 画素以内に、似た動き (差 2 画素以内) で変わった別の線がない線は雑音とみなす
     std::vector<char> keep(lines.size(), 0);
