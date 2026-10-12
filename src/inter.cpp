@@ -15,6 +15,15 @@ constexpr int kLuma[4][8] = {{0, 0, 0, 64, 0, 0, 0, 0},
 constexpr int kChroma[8][4] = {{0, 64, 0, 0},     {-2, 58, 10, -2}, {-4, 54, 16, -2}, {-6, 46, 28, -4},
                                {-4, 36, 36, -4},  {-4, 28, 46, -6}, {-2, 16, 54, -4}, {-2, 10, 58, -2}};
 
+// 独自の補間フィルタ (特許安全モード): 輝度は Lanczos-3 窓付き sinc (Duchon 1979) の 6 タップ、
+// 色差は Keys の 3 次畳み込み (a = -0.5, 1981) の 4 タップ。いずれも係数和 64 に丸めたもの
+constexpr int kLumaOwn[4][8] = {{0, 0, 0, 64, 0, 0, 0, 0},
+                                {0, 2, -9, 57, 17, -4, 1, 0},
+                                {0, 2, -9, 39, 39, -9, 2, 0},
+                                {0, 1, -4, 17, 57, -9, 2, 0}};
+constexpr int kChromaOwn[8][4] = {{0, 64, 0, 0},     {-3, 62, 6, -1},  {-4, 56, 14, -2}, {-5, 47, 25, -3},
+                                  {-4, 36, 36, -4},  {-3, 25, 47, -5}, {-2, 14, 56, -4}, {-1, 6, 62, -3}};
+
 inline int floor_div(int a, int b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
 }  // namespace
 
@@ -26,8 +35,8 @@ void motion_compensate(const RefPlane& ref, int x0, int y0, int w, int h, int mv
     const int fx = mvx - ix * one, fy = mvy - iy * one;
     const bool luma = frac_bits == 2;
     const int taps = luma ? 8 : 4, half = taps / 2 - 1;
-    const int* cx = luma ? kLuma[fx] : kChroma[fx];
-    const int* cy = luma ? kLuma[fy] : kChroma[fy];
+    const int* cx = luma ? (ref.own_filter ? kLumaOwn[fx] : kLuma[fx]) : (ref.own_filter ? kChromaOwn[fx] : kChroma[fx]);
+    const int* cy = luma ? (ref.own_filter ? kLumaOwn[fy] : kLuma[fy]) : (ref.own_filter ? kChromaOwn[fy] : kChroma[fy]);
     // 高速経路: 整数ベクトル・平滑なし (参照内部ならクランプも不要)
     if (fx == 0 && fy == 0 && psi == 0) {
         out64.resize(static_cast<size_t>(w) * h);

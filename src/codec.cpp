@@ -1122,7 +1122,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
             for (int l = 0; l < 2; ++l) {
                 ic.nref[l] = static_cast<int>(refs[l].size());
                 RefPlane* arr = l ? ic.l1 : ic.l0;
-                for (size_t r = 0; r < refs[l].size() && r < 4; ++r) arr[r].p = &refs[l][r]->p[pi];
+                for (size_t r = 0; r < refs[l].size() && r < 4; ++r) { arr[r].p = &refs[l][r]->p[pi]; arr[r].own_filter = fp.tools.own_interp; }
             }
             if (hgain[pi] != 64) {
                 // L0 先頭参照を帯域別ゲインで変形したもの (低域そのまま + 高域 hg/64 倍)
@@ -1571,6 +1571,7 @@ FrameParams params_from(const EncoderConfig& c) {
         fp.alf = false;
         t.all_angular = false;
         t.safe_intra = true;
+        t.own_interp = true;  // HEVC の DCT-IF 係数を使わない
         t.no_merge = true;
         fp.no_deblock = true;
     }
@@ -1588,6 +1589,7 @@ FrameParams params_from(const EncoderConfig& c) {
     if (c.safe_intra >= 0) t.safe_intra = c.safe_intra != 0;
     if (c.merge >= 0) t.no_merge = c.merge == 0;
     if (c.bline >= 0) t.bline = c.bline != 0;
+    if (c.interp >= 0) t.own_interp = c.interp != 0;
     // エッジモード: 実測 (lena slow) 特許安全版 +0.022 dB / 全機能版 +0.025 dB。符号器の試行が増えるため slow 以上で既定オン
     t.edge = c.edge >= 0 ? c.edge != 0 : c.preset >= Preset::Slow;
     if (c.brest >= 0) { fp.brest = c.brest != 0; if (fp.brest) fp.alf = false; }
@@ -1621,7 +1623,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
     put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u) |
                   (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u) | (fp.tools.firb ? 128u : 0u));
-    put_u8(p, (fp.tools.guide ? 1u : 0u) | (fp.brest ? 2u : 0u) | (fp.tools.bline ? 8u : 0u) | (fp.tools.edge ? 16u : 0u));
+    put_u8(p, (fp.tools.guide ? 1u : 0u) | (fp.brest ? 2u : 0u) | (fp.tools.bline ? 8u : 0u) | (fp.tools.edge ? 16u : 0u) | (fp.tools.own_interp ? 32u : 0u));
     put_u8(p, (fp.tools.no_merge ? 1u : 0u) | (fp.no_deblock ? 2u : 0u) | (fp.range_coder ? 4u : 0u) |
                   (fp.tools.no_obmc ? 8u : 0u) | (fp.tools.no_sp ? 16u : 0u) | (fp.tools.line_mv ? 32u : 0u) |
                   (fp.tools.sr ? 64u : 0u) | (fp.tools.safe_intra ? 128u : 0u));
@@ -1664,7 +1666,8 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.tools.gs = (f3 >> 6) & 1;
     fp.tools.firb = (f3 >> 7) & 1;
     const uint32_t f5 = br.u8();
-    if (f5 > 31) return false;
+    if (f5 > 63) return false;
+    fp.tools.own_interp = (f5 >> 5) & 1;
     fp.tools.edge = (f5 >> 4) & 1;
     fp.tools.bline = (f5 >> 3) & 1;
     fp.tools.guide = f5 & 1;

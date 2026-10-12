@@ -14,6 +14,7 @@ struct RefPlane {
     const Plane* p = nullptr;
     int gain_q = 64;    // Q6 (64 = 1.0)
     int32_t off = 0;
+    bool own_filter = false;  // true: 独自の補間フィルタ (輝度 Lanczos-3 6 タップ, 色差 Keys 3 次 4 タップ)
 };
 
 // 4x4 (輝度) 単位の動き情報
@@ -67,7 +68,7 @@ struct GlobalModel {
 };
 
 // 動き補償 1 方向。mv は frac_bits の固定小数 (輝度: 2 = 1/4 画素, 4:2:0 色差: 3 = 1/8 画素)。
-// 輝度は 8 タップ DCT-IF、色差は 4 タップ。psi>0 で 3x3 分離平滑 [a,1-2a,a], a = psi/16 (§7.3)。
+// 輝度は 8 タップ DCT-IF、色差は 4 タップ (own_filter: 輝度 Lanczos-3、色差 Keys 3 次畳み込み)。psi>0 で 3x3 分離平滑 [a,1-2a,a], a = psi/16 (§7.3)。
 // 出力は 1/64 精度 (×64) の中間値。
 void motion_compensate(const RefPlane& ref, int x0, int y0, int w, int h, int mvx, int mvy, int frac_bits, int psi,
                        std::vector<int32_t>& out64);
