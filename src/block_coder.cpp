@@ -1057,10 +1057,20 @@ void BlockCoder::motion_search(int x0, int y0, int w, int h, std::vector<Leaf>& 
                 return static_cast<double>(me_cost(x0, y0, w, h, t)) + lsad * (mvbits(vx - px, vy - py) + (inter_.nref[list] > 1 ? ref : 0));
             };
             double sc = subcost(mx, my);
-            for (int step = 2; step >= (search_.qpel ? 1 : 2); step >>= 1) {
+            if (search_.qpel) {
+                // 1/4 画素格子上の SPSA-Adam (8 近傍 × 2 段の探索の代わり)。整数位置 ±3/4 画素の範囲
+                const std::array<int, 2> s0[1] = {{mx, my}};
+                auto f = [&](const std::array<int, 2>& v) {
+                    const double c = subcost(v[0], v[1]);
+                    if (c < sc) { sc = c; mx = v[0]; my = v[1]; }
+                    return c;
+                };
+                lattice_adam<2>(f, s0, 1, {mx - 3, my - 3}, {mx + 3, my + 3}, 2.0, &sub_adam_[list], &sub_adam_[list],
+                                static_cast<uint64_t>(x0) * 31 + static_cast<uint64_t>(y0) + 17, 8);
+            } else {
                 const int ox = mx, oy = my;
-                for (int dy = -step; dy <= step; dy += step)
-                    for (int dx = -step; dx <= step; dx += step) {
+                for (int dy = -2; dy <= 2; dy += 2)
+                    for (int dx = -2; dx <= 2; dx += 2) {
                         if (!dx && !dy) continue;
                         const double c = subcost(ox + dx, oy + dy);
                         if (c < sc) { sc = c; mx = ox + dx; my = oy + dy; }
@@ -1731,21 +1741,24 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             return sad;
         };
         if (tools_.safe_intra) {
-            // 座標降下: DC・平面と 4 方向おきの線方向を評価し、良い 2 方向の周り (±2, ±1) だけを詳しく見る
-            std::vector<char> done(kNumLine, 0);
+            // 線方向の SPSA-Adam (全方向の評価の代わり): 開始点は左・上の方向と 4 方向 (0, 8, 16, 24)。
+            // 評価した方向はすべて候補にする (RD は上位だけを本評価する)
             for (int m : {kModeDC, kModePlanar}) sads.push_back({sad_of(m), m});
-            std::vector<std::pair<int64_t, int>> dirs;
-            for (int d = 0; d < kNumLine; d += 4) { dirs.push_back({sad_of(kModeLine0 + d), d}); done[d] = 1; }
-            std::sort(dirs.begin(), dirs.end());
-            for (size_t k = 0; k < std::min<size_t>(2, dirs.size()); ++k)
-                for (int st : {2, 1}) {
-                    const int c0 = dirs[k].second;
-                    for (int dd : {-st, st}) {
-                        const int d = (c0 + dd + kNumLine) % kNumLine;
-                        if (!done[d]) { done[d] = 1; dirs.push_back({sad_of(kModeLine0 + d), d}); }
-                    }
-                }
-            for (const auto& dv : dirs) sads.push_back({dv.first, kModeLine0 + dv.second});
+            const int gw = rec_->w / 4;
+            const int lm = x0 > tx0_ ? modes4_[(y0 / 4) * gw + (x0 / 4 - 1)] : -1;
+            const int am = y0 > ty0_ ? modes4_[(y0 / 4 - 1) * gw + (x0 / 4)] : -1;
+            std::array<int, 1> st[6];
+            int ns = 0;
+            for (int m : {lm, am}) if (m >= kModeLine0) st[ns++] = {m - kModeLine0};
+            for (int d : {0, 8, 16, 24}) st[ns++] = {d};
+            std::vector<char> done(kNumLine, 0);
+            auto f = [&](const std::array<int, 1>& v) {
+                const int64_t sd = sad_of(kModeLine0 + v[0]);
+                if (!done[v[0]]) { done[v[0]] = 1; sads.push_back({sd, kModeLine0 + v[0]}); }
+                return static_cast<double>(sd);
+            };
+            lattice_adam<1>(f, st, ns, {0}, {kNumLine - 1}, 3.0, &intra_adam_, &intra_adam_,
+                            static_cast<uint64_t>(x0) * 7 + static_cast<uint64_t>(y0) * 3 + static_cast<uint64_t>(l), 10);
         } else {
             for (int m : modes) sads.push_back({sad_of(m), m});
         }
@@ -1984,13 +1997,16 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
             double be = pse(preds[ci].data()) - lambda_ * 6.0;
             int bed = 0;
             std::vector<int32_t> tp(static_cast<size_t>(n));
-            for (int sh = 0; sh < 4; ++sh)
-                for (int dq = -4; dq <= 4; dq += 2) {
-                    std::copy(preds[ci].begin(), preds[ci].end(), tp.begin());
-                    edge_sharpen_block(tp.data(), s, sh, dq, lo_, hi_, bd);
-                    const double e = pse(tp.data());
-                    if (e < be) { be = e; bed = 1 + sh * 9 + dq + 4; }
-                }
+            // (鋭さ, 位置補正) の SPSA-Adam (20 通りの評価の代わり)
+            auto f = [&](const std::array<int, 2>& v) {
+                std::copy(preds[ci].begin(), preds[ci].end(), tp.begin());
+                edge_sharpen_block(tp.data(), s, v[0], v[1], lo_, hi_, bd);
+                const double e = pse(tp.data());
+                if (e < be) { be = e; bed = 1 + v[0] * 9 + v[1] + 4; }
+                return e;
+            };
+            const std::array<int, 2> st[2] = {{1, 0}, {2, 0}};
+            lattice_adam<2>(f, st, 2, {0, -4}, {3, 4}, 2.0, &edge_adam_, &edge_adam_, static_cast<uint64_t>(x0) * 13 + static_cast<uint64_t>(y0), 8);
             if (!bed) continue;
             Leaf v = cands[ci];
             v.edge = bed;

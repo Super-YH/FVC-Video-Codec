@@ -306,7 +306,9 @@ private:
 
     void obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const;
     // 動き探索の Adam 状態 (リストごと、直前に探索したブロックから継承する)
-    mutable AdamState<2> me_adam_[2];
+    mutable AdamState<2> me_adam_[2], sub_adam_[2];
+    mutable AdamState<1> intra_adam_;
+    mutable AdamState<2> edge_adam_;
     // 線の動き場: 輝度位置 (x, y) の動き (L0 先頭参照)
     MotionInfo line_mi(int x, int y) const {
         MotionInfo m;
