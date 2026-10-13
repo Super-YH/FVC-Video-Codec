@@ -4,6 +4,7 @@
 #include "prof.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <cmath>
 #include <stdexcept>
@@ -149,6 +150,69 @@ void decay_deblock(Plane& p, const EdgeInfo& e, int rq, int thr, int32_t lo, int
                         if (c == 0) break;
                         px(-1 - j) = std::clamp(px(-1 - j) + c, lo, hi);
                         px(j) = std::clamp(px(j) - c, lo, hi);
+                    }
+                }
+            }
+}
+
+// MPEG-4 Part 2 (ISO/IEC 14496-2, 1999) 型のデブロック。境界をまたぐ 10 画素 v0..v9 (境界は v4 | v5) について
+//  平坦度 eq = Σ_{i=0..8} [|v_i - v_{i+1}| <= T1] が T2 以上なら DC オフセット (平坦) モード:
+//    max - min < 2 QP のときだけ v1..v8 を 9 タップ [1 1 2 2 4 2 2 1 1]/16 で平滑化 (端は v0 / v9 で延長)
+//  それ以外は既定モード: 4 点の高域成分 a = [2 -5 5 -2]·(v3..v6)/8 を、左右の区間 (v1..v4, v5..v8) の
+//    同じ成分の小さい方まで減らし、その差の 5/8 (段差の半分まで) だけ v4, v5 を動かす
+// qp: 強さ (画素値の単位)。両側が 8 画素以上の境界だけ平坦モードを使う
+void mpeg4_deblock(Plane& p, const EdgeInfo& e, int qp, int bit_depth, int32_t lo, int32_t hi) {
+    if (qp <= 0) return;
+    const int t1 = 2 << std::max(0, bit_depth - 8), t2 = 6;
+    auto leaf = [&](int cx, int cy) { return e.leaf[static_cast<size_t>(cy) * e.w4 + cx]; };
+    auto run = [&](int cx, int cy, int dx, int dy) {
+        const int32_t id = leaf(cx, cy);
+        int len = 0;
+        while (len < 2 && cx >= 0 && cy >= 0 && cx < e.w4 && cy < e.h4 && leaf(cx, cy) == id) { ++len; cx += dx; cy += dy; }
+        return len * 4;
+    };
+    const int W4 = std::min(e.w4, p.w / 4), H4 = std::min(e.h4, p.h / 4);
+    for (int dir = 0; dir < 2; ++dir)
+        for (int cy = dir; cy < H4; ++cy)
+            for (int cx = 1 - dir; cx < W4; ++cx) {
+                const int ax = dir == 0 ? cx - 1 : cx, ay = dir == 0 ? cy : cy - 1;
+                if (leaf(ax, ay) == leaf(cx, cy)) continue;
+                const bool wide = (dir == 0 ? run(ax, ay, -1, 0) : run(ax, ay, 0, -1)) >= 8 &&
+                                  (dir == 0 ? run(cx, cy, 1, 0) : run(cx, cy, 0, 1)) >= 8;
+                const int pos = dir == 0 ? cx * 4 : cy * 4, lim = dir == 0 ? p.w : p.h;
+                for (int k = 0; k < 4; ++k) {
+                    auto at = [&](int i) -> int32_t& {
+                        const int q = std::clamp(pos + i, 0, lim - 1);
+                        return dir == 0 ? p.at(q, cy * 4 + k) : p.at(cx * 4 + k, q);
+                    };
+                    int v[10];
+                    for (int i = 0; i < 10; ++i) v[i] = at(i - 5);
+                    int eq = 0;
+                    for (int i = 0; i < 9; ++i) eq += std::abs(v[i] - v[i + 1]) <= t1;
+                    if (wide && eq >= t2) {
+                        int mx = v[1], mn = v[1];
+                        for (int i = 2; i <= 8; ++i) { mx = std::max(mx, v[i]); mn = std::min(mn, v[i]); }
+                        if (mx - mn >= 2 * qp) continue;
+                        static constexpr int kW[9] = {1, 1, 2, 2, 4, 2, 2, 1, 1};
+                        int o[10];
+                        for (int n = 1; n <= 8; ++n) {
+                            int acc = 0;
+                            for (int t = -4; t <= 4; ++t) acc += kW[t + 4] * v[std::clamp(n + t, 0, 9)];
+                            o[n] = (acc + 8) >> 4;
+                        }
+                        for (int n = 1; n <= 8; ++n) at(n - 5) = std::clamp(o[n], lo, hi);
+                    } else {
+                        const int a30 = (2 * v[3] - 5 * v[4] + 5 * v[5] - 2 * v[6]) / 8;
+                        if (std::abs(a30) >= qp) continue;
+                        const int a31 = (2 * v[1] - 5 * v[2] + 5 * v[3] - 2 * v[4]) / 8;
+                        const int a32 = (2 * v[5] - 5 * v[6] + 5 * v[7] - 2 * v[8]) / 8;
+                        const int mag = std::min({std::abs(a30), std::abs(a31), std::abs(a32)});
+                        const int a30n = a30 < 0 ? -mag : mag;
+                        const int half = (v[4] - v[5]) / 2;
+                        int d = 5 * (a30n - a30) / 8;
+                        d = half >= 0 ? std::clamp(d, 0, half) : std::clamp(d, half, 0);
+                        at(-1) = std::clamp(v[4] - d, lo, hi);
+                        at(0) = std::clamp(v[5] + d, lo, hi);
                     }
                 }
             }
@@ -394,6 +458,29 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
             const std::array<int, 2> st[1] = {{3, 2}};
             lattice_adam<2>(f, st, 1, {0, 0}, {5, 6}, 1.5, nullptr, nullptr, 11, 8);
         }
+        // MPEG-4 型: 強さ QP = thr_of(js) を 1 変数の SPSA-Adam で選び、減衰デブロックより良ければ使う
+        int js = 0;
+        if (io.enc && org) {
+            static constexpr int kJ[10] = {1, 2, 3, 4, 5, 6, 8, 10, 12, 16};
+            double bj = 1e300;
+            Plane bestJ;
+            auto f = [&](const std::array<int, 1>& v) {
+                Plane t2 = R;
+                mpeg4_deblock(t2, e, thr_of(kJ[v[0]]), bit_depth, lo, hi);
+                const double s = sse(t2);
+                if (s < bj) { bj = s; js = kJ[v[0]]; bestJ = std::move(t2); }
+                return s;
+            };
+            const std::array<int, 1> st[1] = {{3}};
+            lattice_adam<1>(f, st, 1, {0}, {9}, 1.5, nullptr, nullptr, 13, 8);
+            if (bj < sse(D)) { D = std::move(bestJ); rq = 0; } else js = 0;
+        }
+        const int use_j = io.bit(m, 9, 0, 0, js > 0);
+        if (use_j) {
+            js = static_cast<int>(io.uint(m, 10, 0, static_cast<uint32_t>(js)));
+            if (js < 1 || js > 64) throw std::runtime_error("corrupt stream: mpeg4 deblock strength");
+            if (!(io.enc && org)) mpeg4_deblock(D, e, thr_of(js), bit_depth, lo, hi);
+        } else {
         rq = static_cast<int>(io.uint(m, 6, 0, static_cast<uint32_t>(rq)));
         if (rq > 15) throw std::runtime_error("corrupt stream: decay deblock");
         if (rq) {
@@ -401,6 +488,7 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
             if (tq < 1 || tq > 64) throw std::runtime_error("corrupt stream: decay threshold");
         }
         if (!(io.enc && org)) decay_deblock(D, e, rq, thr_of(tq), lo, hi);
+        }
     }
     // 9.2 周波数ゲイン: 符号器は μ 候補から最小 SSE を選ぶ
     Plane F;
@@ -451,7 +539,19 @@ void code_loop_filter(SymIO& io, CMModel& m, Plane& R, const Plane* org, const E
                     gain += e1 - e2;
                     lp.gamma[cy * cw + cx] = g;
                 }
-            use_map = gain > lambda * 3.0 * cw * ch;
+            // マップの符号量は実際の構文で見積もる (以前の 3 ビット/セルの近似は過小評価で、低レートでマップを使いすぎた)
+            double mbits = 0;
+            {
+                SymIO ce;
+                ce.cost = &mbits;
+                ce.enc = true;
+                int prev = 64;
+                for (int g : lp.gamma) {
+                    ce.sint(m, 4, static_cast<uint32_t>(std::min(std::abs(prev - 64) >> 3, 7)), g - prev);
+                    prev = g;
+                }
+            }
+            use_map = gain > lambda * (mbits + 1.0);
         }
         use_map = io.bit(m, 3, 0, 0, use_map);
         if (use_map) {
