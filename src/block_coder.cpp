@@ -2299,12 +2299,30 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
                     else lf.mode = io.bit(md.mode, 42, cc, pc, lf.mode == kModePaeth) ? kModePaeth : kModeDC;
                 } else {
                     const int dv = io.enc ? lf.mode - kModeLine0 : 0;
-                    uint32_t tree = 1;
-                    for (int b = 4; b >= 0; --b) {
-                        const int bt = io.bit(md.mode, 64 + tree, dir(lm) | (pc << 6), dir(am), (dv >> b) & 1);
-                        tree = (tree << 1) | static_cast<uint32_t>(bt);
+                    // 隣に線モードがあれば、その方向との差 (32 方向の巡回差, -16..15) を符号化する
+                    // (方向は空間的に連続なので差は 0 付近に集まる)。なければ 5 ビットの二分木
+                    const int rm = lm >= kModeLine0 ? lm : (am >= kModeLine0 ? am : -1);
+                    if (rm >= 0) {
+                        const int rd = rm - kModeLine0;
+                        const uint32_t both = (lm >= kModeLine0 && am >= kModeLine0) ? (lm == am ? 2u : 1u) : 0u;
+                        const int delta = io.enc ? ((dv - rd + 48) % 32) - 16 : 0;  // -16..15
+                        const int nz = io.bit(md.mode, 120, both, pc, delta != 0);
+                        int dd = 0;
+                        if (nz) {
+                            const int neg = io.bit(md.mode, 121, both, pc, delta < 0);
+                            const uint32_t mag = io.uint(md.mode, 122 + both, pc, static_cast<uint32_t>(std::abs(delta) - 1)) + 1;
+                            if (mag > 16) throw std::runtime_error("corrupt stream: line delta");
+                            dd = neg ? -static_cast<int>(mag) : static_cast<int>(mag);
+                        }
+                        lf.mode = kModeLine0 + ((rd + dd + 32) % 32);
+                    } else {
+                        uint32_t tree = 1;
+                        for (int b = 4; b >= 0; --b) {
+                            const int bt = io.bit(md.mode, 64 + tree, dir(lm) | (pc << 6), dir(am), (dv >> b) & 1);
+                            tree = (tree << 1) | static_cast<uint32_t>(bt);
+                        }
+                        lf.mode = kModeLine0 + static_cast<int>(tree - 32);
                     }
-                    lf.mode = kModeLine0 + static_cast<int>(tree - 32);
                 }
             } else if (tools_.all_angular) {
                 // 6 候補 MPM: 切り詰め単進のインデックス、それ以外は残り 31 モードを 5 ビット (二分木文脈)
