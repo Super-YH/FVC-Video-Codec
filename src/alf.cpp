@@ -11,9 +11,12 @@ namespace {
 constexpr int kTaps = 12;  // |dx|+|dy| <= 3 の半平面
 constexpr int kOff[kTaps][2] = {{1, 0}, {2, 0}, {3, 0}, {-2, 1}, {-1, 1}, {0, 1}, {1, 1}, {2, 1},
                                 {-1, 2}, {0, 2}, {1, 2}, {0, 3}};
+// 特許安全版 (safe): 5x5 正方窓の点対称フィルタ (半平面の 12 組)。ダイヤモンド形状を使わない
+constexpr int kOffSq[kTaps][2] = {{1, 0}, {2, 0}, {-2, 1}, {-1, 1}, {0, 1}, {1, 1}, {2, 1},
+                                  {-2, 2}, {-1, 2}, {0, 2}, {1, 2}, {2, 2}};
 constexpr int kCtuA = 64;
 
-int classify(const Plane& r, int bx, int by, int bd) {
+int classify(const Plane& r, int bx, int by, int bd, bool safe = false) {
     int64_t gh = 0, gv = 0;
     for (int y = by; y < by + 4; ++y)
         for (int x = bx; x < bx + 4; ++x) {
@@ -25,6 +28,7 @@ int classify(const Plane& r, int bx, int by, int bd) {
         }
     const int64_t act = (gh + gv) >> (bd - 8);
     const int aq = act <= 32 ? 0 : act <= 96 ? 1 : act <= 256 ? 2 : 3;
+    if (safe) return aq;  // 特許安全版: 方向で分けない (活動度 4 段のみ)
     const int dir = gh > 2 * gv ? 1 : gv > 2 * gh ? 2 : 0;
     return aq + 4 * dir;
 }
@@ -61,18 +65,19 @@ bool solve(std::vector<double> A, std::vector<double> b, int n, std::vector<doub
 }  // namespace
 
 void code_alf(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, int bit_depth, double lambda, int32_t lo,
-              int32_t hi) {
-    const int ncls = luma ? 12 : 1;
+              int32_t hi, bool safe) {
+    const int ncls = luma ? (safe ? 4 : 12) : 1;
+    const int (*off)[2] = safe ? kOffSq : kOff;
     const int W = R.w, H = R.h, bw = W / 4, bh = H / 4;
     std::vector<uint8_t> cls(static_cast<size_t>(bw) * bh, 0);
     if (luma)
         parallel_for(bh, [&](int by) {
-            for (int bx = 0; bx < bw; ++bx) cls[by * bw + bx] = static_cast<uint8_t>(classify(R, bx * 4, by * 4, bit_depth));
+            for (int bx = 0; bx < bw; ++bx) cls[by * bw + bx] = static_cast<uint8_t>(classify(R, bx * 4, by * 4, bit_depth, safe));
         });
     auto feat = [&](int x, int y, int k) {
         const int32_t c = R.at(x, y);
-        const int x1 = std::clamp(x + kOff[k][0], 0, W - 1), y1 = std::clamp(y + kOff[k][1], 0, H - 1);
-        const int x2 = std::clamp(x - kOff[k][0], 0, W - 1), y2 = std::clamp(y - kOff[k][1], 0, H - 1);
+        const int x1 = std::clamp(x + off[k][0], 0, W - 1), y1 = std::clamp(y + off[k][1], 0, H - 1);
+        const int x2 = std::clamp(x - off[k][0], 0, W - 1), y2 = std::clamp(y - off[k][1], 0, H - 1);
         return R.at(x1, y1) + R.at(x2, y2) - 2 * c;
     };
     // 係数の推定 (符号器)

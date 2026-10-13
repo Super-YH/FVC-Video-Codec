@@ -12,6 +12,7 @@
 namespace fvc {
 
 void code_alf(SymIO& io, CMModel& m, Plane& R, const Plane* org, bool luma, int bit_depth, double lambda, int32_t lo,
-              int32_t hi);
+              int32_t hi, bool safe = false);
+// safe: 特許安全版 (5x5 正方窓、活動度のみの 4 クラス。古典的な最小二乗 (ウィーナー) 復元フィルタ)
 
 }  // namespace fvc
