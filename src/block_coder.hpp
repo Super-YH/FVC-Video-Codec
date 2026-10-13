@@ -117,6 +117,7 @@ struct Tools {
     bool line_mv = false;     // 線に基づく動き場のモード (lines.hpp)
     bool safe_intra = false;  // 特許安全イントラ: DC / 最小二乗平面 / 32 方向の両側線補間 (モードは近傍を文脈にして直接符号化)
     bool own_interp = false;  // 独自の補間フィルタ (inter.cpp)
+    bool inherit = false;     // 特許安全モードの動きの継承 (左/上の動きをそのまま使う 2 択。マージの代替)
     bool edge = false;        // ブロックのエッジモード (予測の中の線を理想エッジで鋭くする)
     bool bline = false;       // 帯域画像の線予測 (静止画の帯域方式で高域を線のエッジモデルから予測)
     bool guide = false;       // 輝度誘導の色差予測 (特許安全モードの CfL 代替): 色差モード kModeCfl の意味を置き換える

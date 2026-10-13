@@ -877,7 +877,23 @@ bool BlockCoder::temporal_cand(int x, int y, MotionInfo& out) const {
 
 int BlockCoder::merge_list(int x0, int y0, int w, int h, MotionInfo* out) const {
     int n = 0;
-    if (tools_.no_merge) return 0;
+    if (tools_.no_merge) {
+        if (!tools_.inherit) return 0;
+        // 動きの継承 (マージの代替): 候補は「左の動き」「上の動き」の固定 2 位置だけ。候補リストの構築
+        // (時間方向候補・重複除去・追加候補) は行わず、使えない位置は 0 ベクトル (L0) とする。
+        // 隣接ブロックの動きをそのまま使う考え方は H.261/MPEG-1 時代からの既知技術
+        auto at = [&](bool ok, int x, int y) {
+            MotionInfo z;
+            z.dir = 1;
+            if (!ok) return z;
+            const MotionInfo m = inter_.mf->at(x, y);
+            if (m.dir == 0 || (((m.dir >> 1) & 1) && inter_.nref[1] == 0)) return z;
+            return m;
+        };
+        out[0] = at(x0 > tx0_, x0 - 1, y0 + h - 1);
+        out[1] = at(y0 > ty0_, x0 + w - 1, y0 - 1);
+        return 2;
+    }
     auto push = [&](const MotionInfo& m) {
         if (m.dir == 0 || n >= kMaxMerge) return;
         if (((m.dir >> 1) & 1) && inter_.nref[1] == 0) return;

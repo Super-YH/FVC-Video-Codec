@@ -1617,6 +1617,15 @@ FrameParams params_from(const EncoderConfig& c) {
         fp.gm_translation_only = true;
     }
     if (c.safe & 4) fp.range_coder = true;
+    // --safe の後でも明示指定は優先する (区分ごとの損失を 1 つずつ測れるように)
+    if (c.safe) {
+        if (c.tmvp >= 0) t.tmvp = c.tmvp != 0;
+        if (c.cdef >= 0) fp.cdef = c.cdef != 0;
+        if (c.alf >= 0) { fp.alf = c.alf != 0; if (fp.alf) fp.brest = false; }
+        if (c.mts >= 0) t.mts = s.try_mts = c.mts != 0;
+        if (c.ibc >= 0) t.ibc = c.ibc != 0;
+        if (c.cfl >= 0) t.cfl = c.cfl != 0;
+    }
     // 線の動き場: 既定は特許安全モード (マージ/TMVP を外す区分 1) で有効
     // medium 以下は速度優先で既定オフ (二重符号化の RD 判定なしでは q32 で +1.7% と損になるため)
     t.line_mv = c.line_mv >= 0 ? c.line_mv != 0 : ((c.safe & 1) != 0 && c.preset >= Preset::Slow);
@@ -1625,6 +1634,8 @@ FrameParams params_from(const EncoderConfig& c) {
     if (c.merge >= 0) t.no_merge = c.merge == 0;
     if (c.bline >= 0) t.bline = c.bline != 0;
     if (c.interp >= 0) t.own_interp = c.interp != 0;
+    // 動きの継承: マージを外した特許安全モードで既定オン
+    t.inherit = c.inherit >= 0 ? c.inherit != 0 : t.no_merge;
     // エッジモード: 実測 (lena slow) 特許安全版 +0.022 dB / 全機能版 +0.025 dB。符号器の試行が増えるため slow 以上で既定オン
     t.edge = c.edge >= 0 ? c.edge != 0 : c.preset >= Preset::Slow;
     if (c.brest >= 0) { fp.brest = c.brest != 0; if (fp.brest) fp.alf = false; }
@@ -1659,7 +1670,7 @@ void write_frame_header(std::vector<uint8_t>& p, const FrameParams& fp) {
     put_u8(p, static_cast<uint32_t>(fp.cqp_off + 32) | (fp.aqp ? 128u : 0u));
     put_u8(p, (fp.alf ? 1u : 0u) | (fp.tools.mts ? 2u : 0u) | (fp.band_blocks ? 4u : 0u) | (fp.band_ns ? 8u : 0u) |
                   (fp.tools.inter_ns ? 16u : 0u) | (fp.cdef ? 32u : 0u) | (fp.tools.gs ? 64u : 0u) | (fp.tools.firb ? 128u : 0u));
-    put_u8(p, (fp.tools.guide ? 1u : 0u) | (fp.brest ? 2u : 0u) | (fp.tools.bline ? 8u : 0u) | (fp.tools.edge ? 16u : 0u) | (fp.tools.own_interp ? 32u : 0u));
+    put_u8(p, (fp.tools.guide ? 1u : 0u) | (fp.brest ? 2u : 0u) | (fp.tools.bline ? 8u : 0u) | (fp.tools.edge ? 16u : 0u) | (fp.tools.own_interp ? 32u : 0u) | (fp.tools.inherit ? 64u : 0u));
     put_u8(p, (fp.tools.no_merge ? 1u : 0u) | (fp.no_deblock ? 2u : 0u) | (fp.range_coder ? 4u : 0u) |
                   (fp.tools.no_obmc ? 8u : 0u) | (fp.tools.no_sp ? 16u : 0u) | (fp.tools.line_mv && !fp.lines_off ? 32u : 0u) |
                   (fp.tools.sr ? 64u : 0u) | (fp.tools.safe_intra ? 128u : 0u));
@@ -1704,6 +1715,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     const uint32_t f5 = br.u8();
     if (f5 > 63) return false;
     fp.tools.own_interp = (f5 >> 5) & 1;
+    fp.tools.inherit = (f5 >> 6) & 1;
     fp.tools.edge = (f5 >> 4) & 1;
     fp.tools.bline = (f5 >> 3) & 1;
     fp.tools.guide = f5 & 1;
