@@ -1626,6 +1626,8 @@ FrameParams params_from(const EncoderConfig& c) {
         if (c.mts >= 0) t.mts = s.try_mts = c.mts != 0;
         if (c.ibc >= 0) t.ibc = c.ibc != 0;
         if (c.cfl >= 0) t.cfl = c.cfl != 0;
+        if (c.deblock >= 0) fp.no_deblock = c.deblock == 0;
+        if (c.angular >= 0 && c.angular) { t.all_angular = true; t.safe_intra = false; }
     }
     // 線の動き場: 既定は特許安全モード (マージ/TMVP を外す区分 1) で有効
     // medium 以下は速度優先で既定オフ (二重符号化の RD 判定なしでは q32 で +1.7% と損になるため)

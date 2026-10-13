@@ -184,7 +184,7 @@ void BlockCoder::intra_angular(int x0, int y0, int s, int mode, int32_t* pred) c
         left[i] = (al_ok && y0 + i < vh_) ? r.at(x0 - 1, y0 + i) : left[i - 1];
     }
     int32_t corner = (ht && hl) ? r.at(x0 - 1, y0 - 1) : (ht ? top[0] : left[0]);
-    if (tools_.safe_intra && mode != kModeDC) {
+    if (tools_.safe_intra && mode != kModeDC && mode != kModePaeth) {
         intra_safe(s, mode, top, left, corner, pred);
         return;
     }
@@ -1781,7 +1781,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         if (tools_.all_angular) for (int m = 0; m < kNumIntra; ++m) { if (m != kModeCfl && !(tools_.no_sp && m >= kModeSmooth)) modes.push_back(m); }
         else modes = {kModeDC, kModePlanar, kModeHor, kModeVer};
         if (tools_.safe_intra) {
-            modes = {kModeDC, kModePlanar};
+            modes = {kModeDC, kModePlanar, kModePaeth};
             for (int d = 0; d < kNumLine; ++d) modes.push_back(kModeLine0 + d);
         }
         Leaf t;
@@ -1796,7 +1796,7 @@ double BlockCoder::rd_node(int x0, int y0, int l) {
         if (tools_.safe_intra) {
             // 線方向の SPSA-Adam (全方向の評価の代わり): 開始点は左・上の方向と 4 方向 (0, 8, 16, 24)。
             // 評価した方向はすべて候補にする (RD は上位だけを本評価する)
-            for (int m : {kModeDC, kModePlanar}) sads.push_back({sad_of(m), m});
+            for (int m : {kModeDC, kModePlanar, kModePaeth}) sads.push_back({sad_of(m), m});
             const int gw = rec_->w / 4;
             const int lm = x0 > tx0_ ? modes4_[(y0 / 4) * gw + (x0 / 4 - 1)] : -1;
             const int am = y0 > ty0_ ? modes4_[(y0 / 4 - 1) * gw + (x0 / 4)] : -1;
@@ -2294,7 +2294,9 @@ void BlockCoder::leaf_syntax(SymIO& io, Models& md, Leaf& lf, int x0, int y0, in
                 const uint32_t cc = static_cast<uint32_t>(cat(lm) * 3 + cat(am));
                 const int is_line = io.bit(md.mode, 40, cc, pc, lf.mode >= kModeLine0);
                 if (!is_line) {
-                    lf.mode = io.bit(md.mode, 41, cc, pc, lf.mode == kModePlanar) ? kModePlanar : kModeDC;
+                    // 平面 / (DC か Paeth)。Paeth (PNG, 1996) は上・左・左上から勾配の近い画素を選ぶ
+                    if (io.bit(md.mode, 41, cc, pc, lf.mode == kModePlanar)) lf.mode = kModePlanar;
+                    else lf.mode = io.bit(md.mode, 42, cc, pc, lf.mode == kModePaeth) ? kModePaeth : kModeDC;
                 } else {
                     const int dv = io.enc ? lf.mode - kModeLine0 : 0;
                     uint32_t tree = 1;
