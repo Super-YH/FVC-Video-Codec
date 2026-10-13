@@ -24,6 +24,7 @@
 #include "shapes.hpp"
 #include "lines.hpp"
 #include "prof.hpp"
+#include "resample.hpp"
 #include "lattice_adam.hpp"
 #include "fvc/quant.hpp"
 
@@ -1750,7 +1751,14 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
 }  // namespace
 
 // ---------------- Encoder ----------------
-Encoder::Encoder(const VideoInfo& info, const EncoderConfig& cfg) : info_(info), cfg_(cfg), st_(new CodecState) {}
+Encoder::Encoder(const VideoInfo& info, const EncoderConfig& cfg) : info_(info), cfg_(cfg), st_(new CodecState) {
+    out_w_ = info.width;
+    out_h_ = info.height;
+    if (cfg_.downscale > 0) {
+        info_.width = (info.width + 1) / 2;
+        info_.height = (info.height + 1) / 2;
+    }
+}
 Encoder::~Encoder() = default;
 
 std::vector<uint8_t> Encoder::sequence_header() const {
@@ -1764,6 +1772,12 @@ std::vector<uint8_t> Encoder::sequence_header() const {
     put_u8(p, static_cast<uint32_t>(info_.ct));
     put_uv(p, static_cast<uint32_t>(info_.fps_num));
     put_uv(p, static_cast<uint32_t>(info_.fps_den));
+    // 拡張: 出力の大きさ (縮小符号化のとき 1、以下に元の幅・高さ)
+    if (out_w_ != info_.width || out_h_ != info_.height) {
+        put_u8(p, 1);
+        put_u16(p, static_cast<uint32_t>(out_w_));
+        put_u16(p, static_cast<uint32_t>(out_h_));
+    }
     put_unit(out, UnitType::Seq, p);
     return out;
 }
@@ -2285,7 +2299,15 @@ std::vector<uint8_t> Encoder::flush_adaptive(bool final) {
     return out;
 }
 
-std::vector<uint8_t> Encoder::encode(const Frame& f) {
+std::vector<uint8_t> Encoder::encode(const Frame& fin) {
+    if (out_w_ == info_.width && out_h_ == info_.height) return encode_impl(fin);
+    Frame f;
+    f.p.resize(fin.p.size());
+    for (size_t i = 0; i < fin.p.size(); ++i) f.p[i] = downsample2(fin.p[i]);
+    return encode_impl(f);
+}
+
+std::vector<uint8_t> Encoder::encode_impl(const Frame& f) {
     if (adaptive_gop()) {
         const int poc = next_poc_++;
         const bool key = poc == 0 || (cfg_.keyint > 0 && poc % cfg_.keyint == 0);
@@ -2503,6 +2525,13 @@ bool Decoder::parse_seq() {
     info_.ct = static_cast<ColorTransform>(br.u8());
     info_.fps_num = static_cast<int>(br.uv());
     info_.fps_den = static_cast<int>(br.uv());
+    out_info_ = info_;
+    if (br.pos < pl.size() && br.u8() == 1) {
+        out_info_.width = static_cast<int>(br.u16());
+        out_info_.height = static_cast<int>(br.u16());
+        if (out_info_.width != 2 * info_.width && out_info_.width != 2 * info_.width - 1) return false;
+        if (out_info_.height != 2 * info_.height && out_info_.height != 2 * info_.height - 1) return false;
+    }
     return !br.fail && info_.width > 0 && info_.height > 0 && info_.bit_depth >= 8 && info_.bit_depth <= 16;
 }
 
@@ -2568,6 +2597,13 @@ bool Decoder::next(Frame& f) {
     auto it = out_.find(next_out_);
     f = std::move(it->second);
     out_.erase(it);
+    if (out_info_.width != info_.width || out_info_.height != info_.height) {
+        // 縮小符号化: 元の大きさに拡大する (ループ外の後処理)
+        for (size_t i = 0; i < f.p.size(); ++i) {
+            const bool ch = i > 0 && out_info_.chroma == ChromaFormat::C420;
+            f.p[i] = upsample2(f.p[i], ch ? out_info_.chroma_w() : out_info_.width, ch ? out_info_.chroma_h() : out_info_.height);
+        }
+    }
     ++next_out_;
     return true;
 }

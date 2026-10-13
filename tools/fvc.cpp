@@ -25,13 +25,14 @@ static bool ends_with(const std::string& s, const char* suf) {
 static int usage() {
     std::fprintf(stderr,
                  "usage:\n  fvc enc [-q QP] [--preset faster|fast|medium|slow|placebo] [--lossless] [--l2] [--pqmf N]"
-                 " [--frames N]\n      [--keyint N] [--bframes N] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] [--aqp=0|1] [--rect=0|1] [--tmvp=0|1] [--alf=0|1] [--mts=0|1] [--cdef=0|1] [--gs=0|1] [--firb=0|1] [--linemv=0|1] [--sr=0|1] [--safeintra=0|1] [--guide=0|1] [--merge=0|1] [--brest=0|1] [--bline=0|1] [--edge=0|1] [--interp=0|1] [--inherit=0|1] [--deblock=0|1] [--angular=0|1] [--agop=0|1] [--me=adam|full] [--tune psy|psnr|ssim] [--safe[=1,2,3,4]] [--band-coder blocks|samples] [--psy-rd X]\n      [--ssim TARGET] [-v] [--quiet] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
+                 " [--frames N]\n      [--keyint N] [--bframes N] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] [--aqp=0|1] [--rect=0|1] [--tmvp=0|1] [--alf=0|1] [--mts=0|1] [--cdef=0|1] [--gs=0|1] [--firb=0|1] [--linemv=0|1] [--sr=0|1] [--safeintra=0|1] [--guide=0|1] [--merge=0|1] [--brest=0|1] [--bline=0|1] [--edge=0|1] [--interp=0|1] [--inherit=0|1] [--downscale=0|1] [--deblock=0|1] [--angular=0|1] [--agop=0|1] [--me=adam|full] [--tune psy|psnr|ssim] [--safe[=1,2,3,4]] [--band-coder blocks|samples] [--psy-rd X]\n      [--ssim TARGET] [--target-bytes N (ppm)] [-v] [--quiet] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
     return 2;
 }
 
 static int cmd_enc(int argc, char** argv) {
     EncoderConfig cfg;
     int max_frames = 1 << 30;
+    long target_bytes = 0;
     bool verbose = false, quiet = false;
     std::string in, out;
     for (int i = 0; i < argc; ++i) {
@@ -54,6 +55,7 @@ static int cmd_enc(int argc, char** argv) {
         else if (a == "-v") verbose = true;
         else if (a == "--quiet") quiet = true;
         else if (a == "--ssim" && i + 1 < argc) cfg.target_ssim = std::atof(argv[++i]);
+        else if (a == "--target-bytes" && i + 1 < argc) target_bytes = std::atol(argv[++i]);
         else if (a == "--tiles" && i + 2 < argc) { cfg.tile_cols = std::atoi(argv[++i]); cfg.tile_rows = std::atoi(argv[++i]); }
         else if (a == "--threads" && i + 1 < argc) cfg.threads = std::atoi(argv[++i]);
         else if (a == "--cqp" && i + 1 < argc) cfg.chroma_qp_offset = std::atoi(argv[++i]);
@@ -75,6 +77,7 @@ static int cmd_enc(int argc, char** argv) {
         else if (a.rfind("--agop=", 0) == 0) cfg.agop = std::atoi(a.c_str() + 7);
         else if (a.rfind("--interp=", 0) == 0) cfg.interp = std::atoi(a.c_str() + 9);
         else if (a.rfind("--inherit=", 0) == 0) cfg.inherit = std::atoi(a.c_str() + 10);
+        else if (a.rfind("--downscale=", 0) == 0) cfg.downscale = std::atoi(a.c_str() + 12);
         else if (a.rfind("--deblock=", 0) == 0) cfg.deblock = std::atoi(a.c_str() + 10);
         else if (a.rfind("--angular=", 0) == 0) cfg.angular = std::atoi(a.c_str() + 10);
         else if (a.rfind("--edge=", 0) == 0) cfg.edge = std::atoi(a.c_str() + 7);
@@ -122,6 +125,48 @@ static int cmd_enc(int argc, char** argv) {
     } else {
         if (!y4m.open(in)) { std::fprintf(stderr, "cannot read %s\n", in.c_str()); return 1; }
         info = y4m.info();
+    }
+    if (target_bytes > 0 && is_ppm) {
+        // 目標バイト数 (静止画): 縮小なし/縮小それぞれで目標以下になる最小の q を二分探索し、
+        // 元の大きさで復号した輝度 PSNR の高い方を選ぶ
+        auto run = [&](const EncoderConfig& c, double& psnr) {
+            Encoder e(info, c);
+            std::vector<uint8_t> s = e.sequence_header();
+            auto a1 = e.encode(single); s.insert(s.end(), a1.begin(), a1.end());
+            auto a2 = e.flush(); s.insert(s.end(), a2.begin(), a2.end());
+            Decoder d(s, c.threads);
+            Frame f;
+            psnr = 0;
+            if (d.next(f)) {
+                double se = 0;
+                const auto& o = single.p[0].v;
+                for (size_t k = 0; k < o.size(); ++k) { const double df = f.p[0].v[k] - o[k]; se += df * df; }
+                const double peak = (1 << info.bit_depth) - 1;
+                psnr = se > 0 ? 10 * std::log10(peak * peak * o.size() / se) : 99;
+            }
+            return static_cast<long>(s.size());
+        };
+        double bestp = -1;
+        int bq = 63, bds = 0;
+        for (int ds = 0; ds <= 1; ++ds) {
+            EncoderConfig c = cfg;
+            c.downscale = ds;
+            c.keep_recon = false;
+            c.total_frames = 1;
+            int lo = 0, hi = 63, fq = -1;
+            double fp = 0;
+            while (lo <= hi) {
+                const int mid = (lo + hi) / 2;
+                c.qp = mid;
+                double ps;
+                const long b = run(c, ps);
+                if (b <= target_bytes) { fq = mid; fp = ps; hi = mid - 1; } else lo = mid + 1;
+            }
+            if (!quiet) std::fprintf(stderr, "target %ld B: downscale=%d -> q%d (PSNR-Y %.2f)\n", target_bytes, ds, fq, fp);
+            if (fq >= 0 && fp > bestp) { bestp = fp; bq = fq; bds = ds; }
+        }
+        cfg.qp = bq;
+        cfg.downscale = bds;
     }
     cfg.keep_recon = false;
     int total = is_ppm ? 1 : y4m_frame_count(in, info);

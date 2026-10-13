@@ -22,6 +22,7 @@ struct EncoderConfig {
     bool psy = false;         // ノイズ補完/帯域ノイズ置換 (PSNR は下がるが質感保持)
     int ibc = -1;             // -1: プリセット依存, 0/1: 強制
     int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1, rect = -1, tmvp = -1, alf = -1, mts = -1, cdef = -1, gs = -1, firb = -1, line_mv = -1, sr = -1, safe_intra = -1, guide = -1, merge = -1, brest = -1, bline = -1, edge = -1, interp = -1, inherit = -1, deblock = -1, angular = -1;
+    int downscale = 0;  // 1: 縦横 1/2 に縮小して符号化し、復号器が元の大きさに拡大する (超低レート用)
     int agop = 0;  // 1: 適応 GOP (Adam による GOP 長の選択と場面転換の I)
     int tf = -1;  // アンカー (I/P) の時間フィルタ (符号器のみ): 0 = なし, 1..3 = 強さ, -1 = 既定
     int adam = -1;
@@ -89,14 +90,18 @@ public:
     std::vector<uint8_t> sequence_header() const;
     // 表示順に 1 フレーム入力。B フレームの並べ替えにより 0 個以上の FRAME ユニットを返す。
     std::vector<uint8_t> encode(const Frame& f);
+    // 縮小符号化のとき、符号化する大きさの情報 (recon() / stats() はこの大きさ)
+    const VideoInfo& coded_info() const { return info_; }
     // 保留フレームを全て符号化し EOS を付ける
     std::vector<uint8_t> flush();
     const std::vector<FrameStats>& stats() const { return stats_; }
     const std::map<int, Frame>& recon() const { return recon_; }
 
 private:
-    VideoInfo info_;
+    VideoInfo info_;      // 符号化する大きさ
+    int out_w_ = 0, out_h_ = 0;  // 元の大きさ (縮小符号化のときだけ info_ と違う)
     EncoderConfig cfg_;
+    std::vector<uint8_t> encode_impl(const Frame& f);
     std::unique_ptr<CodecState> st_;
     int next_poc_ = 0;
     std::vector<std::pair<int, Frame>> pend_;  // 未符号化フレーム (表示順)
@@ -129,9 +134,10 @@ public:
     explicit Decoder(std::istream& in, int threads = 0);
     ~Decoder();
     bool ok() const { return ok_; }
-    const VideoInfo& info() const { return info_; }
+    const VideoInfo& info() const { return out_info_; }  // 出力 (元) の大きさ
     bool next(Frame& f);  // 表示順に返す。false: 終端
 private:
+    VideoInfo out_info_;
     std::vector<uint8_t> s_;
     size_t pos_ = 0;
     bool ok_ = false;
