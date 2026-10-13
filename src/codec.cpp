@@ -1713,7 +1713,7 @@ bool read_frame_header(ByteReader& br, FrameParams& fp) {
     fp.tools.gs = (f3 >> 6) & 1;
     fp.tools.firb = (f3 >> 7) & 1;
     const uint32_t f5 = br.u8();
-    if (f5 > 63) return false;
+    if (f5 > 127) return false;
     fp.tools.own_interp = (f5 >> 5) & 1;
     fp.tools.inherit = (f5 >> 6) & 1;
     fp.tools.edge = (f5 >> 4) & 1;
