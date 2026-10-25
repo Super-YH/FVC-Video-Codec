@@ -25,6 +25,7 @@
 #include "lines.hpp"
 #include "prof.hpp"
 #include "resample.hpp"
+#include "hf_layer.hpp"
 #include "lattice_adam.hpp"
 #include "fvc/quant.hpp"
 
@@ -2094,6 +2095,17 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& forig, int poc, FrameT
     }
     if (!done) { payload = run(fp, rec); ++trials; }
     std::vector<uint8_t> out;
+    auto fl = full_luma_.find(poc);
+    if (fl != full_luma_.end()) {
+        // 縮小符号化の高周波層 (SEI ユニット、フレームより前に置く): 拡大した再構成と元の輝度から推定
+        const Plane U = upsample2(rec.p[0], out_w_, out_h_);
+        std::vector<uint8_t> sp;
+        put_uv(sp, static_cast<uint32_t>(poc));
+        const auto hf = hf_encode(fl->second, U, info_.bit_depth, static_cast<uint64_t>(poc));
+        sp.insert(sp.end(), hf.begin(), hf.end());
+        put_unit(out, UnitType::Sei, sp);
+        full_luma_.erase(fl);
+    }
     put_unit(out, UnitType::Frame, payload);
     st_->push(poc, rec, type != FrameType::B);
     FrameStats fs;
@@ -2304,6 +2316,8 @@ std::vector<uint8_t> Encoder::encode(const Frame& fin) {
     Frame f;
     f.p.resize(fin.p.size());
     for (size_t i = 0; i < fin.p.size(); ++i) f.p[i] = downsample2(fin.p[i]);
+    if (cfg_.hf > 0) full_luma_[n_in_] = fin.p[0];
+    ++n_in_;
     return encode_impl(f);
 }
 
@@ -2554,6 +2568,12 @@ bool Decoder::decode_unit() {
         const uint32_t len = static_cast<uint32_t>(buf.size());
         const uint8_t* pl = buf.data();
         if (type == UnitType::Eos) { eos_ = true; return false; }
+        if (type == UnitType::Sei) {
+            ByteReader sr{pl, len};
+            const int poc = static_cast<int>(sr.uv());
+            if (!sr.fail) hf_[poc].assign(pl + sr.pos, pl + len);
+            continue;
+        }
         if (type != UnitType::Frame) continue;
         ByteReader hr{pl, len};
         FrameParams fp;
@@ -2602,6 +2622,11 @@ bool Decoder::next(Frame& f) {
         for (size_t i = 0; i < f.p.size(); ++i) {
             const bool ch = i > 0 && out_info_.chroma == ChromaFormat::C420;
             f.p[i] = upsample2(f.p[i], ch ? out_info_.chroma_w() : out_info_.width, ch ? out_info_.chroma_h() : out_info_.height);
+        }
+        auto h = hf_.find(next_out_);
+        if (h != hf_.end()) {
+            hf_apply(h->second.data(), h->second.size(), f.p[0], out_info_.bit_depth, static_cast<uint64_t>(next_out_));
+            hf_.erase(h);
         }
     }
     ++next_out_;

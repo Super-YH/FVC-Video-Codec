@@ -22,7 +22,8 @@ struct EncoderConfig {
     bool psy = false;         // ノイズ補完/帯域ノイズ置換 (PSNR は下がるが質感保持)
     int ibc = -1;             // -1: プリセット依存, 0/1: 強制
     int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1, rect = -1, tmvp = -1, alf = -1, mts = -1, cdef = -1, gs = -1, firb = -1, line_mv = -1, sr = -1, safe_intra = -1, guide = -1, merge = -1, brest = -1, bline = -1, edge = -1, interp = -1, inherit = -1, deblock = -1, angular = -1;
-    int downscale = 0;  // 1: 縦横 1/2 に縮小して符号化し、復号器が元の大きさに拡大する (超低レート用)
+    int downscale = 0;
+    int hf = 0;         // 1: 縮小符号化の高周波層 (輪郭の鋭さ + パラメトリック質感、数バイト)。PSNR は下がるので既定オフ  // 1: 縦横 1/2 に縮小して符号化し、復号器が元の大きさに拡大する (超低レート用)
     int agop = 0;  // 1: 適応 GOP (Adam による GOP 長の選択と場面転換の I)
     int tf = -1;  // アンカー (I/P) の時間フィルタ (符号器のみ): 0 = なし, 1..3 = 強さ, -1 = 既定
     int adam = -1;
@@ -100,6 +101,8 @@ public:
 private:
     VideoInfo info_;      // 符号化する大きさ
     int out_w_ = 0, out_h_ = 0;  // 元の大きさ (縮小符号化のときだけ info_ と違う)
+    std::map<int, Plane> full_luma_;  // 縮小符号化: 元の大きさの輝度 (高周波層の推定用, poc ごと)
+    int n_in_ = 0;
     EncoderConfig cfg_;
     std::vector<uint8_t> encode_impl(const Frame& f);
     std::unique_ptr<CodecState> st_;
@@ -138,6 +141,7 @@ public:
     bool next(Frame& f);  // 表示順に返す。false: 終端
 private:
     VideoInfo out_info_;
+    std::map<int, std::vector<uint8_t>> hf_;  // poc ごとの高周波層 (縮小符号化)
     std::vector<uint8_t> s_;
     size_t pos_ = 0;
     bool ok_ = false;
