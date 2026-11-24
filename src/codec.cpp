@@ -1216,6 +1216,29 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
         }
         Plane opad;
         if (org) opad = pad_plane(org->p[pi], W, H);
+        // 輪郭付近の歪みの重み (符号器のみ): 元画像の勾配が強い所とその周囲 2 画素を 1 + edge_q 倍まで重くする。
+        // 輪郭の横の波 (リンギング) を RD が嫌うようになり、輪郭付近の係数が細かく残る
+        std::vector<float> ewm;
+        if (org && fp.search.edge_q > 0) {
+            const double sc = std::ldexp(1.0, info.bit_depth - 8);
+            std::vector<float> e(static_cast<size_t>(W) * H, 0.0f);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    auto px = [&](int xx, int yy) { return static_cast<double>(opad.at(std::clamp(xx, 0, W - 1), std::clamp(yy, 0, H - 1))); };
+                    const double gx = px(x + 1, y - 1) + 2 * px(x + 1, y) + px(x + 1, y + 1) - px(x - 1, y - 1) - 2 * px(x - 1, y) - px(x - 1, y + 1);
+                    const double gy = px(x - 1, y + 1) + 2 * px(x, y + 1) + px(x + 1, y + 1) - px(x - 1, y - 1) - 2 * px(x, y - 1) - px(x + 1, y - 1);
+                    const double g = std::sqrt(gx * gx + gy * gy) / 8.0 / sc;  // 8 ビット換算の傾き
+                    e[static_cast<size_t>(y) * W + x] = static_cast<float>(std::clamp((g - 4.0) / 12.0, 0.0, 1.0));
+                }
+            ewm.assign(e.size(), 1.0f);
+            for (int y = 0; y < H; ++y)
+                for (int x = 0; x < W; ++x) {
+                    float m = 0;
+                    for (int dy = -2; dy <= 2; ++dy)
+                        for (int dx = -2; dx <= 2; ++dx) m = std::max(m, e[static_cast<size_t>(std::clamp(y + dy, 0, H - 1)) * W + std::clamp(x + dx, 0, W - 1)]);
+                    ewm[static_cast<size_t>(y) * W + x] = 1.0f + static_cast<float>(fp.search.edge_q) * m;
+                }
+        }
         Plane R(W, H, 0);
         BlockUsage* cur_usage = usage;
         bool allow_ns = true;  // 方式判定の試行中はノイズ置換を止める (知覚目的の加算を SSE 判定に含めない)
@@ -1333,6 +1356,7 @@ void code_frame(SymIO& io, const VideoInfo& info, const FrameParams& fp, const F
                         if (fp.aqp) coders[t]->enable_aqp(pqp, info.bit_depth, aqp_lookup, &actx);
                         coders[t]->set_noise_seed(static_cast<uint64_t>(fp.poc) * 7919u + static_cast<uint64_t>(pi) * 104729u + static_cast<uint64_t>(t));
                         coders[t]->set_valid(vw, vh);
+                        if (!ewm.empty()) coders[t]->set_edge_weight(&ewm);
                         if (io.enc) {
                             tw[t] = std::make_unique<EntropyWriter>(fp.range_coder);
                             tio[t].w = tw[t].get();
@@ -1589,6 +1613,7 @@ FrameParams params_from(const EncoderConfig& c) {
     // RD の歪みに使う方式は、いずれも SSE より SSIM が悪化した (超低レートで一次近似が成り立たないため)
     if (c.tune_ssim) fp.cqp_off = std::clamp(fp.cqp_off + 3, -12, 12);
     s.chroma_weight = c.tune_psnr ? 1.0 : 2.0;
+    s.edge_q = c.edge_q >= 0 ? c.edge_q : 0.0;
     if (c.mts >= 0) t.mts = s.try_mts = c.mts != 0;
     if (c.alf >= 0) fp.alf = c.alf != 0;
     fp.band_blocks = !c.band_samples;

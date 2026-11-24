@@ -23,6 +23,7 @@ struct EncoderConfig {
     int ibc = -1;             // -1: プリセット依存, 0/1: 強制
     int e8 = -1, tns = -1, cfl = -1, dict = -1, shapes = -1, fir = -1, loop_filter = -1, rect = -1, tmvp = -1, alf = -1, mts = -1, cdef = -1, gs = -1, firb = -1, line_mv = -1, sr = -1, safe_intra = -1, guide = -1, merge = -1, brest = -1, bline = -1, edge = -1, interp = -1, inherit = -1, deblock = -1, angular = -1;
     int downscale = 0;
+    double edge_q = -1;  // 輪郭付近の歪みの重み (1 + edge_q 倍まで、0: なし)。-1: 既定 (0)
     int hf = 0;         // 縮小符号化の高周波層: デリンギングと輪郭の鋭さは常に使う。1: パラメトリック質感 (雑音) も足す (PSNR は下がる)  // 1: 縦横 1/2 に縮小して符号化し、復号器が元の大きさに拡大する (超低レート用)
     int agop = 0;  // 1: 適応 GOP (Adam による GOP 長の選択と場面転換の I)
     int tf = -1;  // アンカー (I/P) の時間フィルタ (符号器のみ): 0 = なし, 1..3 = 強さ, -1 = 既定

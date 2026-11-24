@@ -178,6 +178,7 @@ struct Search {
     bool try_mts = false;          // MTS の RD 探索
     double psy = 0;                // 心理視覚歪みの強さ (0: SSE)
     double chroma_weight = 1.0;    // 色差歪みの重み
+    double edge_q = 0;             // >0: 輪郭付近の歪みを (1 + edge_q) 倍まで重く評価する (輪郭付近に符号量を寄せる)
 };
 
 class BlockCoder {
@@ -308,6 +309,7 @@ private:
     void obmc(const MotionInfo& cur, int x0, int y0, int s, int32_t* pred) const;
     // 動き探索の Adam 状態 (リストごと、直前に探索したブロックから継承する)
     mutable AdamState<2> me_adam_[2], sub_adam_[2];
+    const std::vector<float>* ew_ = nullptr;  // 輪郭付近の歪みの重み
     mutable AdamState<4> bi_adam_;  // 双予測の 4 変数の精密化
     mutable AdamState<1> intra_adam_;
     mutable AdamState<2> edge_adam_;
@@ -385,6 +387,8 @@ private:
     int vw_ = 1 << 30, vh_ = 1 << 30;  // 有効領域 (これより外のブロックは符号化しない)
 public:
     void set_valid(int vw, int vh) { vw_ = vw; vh_ = vh; }
+    // 符号器: 画素ごとの歪みの重み (rec と同じ大きさ、nullptr なら 1)
+    void set_edge_weight(const std::vector<float>* w) { ew_ = w; }
     // 符号器: このフレームで使われた大域辞書の項目 ID (捨てる判断用)
     const std::vector<int>& used_global() const { return used_global_; }
     // 符号化しない (画面外の) ブロックの動き情報は既定値 (イントラ扱い) に戻す。符号器の試行符号化の残りが

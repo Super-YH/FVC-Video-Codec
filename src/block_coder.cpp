@@ -1674,12 +1674,22 @@ double BlockCoder::sse(int x0, int y0, int s) const {
         // 有効領域をはみ出すブロック: 領域内の画素だけで歪みを測る (はみ出し部は表示されない)
         double e = 0;
         for (int y = 0; y < std::min(s, vh_ - y0); ++y)
-            for (int x = 0; x < std::min(s, vw_ - x0); ++x) { const double d = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y); e += d * d; }
+            for (int x = 0; x < std::min(s, vw_ - x0); ++x) {
+                const double d = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y);
+                e += d * d * (ew_ ? (*ew_)[static_cast<size_t>(y0 + y) * rec_->w + x0 + x] : 1.0f);
+            }
         return e * (plane_ ? search_.chroma_weight : 1.0);
     }
     double e = 0;
-    for (int y = 0; y < s; ++y)
-        for (int x = 0; x < s; ++x) { const double d = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y); e += d * d; }
+    if (ew_) {
+        for (int y = 0; y < s; ++y) {
+            const float* wr = &(*ew_)[static_cast<size_t>(y0 + y) * rec_->w + x0];
+            for (int x = 0; x < s; ++x) { const double d = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y); e += d * d * wr[x]; }
+        }
+    } else {
+        for (int y = 0; y < s; ++y)
+            for (int x = 0; x < s; ++x) { const double d = org_->at(x0 + x, y0 + y) - rec_->at(x0 + x, y0 + y); e += d * d; }
+    }
     // 色差の誤差は数値が小さくても彩度変化として目立つため重み付け (輝度と同 QP 時に約 2 倍)
     const double cw = plane_ ? search_.chroma_weight : 1.0;
     if (search_.psy <= 0) return e * cw;

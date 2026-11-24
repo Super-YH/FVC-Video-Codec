@@ -25,7 +25,7 @@ static bool ends_with(const std::string& s, const char* suf) {
 static int usage() {
     std::fprintf(stderr,
                  "usage:\n  fvc enc [-q QP] [--preset faster|fast|medium|slow|placebo] [--lossless] [--l2] [--pqmf N]"
-                 " [--frames N]\n      [--keyint N] [--bframes N] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] [--aqp=0|1] [--rect=0|1] [--tmvp=0|1] [--alf=0|1] [--mts=0|1] [--cdef=0|1] [--gs=0|1] [--firb=0|1] [--linemv=0|1] [--sr=0|1] [--safeintra=0|1] [--guide=0|1] [--merge=0|1] [--brest=0|1] [--bline=0|1] [--edge=0|1] [--interp=0|1] [--inherit=0|1] [--downscale=0|1] [--hf=0|1] [--deblock=0|1] [--angular=0|1] [--agop=0|1] [--me=adam|full] [--tune psy|psnr|ssim] [--safe[=1,2,3,4]] [--band-coder blocks|samples] [--psy-rd X]\n      [--ssim TARGET] [--target-bytes N (ppm)] [-v] [--quiet] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
+                 " [--frames N]\n      [--keyint N] [--bframes N] [--refs N] [--no-copy] [--psy] [--ibc|--no-ibc]\n      [--e8=0|1] [--tns=0|1] [--cfl=0|1] [--dict=0|1] [--shapes=0|1] [--fir=0|1] [--lf=0|1]\n      [--tiles C R] [--threads N] [--cqp N] [--aqp=0|1] [--rect=0|1] [--tmvp=0|1] [--alf=0|1] [--mts=0|1] [--cdef=0|1] [--gs=0|1] [--firb=0|1] [--linemv=0|1] [--sr=0|1] [--safeintra=0|1] [--guide=0|1] [--merge=0|1] [--brest=0|1] [--bline=0|1] [--edge=0|1] [--interp=0|1] [--inherit=0|1] [--downscale=0|1] [--hf=0|1] [--edgeq=X] [--deblock=0|1] [--angular=0|1] [--agop=0|1] [--me=adam|full] [--tune psy|psnr|ssim] [--safe[=1,2,3,4]] [--band-coder blocks|samples] [--psy-rd X]\n      [--ssim TARGET] [--target-bytes N (ppm)] [-v] [--quiet] in.(y4m|ppm) out.fvc\n  fvc dec in.fvc out.(y4m|ppm)\n");
     return 2;
 }
 
@@ -79,6 +79,7 @@ static int cmd_enc(int argc, char** argv) {
         else if (a.rfind("--inherit=", 0) == 0) cfg.inherit = std::atoi(a.c_str() + 10);
         else if (a.rfind("--downscale=", 0) == 0) cfg.downscale = std::atoi(a.c_str() + 12);
         else if (a.rfind("--hf=", 0) == 0) cfg.hf = std::atoi(a.c_str() + 5);
+        else if (a.rfind("--edgeq=", 0) == 0) cfg.edge_q = std::atof(a.c_str() + 8);
         else if (a.rfind("--deblock=", 0) == 0) cfg.deblock = std::atoi(a.c_str() + 10);
         else if (a.rfind("--angular=", 0) == 0) cfg.angular = std::atoi(a.c_str() + 10);
         else if (a.rfind("--edge=", 0) == 0) cfg.edge = std::atoi(a.c_str() + 7);
