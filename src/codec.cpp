@@ -2101,7 +2101,7 @@ std::vector<uint8_t> Encoder::encode_picture(const Frame& forig, int poc, FrameT
         const Plane U = upsample2(rec.p[0], out_w_, out_h_);
         std::vector<uint8_t> sp;
         put_uv(sp, static_cast<uint32_t>(poc));
-        const auto hf = hf_encode(fl->second, U, info_.bit_depth, static_cast<uint64_t>(poc));
+        const auto hf = hf_encode(fl->second, U, info_.bit_depth, static_cast<uint64_t>(poc), cfg_.hf > 0);
         sp.insert(sp.end(), hf.begin(), hf.end());
         put_unit(out, UnitType::Sei, sp);
         full_luma_.erase(fl);
@@ -2316,7 +2316,7 @@ std::vector<uint8_t> Encoder::encode(const Frame& fin) {
     Frame f;
     f.p.resize(fin.p.size());
     for (size_t i = 0; i < fin.p.size(); ++i) f.p[i] = downsample2(fin.p[i]);
-    if (cfg_.hf > 0) full_luma_[n_in_] = fin.p[0];
+    full_luma_[n_in_] = fin.p[0];
     ++n_in_;
     return encode_impl(f);
 }

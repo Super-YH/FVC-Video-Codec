@@ -5,6 +5,7 @@
 //   2. 質感の量 g: 元画像と (α 適用後の) 拡大画像の高周波エネルギーの差。復号器は種から決まる雑音を
 //      U の局所的な向きに沿って伸ばした高周波場を作り、差のエネルギーだけ足す (値は送らず統計だけ送る)
 //  元から滑らかな所 (肌など) は差が小さいので質感は足されない
+//  その前に、低レートの DCT が輪郭の横に作る波 (二重の輪郭) をシグマフィルタで消す (σ を 1 つ送る)
 #pragma once
 #include <cstdint>
 #include <vector>
@@ -14,7 +15,8 @@
 namespace fvc {
 
 // 符号器: 元画像 org と拡大画像 U (同じ大きさ) から高周波層のペイロードを作る
-std::vector<uint8_t> hf_encode(const Plane& org, const Plane& U, int bit_depth, uint64_t seed);
+// texture: 質感 (雑音) も足す。false ならデリンギングと輪郭の鋭さだけ (PSNR を上げる方向だけ)
+std::vector<uint8_t> hf_encode(const Plane& org, const Plane& U, int bit_depth, uint64_t seed, bool texture);
 // 復号器: U にペイロードの高周波層を適用する。失敗 (壊れたデータ) なら false (U は変えない)
 bool hf_apply(const uint8_t* d, size_t n, Plane& U, int bit_depth, uint64_t seed);
 

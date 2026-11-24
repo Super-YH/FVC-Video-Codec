@@ -46,7 +46,10 @@ void up1d(const int32_t* in, int n, int stride, int32_t* out, int m, int ostride
         const int f = (i & 1) ? j - 2 : j - 3;
         int64_t acc = 0;
         for (int k = 0; k < 6; ++k) acc += static_cast<int64_t>(t[k]) * in[static_cast<size_t>(std::clamp(f + k, 0, n - 1)) * stride];
-        out[static_cast<size_t>(i) * ostride] = static_cast<int32_t>((acc + 8192) >> 14);
+        // リンギング抑制: 出力を最も近い 2 つの入力画素の範囲に収める (輪郭の外側の明暗の波 = 二重の輪郭を出さない)
+        const int32_t a = in[static_cast<size_t>(std::clamp(f + 2, 0, n - 1)) * stride];
+        const int32_t b = in[static_cast<size_t>(std::clamp(f + 3, 0, n - 1)) * stride];
+        out[static_cast<size_t>(i) * ostride] = std::clamp(static_cast<int32_t>((acc + 8192) >> 14), std::min(a, b), std::max(a, b));
     }
 }
 }  // namespace

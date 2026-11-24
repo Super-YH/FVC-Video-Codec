@@ -60,6 +60,7 @@ struct Analysis {
     Img u, d;
     std::vector<uint8_t> band, ori;
     Img coh;
+    Img gm;  // 平滑化した U の勾配の大きさ
 };
 Analysis analyze(const Plane& U, int bit_depth) {
     const int w = U.w, h = U.h;
@@ -68,6 +69,7 @@ Analysis analyze(const Plane& U, int bit_depth) {
     A.u.assign(U.v.begin(), U.v.end());
     const Img b = blur5(A.u, w, h);
     A.d.resize(A.u.size());
+    A.gm.resize(A.u.size());
     Img d2(A.u.size()), jxx(A.u.size()), jyy(A.u.size()), jxy(A.u.size());
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x) {
@@ -77,6 +79,7 @@ Analysis analyze(const Plane& U, int bit_depth) {
             const double gx = (b[static_cast<size_t>(y) * w + std::min(x + 1, w - 1)] - b[static_cast<size_t>(y) * w + std::max(x - 1, 0)]) * 0.5;
             const double gy = (b[static_cast<size_t>(std::min(y + 1, h - 1)) * w + x] - b[static_cast<size_t>(std::max(y - 1, 0)) * w + x]) * 0.5;
             jxx[i] = gx * gx; jyy[i] = gy * gy; jxy[i] = gx * gy;
+            A.gm[i] = std::sqrt(gx * gx + gy * gy);
         }
     const Img act = box(d2, w, h, 4), sxx = box(jxx, w, h, 3), syy = box(jyy, w, h, 3), sxy = box(jxy, w, h, 3);
     A.band.resize(A.u.size());
@@ -120,9 +123,43 @@ Img tex_field(const Img& noise, int w, int h, int o) {
     return s;
 }
 
-struct Params { int a[kBands] = {}, g[kBands] = {}; };
+struct Params { int dr = 0, a[kBands] = {}, g[kBands] = {}; };
+
+// デリンギング (Lee のシグマフィルタ, 1983): 強い輪郭の近く (半径 4) の画素だけを、輝度差が σ 以内の 5x5 近傍の
+// 平均で置き換える。輪郭をまたぐ画素は混ぜないので輪郭は保たれ、低レートの DCT が作る輪郭の横の波だけが消える
+constexpr int kNd = 6;
+constexpr double kSigma[kNd] = {0.0, 2.0, 4.0, 6.0, 9.0, 13.0};  // 8 ビット換算
+void dering(Plane& U, int bit_depth, int dr) {
+    if (dr <= 0) return;
+    const int w = U.w, h = U.h;
+    const double sc = std::ldexp(1.0, bit_depth - 8), sg = kSigma[dr] * sc;
+    const Img u(U.v.begin(), U.v.end()), b = blur5(u, w, h);
+    Img e(u.size(), 0.0);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const double gx = (b[static_cast<size_t>(y) * w + std::min(x + 1, w - 1)] - b[static_cast<size_t>(y) * w + std::max(x - 1, 0)]) * 0.5;
+            const double gy = (b[static_cast<size_t>(std::min(y + 1, h - 1)) * w + x] - b[static_cast<size_t>(std::max(y - 1, 0)) * w + x]) * 0.5;
+            e[static_cast<size_t>(y) * w + x] = std::sqrt(gx * gx + gy * gy) > 6.0 * sc ? 1.0 : 0.0;
+        }
+    const Img zone = box(e, w, h, 4);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const size_t i = static_cast<size_t>(y) * w + x;
+            if (zone[i] <= 0) continue;
+            double s = 0;
+            int n = 0;
+            for (int dy = -2; dy <= 2; ++dy)
+                for (int dx = -2; dx <= 2; ++dx) {
+                    const double q = u[static_cast<size_t>(std::clamp(y + dy, 0, h - 1)) * w + std::clamp(x + dx, 0, w - 1)];
+                    if (std::abs(q - u[i]) <= sg) { s += q; ++n; }
+                }
+            U.v[i] = static_cast<int32_t>(std::lround(s / n));
+        }
+}
 
 void code_params(SymIO& io, CMModel& m, Params& p) {
+    p.dr = static_cast<int>(io.uint(m, 0, 0, static_cast<uint32_t>(p.dr)));
+    if (p.dr >= kNd) throw std::runtime_error("corrupt hf layer");
     for (int k = 0; k < kBands; ++k) {
         p.a[k] = static_cast<int>(io.uint(m, 1, static_cast<uint32_t>(k), static_cast<uint32_t>(p.a[k])));
         p.g[k] = static_cast<int>(io.uint(m, 2, static_cast<uint32_t>(k), static_cast<uint32_t>(p.g[k])));
@@ -140,32 +177,54 @@ void apply(const Params& p, const Analysis& A, Plane& U, int bit_depth, uint64_t
         SplitMix64 rng(seed * 0x9E3779B97F4A7C15ull + 0x5851F42D4C957F2Dull);
         Img noise(A.u.size());
         for (double& v : noise) v = static_cast<double>(rng.next() >> 11) * (2.0 / 9007199254740992.0) - 1.0;
-        for (int o = 0; o <= 4; ++o) fields.push_back(tex_field(noise, w, h, o));
+        fields.push_back(tex_field(noise, w, h, 0));
     }
     // 段ごとの量は段の境界でなめらかにつなぐ (活動度の箱平均で段を決めているので、さらに 9x9 で平均)
     Img al(A.u.size()), gn(A.u.size());
     for (size_t i = 0; i < A.u.size(); ++i) { al[i] = kAlpha[p.a[A.band[i]]]; gn[i] = kGain[p.g[A.band[i]]]; }
     al = box(al, w, h, 4);
     if (any_g) gn = box(gn, w, h, 4);
-    for (size_t i = 0; i < A.u.size(); ++i) {
-        double v = A.u[i] + al[i] * A.d[i];
-        if (any_g && gn[i] > 0) {
-            const double c = std::clamp((A.coh[i] - 0.2) / 0.5, 0.0, 1.0);  // 向きが確かなほど縞、そうでなければ等方
-            v += gn[i] * sc * ((1 - c) * fields[0][i] + c * fields[A.ori[i]][i]);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const size_t i = static_cast<size_t>(y) * w + x;
+            // 輪郭の鋭さ: 強調後の値を周囲 3x3 の最小〜最大に収める (はみ出し = 輪郭の横の二重の輪郭を出さない)
+            double mn = A.u[i], mx = A.u[i];
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx) {
+                    const double q = A.u[static_cast<size_t>(std::clamp(y + dy, 0, h - 1)) * w + std::clamp(x + dx, 0, w - 1)];
+                    mn = std::min(mn, q); mx = std::max(mx, q);
+                }
+            double v = std::clamp(A.u[i] + al[i] * A.d[i], mn, mx);
+            if (any_g && gn[i] > 0) {
+                // 質感: 等方の雑音だけを使い (輪郭に平行な縞は輪郭の複製に見える)、強い輪郭の近くでは弱める
+                const double damp = 1.0 / (1.0 + (A.gm[i] / (6.0 * sc)) * (A.gm[i] / (6.0 * sc)));
+                v += gn[i] * sc * damp * fields[0][i];
+            }
+            U.v[i] = static_cast<int32_t>(std::clamp(std::lround(v), 0L, static_cast<long>(hi)));
         }
-        U.v[i] = static_cast<int32_t>(std::clamp(std::lround(v), 0L, static_cast<long>(hi)));
-    }
 }
 }  // namespace
 
-std::vector<uint8_t> hf_encode(const Plane& org, const Plane& U, int bit_depth, uint64_t seed) {
+std::vector<uint8_t> hf_encode(const Plane& org, const Plane& U0, int bit_depth, uint64_t seed, bool texture) {
     (void)seed;
-    const int w = U.w, h = U.h;
+    const int w = U0.w, h = U0.h;
     const double sc = std::ldexp(1.0, bit_depth - 8);
+    Params p;
+    // 0. デリンギングの σ: 元画像との SSE が最小のもの
+    Plane U = U0;
+    {
+        double best = 1e300;
+        for (int d = 0; d < kNd; ++d) {
+            Plane t = U0;
+            dering(t, bit_depth, d);
+            double e = 0;
+            for (size_t i = 0; i < t.v.size(); ++i) { const double df = t.v[i] - org.v[i]; e += df * df; }
+            if (e < best) { best = e; p.dr = d; U = std::move(t); }
+        }
+    }
     const Analysis A = analyze(U, bit_depth);
     const Img o(org.v.begin(), org.v.end());
     const Img ob = blur5(o, w, h);
-    Params p;
     // 1. α: 段ごとに残差 R = org - U と D の最小二乗
     double num[kBands] = {}, den[kBands] = {};
     for (size_t i = 0; i < A.u.size(); ++i) { num[A.band[i]] += (o[i] - A.u[i]) * A.d[i]; den[A.band[i]] += A.d[i] * A.d[i]; }
@@ -190,7 +249,7 @@ std::vector<uint8_t> hf_encode(const Plane& org, const Plane& U, int bit_depth, 
         const double g = 0.6 * def;  // 不足分の 6 割 (足しすぎると雑音に見える)
         int best = 0;
         for (int j = 1; j < kNg; ++j) if (std::abs(kGain[j] - g) < std::abs(kGain[best] - g)) best = j;
-        p.g[k] = best;
+        p.g[k] = texture ? best : 0;
     }
     EntropyWriter ew;
     CMModel m;
@@ -212,6 +271,7 @@ bool hf_apply(const uint8_t* d, size_t n, Plane& U, int bit_depth, uint64_t seed
     } catch (const std::exception&) {
         return false;
     }
+    dering(U, bit_depth, p.dr);
     const Analysis A = analyze(U, bit_depth);
     apply(p, A, U, bit_depth, seed);
     return true;
