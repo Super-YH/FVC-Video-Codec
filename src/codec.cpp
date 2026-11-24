@@ -1613,7 +1613,7 @@ FrameParams params_from(const EncoderConfig& c) {
     // RD の歪みに使う方式は、いずれも SSE より SSIM が悪化した (超低レートで一次近似が成り立たないため)
     if (c.tune_ssim) fp.cqp_off = std::clamp(fp.cqp_off + 3, -12, 12);
     s.chroma_weight = c.tune_psnr ? 1.0 : 2.0;
-    s.edge_q = c.edge_q >= 0 ? c.edge_q : 0.0;
+    s.edge_q = c.edge_q >= 0 ? c.edge_q : 1.0;  // 実測 (lena 2 KiB, 同サイズ): 重み 1 で +0.04 dB、2 以上は悪化
     if (c.mts >= 0) t.mts = s.try_mts = c.mts != 0;
     if (c.alf >= 0) fp.alf = c.alf != 0;
     fp.band_blocks = !c.band_samples;
